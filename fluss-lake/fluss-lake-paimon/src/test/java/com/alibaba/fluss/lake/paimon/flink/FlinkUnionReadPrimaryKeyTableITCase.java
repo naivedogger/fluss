@@ -268,11 +268,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         String tableName = "pk_table_full" + (isPartitioned ? "_partitioned" : "_non_partitioned");
         TablePath t1 = TablePath.of(DEFAULT_DB, tableName);
         Map<TableBucket, Long> bucketLogEndOffset = new HashMap<>();
-        long tableId =
-                preparePKTableFullType(t1, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
+        long tableId = preparePKTableFullType(t1, 1, isPartitioned, bucketLogEndOffset);
 
         // wait unit records has been synced
-        waitUntilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
+        waitUntilBucketSynced(t1, tableId, 1, isPartitioned);
 
         // stop lake tiering service
         jobClient.cancel().get();

@@ -27,7 +27,7 @@ import org.junit.jupiter.api.BeforeEach;
 import static com.alibaba.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
 
 class FlinkUnionReadTestBase extends FlinkPaimonTieringTestBase {
-    protected static final int DEFAULT_BUCKET_NUM = 1;
+    protected static final int DEFAULT_BUCKET_NUM = 3;
     StreamTableEnvironment batchTEnv;
 
     @BeforeAll
