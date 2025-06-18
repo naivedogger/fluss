@@ -22,12 +22,12 @@ import com.alibaba.fluss.metadata.Schema;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TableDescriptor;
 import com.alibaba.fluss.metadata.TablePath;
+import com.alibaba.fluss.row.Decimal;
 import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
 import com.alibaba.fluss.server.replica.Replica;
 import com.alibaba.fluss.types.DataTypes;
-
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.types.Row;
@@ -38,7 +38,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
-
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -52,7 +51,9 @@ import java.util.stream.Collectors;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The IT case for Flink union data in lake and fluss for primary key table. */
+/**
+ * The IT case for Flink union data in lake and fluss for primary key table.
+ */
 class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
 
     @BeforeAll
@@ -72,8 +73,8 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         Map<TableBucket, Long> bucketLogEndOffset = new HashMap<>();
         long tableId = preparePkTable(t1, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
 
-        // wait unit records has has been synced
-        waitUtilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
+        // wait unit records has been synced
+        waitUntilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
 
         // write records again
         writeRowsToPkTable(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
@@ -163,13 +164,13 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                 t1,
                 isPartitioned,
                 Arrays.asList(
-                        new Object[] {"f00", 0, "v0"},
-                        new Object[] {"f11", 1, "v111"},
-                        new Object[] {"f22", 2, "v222"},
-                        new Object[] {"f44", 4, "v4"},
-                        new Object[] {"f5", 5, "v5"},
-                        new Object[] {"f6", 6, "v6"},
-                        new Object[] {"f7", 7, "v7"}));
+                        new Object[]{"f00", 0, "v0"},
+                        new Object[]{"f11", 1, "v111"},
+                        new Object[]{"f22", 2, "v222"},
+                        new Object[]{"f44", 4, "v4"},
+                        new Object[]{"f5", 5, "v5"},
+                        new Object[]{"f6", 6, "v6"},
+                        new Object[]{"f7", 7, "v7"}));
 
         // query again and check the data
         // it must union snapshot and log
@@ -217,6 +218,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                 createPrimaryKeyTable(
                         t1,
                         1,
+                        0,
                         Arrays.asList(
                                 new Schema.Column("c1", DataTypes.INT()),
                                 new Schema.Column("c2", DataTypes.TIMESTAMP_LTZ()),
@@ -235,8 +237,8 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
 
         writeRows(t1, rows, false);
 
-        // wait unit records has has been synced
-        waitUtilBucketSynced(t1, tableId, 1, false);
+        // wait unit records has been synced
+        waitUntilBucketSynced(t1, tableId, 1, false);
 
         // stop lake tiering service
         jobClient.cancel().get();
@@ -256,6 +258,113 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         assertThat(result.toString())
                 .isEqualTo(
                         "[+I[1, 2023-10-25T12:01:13.182005Z, 2023-10-25T12:01:13.183006], +I[2, 2023-10-25T12:01:13.400007Z, 2023-10-25T12:01:13.501008]]");
+    }
+
+    @Test
+    void testUnionReadFullType() throws Exception {
+        // first of all, start tiering
+        JobClient jobClient = buildTieringJob(execEnv);
+
+        String tableName = "pk_table_full";
+        TablePath t1 = TablePath.of(DEFAULT_DB, tableName);
+        long tableId =
+                createPrimaryKeyTable(
+                        t1,
+                        1,
+                        3,
+                        Arrays.asList(
+                                new Schema.Column("c1", DataTypes.BOOLEAN()),
+                                new Schema.Column("c2", DataTypes.TINYINT()),
+                                new Schema.Column("c3", DataTypes.SMALLINT()),
+                                new Schema.Column("c4", DataTypes.INT()),
+                                new Schema.Column("c5", DataTypes.BIGINT()),
+                                new Schema.Column("c6", DataTypes.FLOAT()),
+                                new Schema.Column("c7", DataTypes.DOUBLE()),
+                                new Schema.Column("c8", DataTypes.STRING()),
+                                new Schema.Column("c9", DataTypes.DECIMAL(5, 2)),
+                                new Schema.Column("c10", DataTypes.DECIMAL(20, 0)),
+                                new Schema.Column("c11", DataTypes.TIMESTAMP_LTZ(6)),
+                                new Schema.Column("c12", DataTypes.TIMESTAMP(6)),
+                                new Schema.Column("c13", DataTypes.BINARY(4)),
+                                new Schema.Column("c14", DataTypes.STRING())));
+        // write some rows;
+        List<InternalRow> rows =
+                Arrays.asList(
+                        row(
+                                false,
+                                (byte) 1,
+                                (short) 2,
+                                3,
+                                4L,
+                                5.1f,
+                                6.0d,
+                                "string",
+                                Decimal.fromUnscaledLong(9, 5, 2),
+                                Decimal.fromBigDecimal(new java.math.BigDecimal(10), 20, 0),
+                                TimestampLtz.fromEpochMillis(1698235273182L, 5000),
+                                TimestampNtz.fromMillis(1698235273183L, 6000),
+                                new byte[]{1, 2, 3, 4},
+                                null),
+                        row(
+                                true,
+                                (byte) 10,
+                                (short) 20,
+                                30,
+                                40L,
+                                50.1f,
+                                60.0d,
+                                "another_string",
+                                Decimal.fromUnscaledLong(90, 5, 2),
+                                Decimal.fromBigDecimal(new java.math.BigDecimal(100), 20, 0),
+                                TimestampLtz.fromEpochMillis(1698235273200L, 5000),
+                                TimestampNtz.fromMillis(1698235273201L, 6000),
+                                new byte[]{1, 2, 3, 4},
+                                null));
+
+        writeRows(t1, rows, false);
+
+        // wait unit records has been synced
+        waitUntilBucketSynced(t1, tableId, 1, false);
+
+        // stop lake tiering service
+        jobClient.cancel().get();
+
+        // write a row again
+        rows =
+                Collections.singletonList(
+                        row(
+                                true,
+                                (byte) 100,
+                                (short) 200,
+                                30,
+                                400L,
+                                500.1f,
+                                600.0d,
+                                "another_string_2",
+                                Decimal.fromUnscaledLong(900, 5, 2),
+                                Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
+                                TimestampLtz.fromEpochMillis(1698235273400L, 7000),
+                                TimestampNtz.fromMillis(1698235273501L, 8000),
+                                new byte[]{5, 6, 7, 8},
+                                null));
+        writeRows(t1, rows, false);
+
+        // read paimon directly using $lake
+        List<String> paimonSnapshotRows =
+                toSortedRows(
+                        batchTEnv.executeSql(String.format("select * from %s$lake", tableName)));
+        // paimon's source will emit +U[0, v0, xx] instead of +I[0, v0, xx], so
+        // replace +U with +I to make it equal
+        assertThat(paimonSnapshotRows.toString().replace("+U", "+I"))
+                .isEqualTo(
+                        "[+I[false, 1, 2, 3, 4, 5.1, 6.0, string, 0.09, 10, 2023-10-25T12:01:13.182005Z, 2023-10-25T12:01:13.183006, [1, 2, 3, 4], null, 0, -1, 1969-12-31T23:59:59.999Z], +I[true, 10, 20, 30, 40, 50.1, 60.0, another_string, 0.90, 100, 2023-10-25T12:01:13.200005Z, 2023-10-25T12:01:13.201006, [1, 2, 3, 4], null, 0, -1, 1969-12-31T23:59:59.999Z]]");
+
+        // now, query the result, it must union lake snapshot and log
+        List<String> result =
+                toSortedRows(batchTEnv.executeSql("select * from " + tableName));
+        assertThat(result.toString())
+                .isEqualTo(
+                        "[+I[false, 1, 2, 3, 4, 5.1, 6.0, string, 0.09, 10, 2023-10-25T12:01:13.182005Z, 2023-10-25T12:01:13.183006, [1, 2, 3, 4], null], +I[true, 100, 200, 30, 400, 500.1, 600.0, another_string_2, 9.00, 1000, 2023-10-25T12:01:13.400007Z, 2023-10-25T12:01:13.501008, [5, 6, 7, 8], null]]");
     }
 
     private List<Row> paddingPartition(TablePath tablePath, List<Row> rows) {
@@ -287,10 +396,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         row ->
                                 isPartitioned
                                         ? Row.of(
-                                                row.getField(0),
-                                                row.getField(1),
-                                                row.getField(2),
-                                                row.getField(3))
+                                        row.getField(0),
+                                        row.getField(1),
+                                        row.getField(2),
+                                        row.getField(3))
                                         : Row.of(row.getField(0), row.getField(1), row.getField(2)))
                 .map(Row::toString)
                 .sorted()

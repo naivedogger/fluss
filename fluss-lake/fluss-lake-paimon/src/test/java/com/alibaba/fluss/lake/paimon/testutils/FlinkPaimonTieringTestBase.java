@@ -38,7 +38,6 @@ import com.alibaba.fluss.server.replica.Replica;
 import com.alibaba.fluss.server.testutils.FlussClusterExtension;
 import com.alibaba.fluss.server.zk.ZooKeeperClient;
 import com.alibaba.fluss.types.DataTypes;
-
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -52,7 +51,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import javax.annotation.Nullable;
-
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -69,7 +67,9 @@ import static com.alibaba.fluss.testutils.common.CommonTestUtils.waitUtil;
 import static com.alibaba.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Test base for sync to paimon by Flink. */
+/**
+ * Test base for sync to paimon by Flink.
+ */
 public class FlinkPaimonTieringTestBase {
     protected static final String DEFAULT_DB = "fluss";
 
@@ -285,9 +285,9 @@ public class FlinkPaimonTieringTestBase {
     }
 
     protected long createPrimaryKeyTable(
-            TablePath tablePath, int bucketNum, List<Schema.Column> columns) throws Exception {
+            TablePath tablePath, int bucketNum, int pkIdx, List<Schema.Column> columns) throws Exception {
         Schema.Builder schemaBuilder =
-                Schema.newBuilder().fromColumns(columns).primaryKey(columns.get(0).getName());
+                Schema.newBuilder().fromColumns(columns).primaryKey(columns.get(pkIdx).getName());
 
         TableDescriptor.Builder tableBuilder =
                 TableDescriptor.builder()
@@ -353,25 +353,25 @@ public class FlinkPaimonTieringTestBase {
                 });
     }
 
-    protected void waitUtilBucketSynced(
+    protected void waitUntilBucketSynced(
             TablePath tablePath, long tableId, int bucketCount, boolean isPartition) {
         if (isPartition) {
             Map<Long, String> partitionById = waitUntilPartitions(tablePath);
             for (Long partitionId : partitionById.keySet()) {
                 for (int i = 0; i < bucketCount; i++) {
                     TableBucket tableBucket = new TableBucket(tableId, partitionId, i);
-                    waitUtilBucketSynced(tableBucket);
+                    waitUntilBucketSynced(tableBucket);
                 }
             }
         } else {
             for (int i = 0; i < bucketCount; i++) {
                 TableBucket tableBucket = new TableBucket(tableId, i);
-                waitUtilBucketSynced(tableBucket);
+                waitUntilBucketSynced(tableBucket);
             }
         }
     }
 
-    protected void waitUtilBucketSynced(TableBucket tb) {
+    protected void waitUntilBucketSynced(TableBucket tb) {
         waitUtil(
                 () -> {
                     Replica replica = getLeaderReplica(tb);
