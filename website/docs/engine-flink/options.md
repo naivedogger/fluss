@@ -4,11 +4,13 @@ sidebar_position: 7
 ---
 
 <!--
- Copyright (c) 2025 Alibaba Group Holding Ltd.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements.  See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership.  The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
 
       http://www.apache.org/licenses/LICENSE-2.0
 
@@ -165,4 +167,5 @@ ALTER TABLE log_table SET ('table.log.ttl' = '7d');
 | client.filesystem.security.token.renewal.backoff    | Duration | 1h        | The time period how long to wait before retrying to obtain new security tokens for filesystem after a failure.                                                                                                                                                                                                                                                                                                    |
 | client.filesystem.security.token.renewal.time-ratio | Double   | 0.75      | Ratio of the token's expiration time when new credentials for access filesystem should be re-obtained.                                                                                                                                                                                                                                                                                                            |
 | client.metrics.enabled                              | Boolean  | false     | Enable metrics for client. When metrics is enabled, the client will collect metrics and report by the JMX metrics reporter.                                                                                                                                                                                                                                                                                       |
-| client.security.protocol                            | String   | PLAINTEXT | The authentication protocol used to authenticate the client.                                                                                                                                                                                                                                                                                                                                                      |
+| client.security.protocol                            | String   | PLAINTEXT | The security protocol used to communicate with brokers. Currently, only `PLAINTEXT` and `SASL` are supported, the configuration value is case insensitive.                                                                                                                                                                                                                                                        |
+| `client.security.{protocol}.*`                      | optional | (none)    | Client-side configuration properties for a specific authentication protocol. E.g., client.security.sasl.jaas.config. More Details in [authentication](../security/authentication.md)                                                                                                                                                                                                                              |                                                                                                                                                                                 

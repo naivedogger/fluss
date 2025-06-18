@@ -5,11 +5,13 @@ sidebar_position: 2
 ---
 
 <!--
- Copyright (c) 2025 Alibaba Group Holding Ltd.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements.  See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership.  The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
 
       http://www.apache.org/licenses/LICENSE-2.0
 
@@ -37,11 +39,13 @@ USE CATALOG fluss_catalog;
 
 The following properties can be set if using the Fluss catalog:
 
-| Option            | Required | Default | Description                                                 | 
-|-------------------|----------|---------|-------------------------------------------------------------|
-| type              | required | (none)  | Catalog type, must to be 'fluss' here.                      |
-| bootstrap.servers | required | (none)  | Comma separated list of Fluss servers.                      |
-| default-database  | optional | fluss   | The default database to use when switching to this catalog. |
+| Option                         | Required | Default   | Description                                                                                                                                                                          | 
+|--------------------------------|----------|-----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| type                           | required | (none)    | Catalog type, must to be 'fluss' here.                                                                                                                                               |
+| bootstrap.servers              | required | (none)    | Comma separated list of Fluss servers.                                                                                                                                               |
+| default-database               | optional | fluss     | The default database to use when switching to this catalog.                                                                                                                          |
+| client.security.protocol       | optional | PLAINTEXT | The security protocol used to communicate with brokers. Currently, only `PLAINTEXT` and `SASL` are supported, the configuration value is case insensitive.                           |
+| `client.security.{protocol}.*` | optional | (none)    | Client-side configuration properties for a specific authentication protocol. E.g., client.security.sasl.jaas.config. More Details in [authentication](../security/authentication.md) | (none)        |
 
 The following introduced statements assuming the current catalog is switched to the Fluss catalog using `USE CATALOG <catalog_name>` statement.
 

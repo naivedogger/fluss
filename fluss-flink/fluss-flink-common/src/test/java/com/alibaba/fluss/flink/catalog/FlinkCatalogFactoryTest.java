@@ -1,11 +1,12 @@
 /*
- * Copyright (c) 2025 Alibaba Group Holding Ltd.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,11 +36,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link FlinkCatalogFactory}. */
-public class FlinkCatalogFactoryTest {
+abstract class FlinkCatalogFactoryTest {
 
-    private static final String CATALOG_NAME = "my_catalog";
-    private static final String BOOTSTRAP_SERVERS_NAME = "localhost:9092";
-    private static final String DB_NAME = "my_db";
+    static final String CATALOG_NAME = "my_catalog";
+    static final String BOOTSTRAP_SERVERS_NAME = "localhost:9092";
+    static final String DB_NAME = "my_db";
 
     @Test
     public void testCreateCatalog() {
