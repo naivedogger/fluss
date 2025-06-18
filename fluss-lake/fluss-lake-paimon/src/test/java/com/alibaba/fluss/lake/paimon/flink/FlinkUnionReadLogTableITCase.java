@@ -18,6 +18,7 @@ package com.alibaba.fluss.lake.paimon.flink;
 
 import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.row.InternalRow;
+
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CollectionUtil;
@@ -26,6 +27,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -34,9 +36,7 @@ import java.util.stream.Collectors;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * The IT case for Flink union data in lake and fluss for log table.
- */
+/** The IT case for Flink union data in lake and fluss for log table. */
 class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
 
     @BeforeAll
