@@ -75,7 +75,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         long tableId = preparePkTable(t1, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
 
         // wait unit records has been synced
-        waitUntilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
+        waitUtilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
 
         // write records again
         writeRowsToPkTable(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
@@ -238,7 +238,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         writeRows(t1, rows, false);
 
         // wait unit records has been synced
-        waitUntilBucketSynced(t1, tableId, 1, false);
+        waitUtilBucketSynced(t1, tableId, 1, false);
 
         // stop lake tiering service
         jobClient.cancel().get();
@@ -272,7 +272,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         long tableId = preparePKTableFullType(t1, 1, isPartitioned, bucketLogEndOffset);
 
         // wait unit records has been synced
-        waitUntilBucketSynced(t1, tableId, 1, isPartitioned);
+        waitUtilBucketSynced(t1, tableId, 1, isPartitioned);
 
         // stop lake tiering service
         jobClient.cancel().get();

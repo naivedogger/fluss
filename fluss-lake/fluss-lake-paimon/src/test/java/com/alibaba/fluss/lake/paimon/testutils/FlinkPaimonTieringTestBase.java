@@ -354,25 +354,25 @@ public class FlinkPaimonTieringTestBase {
                 });
     }
 
-    protected void waitUntilBucketSynced(
+    protected void waitUtilBucketSynced(
             TablePath tablePath, long tableId, int bucketCount, boolean isPartition) {
         if (isPartition) {
             Map<Long, String> partitionById = waitUntilPartitions(tablePath);
             for (Long partitionId : partitionById.keySet()) {
                 for (int i = 0; i < bucketCount; i++) {
                     TableBucket tableBucket = new TableBucket(tableId, partitionId, i);
-                    waitUntilBucketSynced(tableBucket);
+                    waitUtilBucketSynced(tableBucket);
                 }
             }
         } else {
             for (int i = 0; i < bucketCount; i++) {
                 TableBucket tableBucket = new TableBucket(tableId, i);
-                waitUntilBucketSynced(tableBucket);
+                waitUtilBucketSynced(tableBucket);
             }
         }
     }
 
-    protected void waitUntilBucketSynced(TableBucket tb) {
+    protected void waitUtilBucketSynced(TableBucket tb) {
         waitUtil(
                 () -> {
                     Replica replica = getLeaderReplica(tb);
