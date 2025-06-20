@@ -29,6 +29,7 @@ import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
 import com.alibaba.fluss.server.replica.Replica;
 import com.alibaba.fluss.types.DataTypes;
+
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.types.Row;
@@ -39,6 +40,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
+
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -52,9 +54,7 @@ import java.util.stream.Collectors;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * The IT case for Flink union data in lake and fluss for primary key table.
- */
+/** The IT case for Flink union data in lake and fluss for primary key table. */
 class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
 
     @BeforeAll
@@ -165,13 +165,13 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                 t1,
                 isPartitioned,
                 Arrays.asList(
-                        new Object[]{"f00", 0, "v0"},
-                        new Object[]{"f11", 1, "v111"},
-                        new Object[]{"f22", 2, "v222"},
-                        new Object[]{"f44", 4, "v4"},
-                        new Object[]{"f5", 5, "v5"},
-                        new Object[]{"f6", 6, "v6"},
-                        new Object[]{"f7", 7, "v7"}));
+                        new Object[] {"f00", 0, "v0"},
+                        new Object[] {"f11", 1, "v111"},
+                        new Object[] {"f22", 2, "v222"},
+                        new Object[] {"f44", 4, "v4"},
+                        new Object[] {"f5", 5, "v5"},
+                        new Object[] {"f6", 6, "v6"},
+                        new Object[] {"f7", 7, "v7"}));
 
         // query again and check the data
         // it must union snapshot and log
@@ -298,7 +298,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                                 new java.math.BigDecimal(1000), 20, 0),
                                         TimestampLtz.fromEpochMillis(1698235273400L, 7000),
                                         TimestampNtz.fromMillis(1698235273501L, 8000),
-                                        new byte[]{5, 6, 7, 8},
+                                        new byte[] {5, 6, 7, 8},
                                         partition));
                 writeRows(t1, rows, false);
             }
@@ -318,7 +318,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
                                     TimestampLtz.fromEpochMillis(1698235273400L, 7000),
                                     TimestampNtz.fromMillis(1698235273501L, 8000),
-                                    new byte[]{5, 6, 7, 8},
+                                    new byte[] {5, 6, 7, 8},
                                     null));
             writeRows(t1, rows, false);
         }
@@ -372,7 +372,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(10), 20, 0),
                                 TimestampLtz.fromEpochMillis(1698235273182L, 5000),
                                 TimestampNtz.fromMillis(1698235273183L, 6000),
-                                new byte[]{1, 2, 3, 4},
+                                new byte[] {1, 2, 3, 4},
                                 partitionName),
                         Row.of(
                                 true,
@@ -387,7 +387,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
                                 TimestampLtz.fromEpochMillis(1698235273400L, 7000),
                                 TimestampNtz.fromMillis(1698235273501L, 8000),
-                                new byte[]{5, 6, 7, 8},
+                                new byte[] {5, 6, 7, 8},
                                 partitionName));
         tableResult =
                 batchTEnv.executeSql(
@@ -451,10 +451,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         row ->
                                 isPartitioned
                                         ? Row.of(
-                                        row.getField(0),
-                                        row.getField(1),
-                                        row.getField(2),
-                                        row.getField(3))
+                                                row.getField(0),
+                                                row.getField(1),
+                                                row.getField(2),
+                                                row.getField(3))
                                         : Row.of(row.getField(0), row.getField(1), row.getField(2)))
                 .map(Row::toString)
                 .sorted()
@@ -661,7 +661,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         Decimal.fromBigDecimal(new java.math.BigDecimal(10), 20, 0),
                         TimestampLtz.fromEpochMillis(1698235273182L, 5000),
                         TimestampNtz.fromMillis(1698235273183L, 6000),
-                        new byte[]{1, 2, 3, 4},
+                        new byte[] {1, 2, 3, 4},
                         partition),
                 row(
                         true,
@@ -676,7 +676,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         Decimal.fromBigDecimal(new java.math.BigDecimal(100), 20, 0),
                         TimestampLtz.fromEpochMillis(1698235273200L, 5000),
                         TimestampNtz.fromMillis(1698235273201L, 6000),
-                        new byte[]{1, 2, 3, 4},
+                        new byte[] {1, 2, 3, 4},
                         partition));
     }
 }
