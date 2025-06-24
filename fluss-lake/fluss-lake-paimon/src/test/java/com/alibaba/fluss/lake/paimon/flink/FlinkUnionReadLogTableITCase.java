@@ -100,7 +100,7 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
     private long prepareLogTable(
             TablePath tablePath, int bucketNum, boolean isPartitioned, List<Row> flinkRows)
             throws Exception {
-        long t1Id = createLogTable(tablePath, bucketNum, isPartitioned);
+        long t1Id = createFullTypeLogTable(tablePath, bucketNum, isPartitioned);
         if (isPartitioned) {
             Map<Long, String> partitionNameById = waitUntilPartitions(tablePath);
             for (String partition : partitionNameById.values()) {

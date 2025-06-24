@@ -266,6 +266,28 @@ public class FlinkPaimonTieringTestBase {
     protected long createLogTable(TablePath tablePath, int bucketNum, boolean isPartitioned)
             throws Exception {
         Schema.Builder schemaBuilder =
+                Schema.newBuilder().column("a", DataTypes.INT()).column("b", DataTypes.STRING());
+
+        TableDescriptor.Builder tableBuilder =
+                TableDescriptor.builder()
+                        .distributedBy(bucketNum, "a")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500));
+
+        if (isPartitioned) {
+            schemaBuilder.column("c", DataTypes.STRING());
+            tableBuilder.property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true);
+            tableBuilder.partitionedBy("c");
+            tableBuilder.property(
+                    ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.YEAR);
+        }
+        tableBuilder.schema(schemaBuilder.build());
+        return createTable(tablePath, tableBuilder.build());
+    }
+
+    protected long createFullTypeLogTable(TablePath tablePath, int bucketNum, boolean isPartitioned)
+            throws Exception {
+        Schema.Builder schemaBuilder =
                 Schema.newBuilder()
                         .column("f_boolean", DataTypes.BOOLEAN())
                         .column("f_byte", DataTypes.TINYINT())
