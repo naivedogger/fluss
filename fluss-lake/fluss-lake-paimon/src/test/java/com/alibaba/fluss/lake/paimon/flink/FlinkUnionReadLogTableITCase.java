@@ -134,9 +134,9 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
                                 "another_string_" + i,
                                 Decimal.fromUnscaledLong(900, 5, 2),
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
-                                TimestampLtz.fromEpochMillis(1698235273400L, 0),
+                                TimestampLtz.fromEpochMillis(1698235273400L),
                                 TimestampLtz.fromEpochMillis(1698235273400L, 7000),
-                                TimestampNtz.fromMillis(1698235273501L, 0),
+                                TimestampNtz.fromMillis(1698235273501L),
                                 TimestampNtz.fromMillis(1698235273501L, 8000),
                                 new byte[] {5, 6, 7, 8}));
 
@@ -174,9 +174,9 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
                                 "another_string_" + i,
                                 Decimal.fromUnscaledLong(900, 5, 2),
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
-                                TimestampLtz.fromEpochMillis(1698235273400L, 0),
+                                TimestampLtz.fromEpochMillis(1698235273400L),
                                 TimestampLtz.fromEpochMillis(1698235273400L, 7000),
-                                TimestampNtz.fromMillis(1698235273501L, 0),
+                                TimestampNtz.fromMillis(1698235273501L),
                                 TimestampNtz.fromMillis(1698235273501L, 8000),
                                 new byte[] {5, 6, 7, 8},
                                 partition));

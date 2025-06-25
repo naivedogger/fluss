@@ -153,9 +153,9 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 "another_string",
                                 Decimal.fromUnscaledLong(90, 5, 2),
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(100), 20, 0),
-                                TimestampLtz.fromEpochMillis(1698235273200L, 0),
+                                TimestampLtz.fromEpochMillis(1698235273200L),
                                 TimestampLtz.fromEpochMillis(1698235273200L, 5000),
-                                TimestampNtz.fromMillis(1698235273201L, 0),
+                                TimestampNtz.fromMillis(1698235273201L),
                                 TimestampNtz.fromMillis(1698235273201L, 6000),
                                 new byte[] {1, 2, 3, 4},
                                 partition));
@@ -191,9 +191,9 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     "another_string",
                                     Decimal.fromUnscaledLong(90, 5, 2),
                                     Decimal.fromBigDecimal(new java.math.BigDecimal(100), 20, 0),
-                                    TimestampLtz.fromEpochMillis(1698235273200L, 0),
+                                    TimestampLtz.fromEpochMillis(1698235273200L),
                                     TimestampLtz.fromEpochMillis(1698235273200L, 5000),
-                                    TimestampNtz.fromMillis(1698235273201L, 0),
+                                    TimestampNtz.fromMillis(1698235273201L),
                                     TimestampNtz.fromMillis(1698235273201L, 6000),
                                     new byte[] {1, 2, 3, 4},
                                     null));
@@ -281,9 +281,9 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 "string",
                                 Decimal.fromUnscaledLong(9, 5, 2),
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(10), 20, 0),
-                                TimestampLtz.fromEpochMillis(1698235273182L, 0),
+                                TimestampLtz.fromEpochMillis(1698235273182L),
                                 TimestampLtz.fromEpochMillis(1698235273182L, 5000),
-                                TimestampNtz.fromMillis(1698235273183L, 0),
+                                TimestampNtz.fromMillis(1698235273183L),
                                 TimestampNtz.fromMillis(1698235273183L, 6000),
                                 new byte[] {1, 2, 3, 4},
                                 partition));
@@ -300,9 +300,9 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 "another_string_2",
                                 Decimal.fromUnscaledLong(900, 5, 2),
                                 Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
-                                TimestampLtz.fromEpochMillis(1698235273400L, 0),
+                                TimestampLtz.fromEpochMillis(1698235273400L),
                                 TimestampLtz.fromEpochMillis(1698235273400L, 7000),
-                                TimestampNtz.fromMillis(1698235273501L, 0),
+                                TimestampNtz.fromMillis(1698235273501L),
                                 TimestampNtz.fromMillis(1698235273501L, 8000),
                                 new byte[] {5, 6, 7, 8},
                                 partition));
@@ -321,9 +321,9 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     "string",
                                     Decimal.fromUnscaledLong(9, 5, 2),
                                     Decimal.fromBigDecimal(new java.math.BigDecimal(10), 20, 0),
-                                    TimestampLtz.fromEpochMillis(1698235273182L, 0),
+                                    TimestampLtz.fromEpochMillis(1698235273182L),
                                     TimestampLtz.fromEpochMillis(1698235273182L, 5000),
-                                    TimestampNtz.fromMillis(1698235273183L, 0),
+                                    TimestampNtz.fromMillis(1698235273183L),
                                     TimestampNtz.fromMillis(1698235273183L, 6000),
                                     new byte[] {1, 2, 3, 4},
                                     null),
@@ -338,15 +338,15 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     "another_string_2",
                                     Decimal.fromUnscaledLong(900, 5, 2),
                                     Decimal.fromBigDecimal(new java.math.BigDecimal(1000), 20, 0),
-                                    TimestampLtz.fromEpochMillis(1698235273400L, 0),
+                                    TimestampLtz.fromEpochMillis(1698235273400L),
                                     TimestampLtz.fromEpochMillis(1698235273400L, 7000),
-                                    TimestampNtz.fromMillis(1698235273501L, 0),
+                                    TimestampNtz.fromMillis(1698235273501L),
                                     TimestampNtz.fromMillis(1698235273501L, 8000),
                                     new byte[] {5, 6, 7, 8},
                                     null));
         }
 
-        // now, query the result, it must union lake snapshot and log
+        // now, query the result, it must be the union result of lake snapshot and log
         List<String> result = toSortedRows(batchTEnv.executeSql("select * from " + tableName));
         String expectedResult = buildExpectedResult(isPartitioned, 0, 2);
         assertThat(result.toString().replace("+U", "+I")).isEqualTo(expectedResult);
