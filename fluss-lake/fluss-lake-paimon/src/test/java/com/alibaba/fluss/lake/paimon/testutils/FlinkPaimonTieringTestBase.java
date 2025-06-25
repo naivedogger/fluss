@@ -52,8 +52,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-import javax.annotation.Nullable;
-
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -417,16 +415,5 @@ public class FlinkPaimonTieringTestBase {
                 },
                 Duration.ofMinutes(2),
                 "bucket " + tb + "not synced");
-    }
-
-    protected Object[] rowValues(Object[] values, @Nullable String partition) {
-        if (partition == null) {
-            return values;
-        } else {
-            Object[] newValues = new Object[values.length + 1];
-            System.arraycopy(values, 0, newValues, 0, values.length);
-            newValues[values.length] = partition;
-            return newValues;
-        }
     }
 }

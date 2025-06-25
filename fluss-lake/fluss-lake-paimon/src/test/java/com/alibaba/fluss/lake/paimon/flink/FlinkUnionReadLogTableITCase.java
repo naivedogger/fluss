@@ -61,9 +61,9 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
 
         TablePath t1 = TablePath.of(DEFAULT_DB, tableName);
         List<Row> writtenRows = new ArrayList<>();
-        long tableId = prepareLogTable(t1, 1, isPartitioned, writtenRows);
-        // wait until records has has been synced
-        waitUtilBucketSynced(t1, tableId, 1, isPartitioned);
+        long tableId = prepareLogTable(t1, DEFAULT_BUCKET_NUM, isPartitioned, writtenRows);
+        // wait until records has been synced
+        waitUtilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
 
         // now, start to read the log table, which will read paimon
         // may read fluss or not, depends on the log offset of paimon snapshot
