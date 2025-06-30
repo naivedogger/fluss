@@ -52,7 +52,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
-import java.util.stream.Collectors;
 
 import static com.alibaba.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 
@@ -172,13 +171,7 @@ public class MetadataUpdater {
     }
 
     public void checkAndUpdateTableMetadata(Set<TablePath> tablePaths) {
-        Set<TablePath> needUpdateTablePaths =
-                tablePaths.stream()
-                        .filter(tablePath -> !cluster.getTable(tablePath).isPresent())
-                        .collect(Collectors.toSet());
-        if (!needUpdateTablePaths.isEmpty()) {
-            updateMetadata(needUpdateTablePaths, null, null);
-        }
+        updateMetadata(tablePaths, null, null);
     }
 
     /**
@@ -188,9 +181,7 @@ public class MetadataUpdater {
      * <p>and update partition metadata .
      */
     public boolean checkAndUpdatePartitionMetadata(PhysicalTablePath physicalTablePath) {
-        if (!cluster.getPartitionId(physicalTablePath).isPresent()) {
-            updateMetadata(null, Collections.singleton(physicalTablePath), null);
-        }
+        updateMetadata(null, Collections.singleton(physicalTablePath), null);
         return cluster.getPartitionId(physicalTablePath).isPresent();
     }
 

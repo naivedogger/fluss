@@ -46,6 +46,7 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.options.Options;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -352,6 +353,20 @@ public class FlinkPaimonTieringTestBase {
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
                         .build();
         return createTable(tablePath, table1Descriptor);
+    }
+
+    protected void dropTable(TablePath tablePath) throws Exception {
+        admin.dropTable(tablePath, false).get();
+        Identifier tableIdentifier = toPaimonIdentifier(tablePath);
+        try {
+            paimonCatalog.dropTable(tableIdentifier, false);
+        } catch (Catalog.TableNotExistException e) {
+            // do nothing, table not exists
+        }
+    }
+
+    private Identifier toPaimonIdentifier(TablePath tablePath) {
+        return Identifier.create(tablePath.getDatabaseName(), tablePath.getTableName());
     }
 
     protected void assertReplicaStatus(
