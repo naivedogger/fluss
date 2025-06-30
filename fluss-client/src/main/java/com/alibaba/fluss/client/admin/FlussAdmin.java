@@ -71,7 +71,6 @@ import com.alibaba.fluss.security.acl.AclBindingFilter;
 import com.alibaba.fluss.utils.MapUtils;
 
 import javax.annotation.Nullable;
-
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -377,12 +376,12 @@ public class FlussAdmin implements Admin {
             Collection<Integer> buckets,
             OffsetSpec offsetSpec) {
         Long partitionId = null;
-        metadataUpdater.checkAndUpdateTableMetadata(
+        metadataUpdater.updateTableMetadata(
                 Collections.singleton(physicalTablePath.getTablePath()));
         long tableId = metadataUpdater.getTableId(physicalTablePath.getTablePath());
         // if partition name is not null, we need to check and update partition metadata
         if (physicalTablePath.getPartitionName() != null) {
-            metadataUpdater.checkAndUpdatePartitionMetadata(physicalTablePath);
+            metadataUpdater.updatePartitionMetadata(physicalTablePath);
             partitionId = metadataUpdater.getPartitionIdOrElseThrow(physicalTablePath);
         }
         Map<Integer, ListOffsetsRequest> requestMap =

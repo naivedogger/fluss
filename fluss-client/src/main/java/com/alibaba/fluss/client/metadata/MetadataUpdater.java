@@ -38,12 +38,10 @@ import com.alibaba.fluss.rpc.gateway.AdminReadOnlyGateway;
 import com.alibaba.fluss.rpc.gateway.CoordinatorGateway;
 import com.alibaba.fluss.rpc.gateway.TabletServerGateway;
 import com.alibaba.fluss.utils.ExceptionUtils;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
-
 import java.net.InetSocketAddress;
 import java.util.Collection;
 import java.util.Collections;
@@ -52,10 +50,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 import static com.alibaba.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 
-/** The updater to initialize and update client metadata. */
+/**
+ * The updater to initialize and update client metadata.
+ */
 public class MetadataUpdater {
     private static final Logger LOG = LoggerFactory.getLogger(MetadataUpdater.class);
 
@@ -171,6 +172,16 @@ public class MetadataUpdater {
     }
 
     public void checkAndUpdateTableMetadata(Set<TablePath> tablePaths) {
+        Set<TablePath> needUpdateTablePaths =
+                tablePaths.stream()
+                        .filter(tablePath -> !cluster.getTable(tablePath).isPresent())
+                        .collect(Collectors.toSet());
+        if (!needUpdateTablePaths.isEmpty()) {
+            updateMetadata(needUpdateTablePaths, null, null);
+        }
+    }
+
+    public void updateTableMetadata(Set<TablePath> tablePaths) {
         updateMetadata(tablePaths, null, null);
     }
 
@@ -181,6 +192,13 @@ public class MetadataUpdater {
      * <p>and update partition metadata .
      */
     public boolean checkAndUpdatePartitionMetadata(PhysicalTablePath physicalTablePath) {
+        if (!cluster.getPartitionId(physicalTablePath).isPresent()) {
+            updateMetadata(null, Collections.singleton(physicalTablePath), null);
+        }
+        return cluster.getPartitionId(physicalTablePath).isPresent();
+    }
+
+    public boolean updatePartitionMetadata(PhysicalTablePath physicalTablePath) {
         updateMetadata(null, Collections.singleton(physicalTablePath), null);
         return cluster.getPartitionId(physicalTablePath).isPresent();
     }
@@ -224,7 +242,9 @@ public class MetadataUpdater {
         updateMetadata(Collections.singleton(tablePath), null, partitionIds);
     }
 
-    /** Update the table or partition metadata info. */
+    /**
+     * Update the table or partition metadata info.
+     */
     public void updatePhysicalTableMetadata(Set<PhysicalTablePath> physicalTablePaths) {
         Set<TablePath> updateTablePaths = new HashSet<>();
         Set<PhysicalTablePath> updatePartitionPath = new HashSet<>();
@@ -308,14 +328,18 @@ public class MetadataUpdater {
         return sendMetadataRequestAndRebuildCluster(adminReadOnlyGateway, Collections.emptySet());
     }
 
-    /** Invalid the bucket metadata for the given physical table paths. */
+    /**
+     * Invalid the bucket metadata for the given physical table paths.
+     */
     public void invalidPhysicalTableBucketMeta(Set<PhysicalTablePath> physicalTablesToInvalid) {
         if (!physicalTablesToInvalid.isEmpty()) {
             cluster = cluster.invalidPhysicalTableBucketMeta(physicalTablesToInvalid);
         }
     }
 
-    /** Get the table physical paths by table ids and partition ids. */
+    /**
+     * Get the table physical paths by table ids and partition ids.
+     */
     public Set<PhysicalTablePath> getPhysicalTablePathByIds(
             @Nullable Collection<Long> tableId,
             @Nullable Collection<TablePartition> tablePartitions) {
