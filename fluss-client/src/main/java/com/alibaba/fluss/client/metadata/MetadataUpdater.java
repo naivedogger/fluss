@@ -38,10 +38,12 @@ import com.alibaba.fluss.rpc.gateway.AdminReadOnlyGateway;
 import com.alibaba.fluss.rpc.gateway.CoordinatorGateway;
 import com.alibaba.fluss.rpc.gateway.TabletServerGateway;
 import com.alibaba.fluss.utils.ExceptionUtils;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
+
 import java.net.InetSocketAddress;
 import java.util.Collection;
 import java.util.Collections;
@@ -54,9 +56,7 @@ import java.util.stream.Collectors;
 
 import static com.alibaba.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 
-/**
- * The updater to initialize and update client metadata.
- */
+/** The updater to initialize and update client metadata. */
 public class MetadataUpdater {
     private static final Logger LOG = LoggerFactory.getLogger(MetadataUpdater.class);
 
@@ -242,9 +242,7 @@ public class MetadataUpdater {
         updateMetadata(Collections.singleton(tablePath), null, partitionIds);
     }
 
-    /**
-     * Update the table or partition metadata info.
-     */
+    /** Update the table or partition metadata info. */
     public void updatePhysicalTableMetadata(Set<PhysicalTablePath> physicalTablePaths) {
         Set<TablePath> updateTablePaths = new HashSet<>();
         Set<PhysicalTablePath> updatePartitionPath = new HashSet<>();
@@ -328,18 +326,14 @@ public class MetadataUpdater {
         return sendMetadataRequestAndRebuildCluster(adminReadOnlyGateway, Collections.emptySet());
     }
 
-    /**
-     * Invalid the bucket metadata for the given physical table paths.
-     */
+    /** Invalid the bucket metadata for the given physical table paths. */
     public void invalidPhysicalTableBucketMeta(Set<PhysicalTablePath> physicalTablesToInvalid) {
         if (!physicalTablesToInvalid.isEmpty()) {
             cluster = cluster.invalidPhysicalTableBucketMeta(physicalTablesToInvalid);
         }
     }
 
-    /**
-     * Get the table physical paths by table ids and partition ids.
-     */
+    /** Get the table physical paths by table ids and partition ids. */
     public Set<PhysicalTablePath> getPhysicalTablePathByIds(
             @Nullable Collection<Long> tableId,
             @Nullable Collection<TablePartition> tablePartitions) {
