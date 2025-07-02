@@ -21,6 +21,7 @@ import com.alibaba.fluss.lake.paimon.testutils.FlinkPaimonTieringTestBase;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.row.InternalRow;
+
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.paimon.catalog.Catalog;
@@ -38,9 +39,7 @@ import java.util.List;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * A Test case for dropping a pktable after tiering and creating one with the same tablePath.
- */
+/** A Test case for dropping a pktable after tiering and creating one with the same tablePath. */
 public class DropTableAfterTieringTest extends FlinkPaimonTieringTestBase {
     protected static final String DEFAULT_DB = "fluss";
 
