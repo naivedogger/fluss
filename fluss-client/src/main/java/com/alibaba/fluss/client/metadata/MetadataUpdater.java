@@ -181,10 +181,6 @@ public class MetadataUpdater {
         }
     }
 
-    public void updateTableMetadata(Set<TablePath> tablePaths) {
-        updateMetadata(tablePaths, null, null);
-    }
-
     /**
      * Check the partition exists in metadata cache, if not, try to update the metadata cache, if
      * not exist yet, throw exception.
@@ -195,11 +191,6 @@ public class MetadataUpdater {
         if (!cluster.getPartitionId(physicalTablePath).isPresent()) {
             updateMetadata(null, Collections.singleton(physicalTablePath), null);
         }
-        return cluster.getPartitionId(physicalTablePath).isPresent();
-    }
-
-    public boolean updatePartitionMetadata(PhysicalTablePath physicalTablePath) {
-        updateMetadata(null, Collections.singleton(physicalTablePath), null);
         return cluster.getPartitionId(physicalTablePath).isPresent();
     }
 

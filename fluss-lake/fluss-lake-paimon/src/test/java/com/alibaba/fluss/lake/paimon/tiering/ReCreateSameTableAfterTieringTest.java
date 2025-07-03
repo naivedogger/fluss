@@ -24,27 +24,19 @@ import com.alibaba.fluss.row.InternalRow;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.paimon.catalog.Catalog;
-import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.reader.RecordReader;
-import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.utils.CloseableIterator;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
-import java.util.Iterator;
 import java.util.List;
 
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
-import static org.assertj.core.api.Assertions.assertThat;
 
 /** A Test case for dropping a pktable after tiering and creating one with the same tablePath. */
-public class DropTableAfterTieringTest extends FlinkPaimonTieringTestBase {
+class ReCreateSameTableAfterTieringTest extends FlinkPaimonTieringTestBase {
     protected static final String DEFAULT_DB = "fluss";
 
     private static StreamExecutionEnvironment execEnv;
-    private static Catalog paimonCatalog;
 
     @BeforeAll
     protected static void beforeAll() {
@@ -52,11 +44,10 @@ public class DropTableAfterTieringTest extends FlinkPaimonTieringTestBase {
         execEnv = StreamExecutionEnvironment.getExecutionEnvironment();
         execEnv.setParallelism(2);
         execEnv.enableCheckpointing(1000);
-        paimonCatalog = getPaimonCatalog();
     }
 
     @Test
-    void testDropTable() throws Exception {
+    void testReCreateSameTable() throws Exception {
         // create a pk table, write some records and wait until snapshot finished
         TablePath t1 = TablePath.of(DEFAULT_DB, "pkTable_drop");
         long t1Id = createPkTable(t1);
@@ -90,30 +81,5 @@ public class DropTableAfterTieringTest extends FlinkPaimonTieringTestBase {
 
         // stop the tiering job
         jobClient.cancel().get();
-    }
-
-    private void checkDataInPaimonPrimayKeyTable(
-            TablePath tablePath, List<InternalRow> expectedRows) throws Exception {
-        Iterator<org.apache.paimon.data.InternalRow> paimonRowIterator =
-                getPaimonRowCloseableIterator(tablePath);
-        for (InternalRow expectedRow : expectedRows) {
-            org.apache.paimon.data.InternalRow row = paimonRowIterator.next();
-            assertThat(row.getInt(0)).isEqualTo(expectedRow.getInt(0));
-            assertThat(row.getString(1).toString()).isEqualTo(expectedRow.getString(1).toString());
-        }
-    }
-
-    private CloseableIterator<org.apache.paimon.data.InternalRow> getPaimonRowCloseableIterator(
-            TablePath tablePath) throws Exception {
-        Identifier tableIdentifier =
-                Identifier.create(tablePath.getDatabaseName(), tablePath.getTableName());
-
-        paimonCatalog = getPaimonCatalog();
-
-        FileStoreTable table = (FileStoreTable) paimonCatalog.getTable(tableIdentifier);
-
-        RecordReader<org.apache.paimon.data.InternalRow> reader =
-                table.newRead().createReader(table.newReadBuilder().newScan().plan());
-        return reader.toCloseableIterator();
     }
 }
