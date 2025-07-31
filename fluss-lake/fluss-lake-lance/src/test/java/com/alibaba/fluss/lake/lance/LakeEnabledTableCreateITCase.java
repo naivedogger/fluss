@@ -23,6 +23,7 @@ import com.alibaba.fluss.client.admin.Admin;
 import com.alibaba.fluss.config.ConfigOptions;
 import com.alibaba.fluss.config.Configuration;
 import com.alibaba.fluss.exception.FlussRuntimeException;
+import com.alibaba.fluss.exception.InvalidTableException;
 import com.alibaba.fluss.lake.lance.utils.LanceDatasetAdapter;
 import com.alibaba.fluss.metadata.DataLakeFormat;
 import com.alibaba.fluss.metadata.Schema;
@@ -30,7 +31,6 @@ import com.alibaba.fluss.metadata.TableDescriptor;
 import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.server.testutils.FlussClusterExtension;
 import com.alibaba.fluss.types.DataTypes;
-
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
@@ -49,8 +49,11 @@ import static com.alibaba.fluss.metadata.TableDescriptor.BUCKET_COLUMN_NAME;
 import static com.alibaba.fluss.metadata.TableDescriptor.OFFSET_COLUMN_NAME;
 import static com.alibaba.fluss.metadata.TableDescriptor.TIMESTAMP_COLUMN_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** ITCase for create lake enabled table with lance as lake storage. */
+/**
+ * ITCase for create lake enabled table with lance as lake storage.
+ */
 class LakeEnabledTableCreateITCase {
 
     @RegisterExtension
@@ -200,5 +203,24 @@ class LakeEnabledTableCreateITCase {
                                 logC10, logC11, logC12, logC13, logC14, logC15, logC16, logC17,
                                 logC18, logC19));
         assertThat(expectedSchema).isEqualTo(LanceDatasetAdapter.getSchema(config).get());
+    }
+
+    @Test
+    void testPrimaryKeyTable() throws Exception {
+        TableDescriptor pkTable =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("pk_c1", DataTypes.INT())
+                                        .column("pk_c2", DataTypes.STRING())
+                                        .primaryKey("pk_c1")
+                                        .build())
+                        .distributedBy(BUCKET_NUM)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .build();
+        TablePath pkTablePath = TablePath.of(DATABASE, "pk_table");
+        assertThatThrownBy(() -> admin.createTable(pkTablePath, pkTable, false).get())
+                .cause()
+                .isInstanceOf(InvalidTableException.class);
     }
 }

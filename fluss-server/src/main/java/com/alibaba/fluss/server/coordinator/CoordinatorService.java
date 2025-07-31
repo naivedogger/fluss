@@ -104,7 +104,6 @@ import com.alibaba.fluss.utils.IOUtils;
 import com.alibaba.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
-
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -129,7 +128,9 @@ import static com.alibaba.fluss.utils.PartitionUtils.validatePartitionSpec;
 import static com.alibaba.fluss.utils.Preconditions.checkNotNull;
 import static com.alibaba.fluss.utils.Preconditions.checkState;
 
-/** An RPC Gateway service for coordinator server. */
+/**
+ * An RPC Gateway service for coordinator server.
+ */
 public final class CoordinatorService extends RpcServiceBase implements CoordinatorGateway {
 
     private final int defaultBucketNumber;
@@ -302,11 +303,19 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         if (newDescriptor.getPartitionKeys().size() > 1
                 && "true".equals(properties.get(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key()))
                 && !properties.containsKey(
-                        ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key())) {
+                ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key())) {
             Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
             // disable precreate partitions for multi-level partitions.
             newProperties.put(ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key(), "0");
             newDescriptor = newDescriptor.withProperties(newProperties);
+        }
+
+        // currently, we don't support primary key table for lance
+        if (dataLakeFormat != null && dataLakeFormat.equals(DataLakeFormat.LANCE)) {
+            if (newDescriptor.hasPrimaryKey()) {
+                throw new InvalidTableException(
+                        "Currently, we don't support tiering a primary key table to Lance");
+            }
         }
 
         // override the datalake format if the table hasn't set it and the cluster configured
