@@ -1857,6 +1857,109 @@ Result LogScanner::PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out) 
     return detail::ArrowBatchImporter::Import(ffi_result.arrow_batches, out);
 }
 
+Result LogScanner::CreateBoundedReaderUntilLatest(const Admin& admin,
+                                                  BoundedRecordBatchReader& out) {
+    if (!Available()) {
+        return utils::make_client_error("LogScanner not available");
+    }
+    if (!admin.Available()) {
+        return utils::make_client_error("Admin not available");
+    }
+
+    auto ffi_result = scanner_->create_bounded_reader_until_latest(*admin.admin_);
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.Destroy();
+        out.reader_ = utils::ptr_from_ffi<ffi::BoundedRecordBatchReader>(ffi_result);
+    }
+    return result;
+}
+
+Result LogScanner::CreateBoundedReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets,
+                                                   BoundedRecordBatchReader& out) {
+    if (!Available()) {
+        return utils::make_client_error("LogScanner not available");
+    }
+
+    rust::Vec<ffi::FfiReaderStopOffset> ffi_offsets;
+    for (const auto& offset : offsets) {
+        ffi::FfiReaderStopOffset ffi_offset;
+        ffi_offset.table_id = offset.bucket.table_id;
+        ffi_offset.has_partition_id = offset.bucket.partition_id.has_value();
+        ffi_offset.partition_id = offset.bucket.partition_id.value_or(0);
+        ffi_offset.bucket_id = offset.bucket.bucket_id;
+        ffi_offset.offset = offset.offset;
+        ffi_offsets.push_back(ffi_offset);
+    }
+
+    auto ffi_result = scanner_->create_bounded_reader_until_offsets(std::move(ffi_offsets));
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.Destroy();
+        out.reader_ = utils::ptr_from_ffi<ffi::BoundedRecordBatchReader>(ffi_result);
+    }
+    return result;
+}
+
+// ============================================================================
+// BoundedRecordBatchReader
+// ============================================================================
+
+BoundedRecordBatchReader::BoundedRecordBatchReader() noexcept = default;
+
+BoundedRecordBatchReader::BoundedRecordBatchReader(ffi::BoundedRecordBatchReader* reader) noexcept
+    : reader_(reader) {}
+
+BoundedRecordBatchReader::~BoundedRecordBatchReader() noexcept { Destroy(); }
+
+void BoundedRecordBatchReader::Destroy() noexcept {
+    if (reader_) {
+        ffi::delete_bounded_record_batch_reader(reader_);
+        reader_ = nullptr;
+    }
+}
+
+BoundedRecordBatchReader::BoundedRecordBatchReader(BoundedRecordBatchReader&& other) noexcept
+    : reader_(other.reader_) {
+    other.reader_ = nullptr;
+}
+
+BoundedRecordBatchReader& BoundedRecordBatchReader::operator=(
+        BoundedRecordBatchReader&& other) noexcept {
+    if (this != &other) {
+        Destroy();
+        reader_ = other.reader_;
+        other.reader_ = nullptr;
+    }
+    return *this;
+}
+
+bool BoundedRecordBatchReader::Available() const { return reader_ != nullptr; }
+
+Result BoundedRecordBatchReader::NextBatch(ArrowRecordBatches& out) {
+    if (!Available()) {
+        return utils::make_client_error("BoundedRecordBatchReader not available");
+    }
+    auto ffi_result = reader_->bounded_reader_next_batch();
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (!result.Ok()) {
+        return result;
+    }
+    return detail::ArrowBatchImporter::Import(ffi_result.arrow_batches, out);
+}
+
+Result BoundedRecordBatchReader::CollectAllBatches(ArrowRecordBatches& out) {
+    if (!Available()) {
+        return utils::make_client_error("BoundedRecordBatchReader not available");
+    }
+    auto ffi_result = reader_->bounded_reader_collect_all_batches();
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (!result.Ok()) {
+        return result;
+    }
+    return detail::ArrowBatchImporter::Import(ffi_result.arrow_batches, out);
+}
+
 // ============================================================================
 // BatchScanner
 // ============================================================================

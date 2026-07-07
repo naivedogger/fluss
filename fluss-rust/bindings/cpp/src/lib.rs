@@ -163,6 +163,14 @@ mod ffi {
         arrow_batches: FfiArrowRecordBatches,
     }
 
+    struct FfiReaderStopOffset {
+        table_id: i64,
+        has_partition_id: bool,
+        partition_id: i64,
+        bucket_id: i32,
+        offset: i64,
+    }
+
     struct FfiLakeSnapshot {
         snapshot_id: i64,
         bucket_offsets: Vec<FfiBucketOffset>,
@@ -290,6 +298,7 @@ mod ffi {
         type WriteResult;
         type LogScanner;
         type BatchScanner;
+        type BoundedRecordBatchReader;
         type UpsertWriter;
         type Lookuper;
         type PrefixLookuper;
@@ -697,7 +706,21 @@ mod ffi {
         -> FfiResult;
         fn poll(self: &LogScanner, timeout_ms: i64) -> Box<ScanResultInner>;
         fn poll_record_batch(self: &LogScanner, timeout_ms: i64) -> FfiArrowRecordBatchesResult;
+        fn create_bounded_reader_until_latest(self: &LogScanner, admin: &Admin) -> FfiPtrResult;
+        fn create_bounded_reader_until_offsets(
+            self: &LogScanner,
+            offsets: Vec<FfiReaderStopOffset>,
+        ) -> FfiPtrResult;
         fn free_arrow_ffi_structures(array_ptr: usize, schema_ptr: usize);
+
+        // BoundedRecordBatchReader
+        unsafe fn delete_bounded_record_batch_reader(reader: *mut BoundedRecordBatchReader);
+        fn bounded_reader_next_batch(
+            self: &BoundedRecordBatchReader,
+        ) -> FfiArrowRecordBatchesResult;
+        fn bounded_reader_collect_all_batches(
+            self: &BoundedRecordBatchReader,
+        ) -> FfiArrowRecordBatchesResult;
 
         // BatchScanner
         unsafe fn delete_batch_scanner(scanner: *mut BatchScanner);
@@ -844,6 +867,10 @@ pub struct LogScanner {
 
 pub struct BatchScanner {
     inner: Mutex<fcore::client::LimitBatchScanner>,
+}
+
+pub struct BoundedRecordBatchReader {
+    inner: Mutex<fcore::client::RecordBatchLogReader>,
 }
 
 pub struct UpsertWriter {
@@ -2204,6 +2231,93 @@ impl LogScanner {
         let result = RUNTIME.block_on(async { inner_batch.poll(timeout).await });
 
         match result {
+            Ok(batches) => arrow_batches_result(types::core_scan_batches_to_ffi(&batches)),
+            Err(e) => empty_arrow_batches_result(err_from_core_error(&e)),
+        }
+    }
+
+    fn create_bounded_reader_until_latest(&self, admin: &Admin) -> ffi::FfiPtrResult {
+        let ScannerKind::Batch(ref inner_batch) = self.scanner else {
+            return client_err_ptr("Batch-based scanner not available".to_string());
+        };
+
+        let reader_result = RUNTIME.block_on(async {
+            fcore::client::RecordBatchLogReader::new_until_latest(
+                inner_batch.new_shared_handle(),
+                admin.inner.as_ref(),
+            )
+            .await
+        });
+
+        match reader_result {
+            Ok(reader) => {
+                let ptr = Box::into_raw(Box::new(BoundedRecordBatchReader {
+                    inner: Mutex::new(reader),
+                }));
+                ok_ptr(ptr as usize)
+            }
+            Err(e) => err_ptr_from_core(&e),
+        }
+    }
+
+    fn create_bounded_reader_until_offsets(
+        &self,
+        offsets: Vec<ffi::FfiReaderStopOffset>,
+    ) -> ffi::FfiPtrResult {
+        let ScannerKind::Batch(ref inner_batch) = self.scanner else {
+            return client_err_ptr("Batch-based scanner not available".to_string());
+        };
+
+        let mut stopping_offsets = HashMap::new();
+        for offset in offsets {
+            let partition_id = offset.has_partition_id.then_some(offset.partition_id);
+            let bucket = fcore::metadata::TableBucket::new_with_partition(
+                offset.table_id,
+                partition_id,
+                offset.bucket_id,
+            );
+            stopping_offsets.insert(bucket, offset.offset);
+        }
+
+        match fcore::client::RecordBatchLogReader::new_until_offsets(
+            inner_batch.new_shared_handle(),
+            stopping_offsets,
+        ) {
+            Ok(reader) => {
+                let ptr = Box::into_raw(Box::new(BoundedRecordBatchReader {
+                    inner: Mutex::new(reader),
+                }));
+                ok_ptr(ptr as usize)
+            }
+            Err(e) => err_ptr_from_core(&e),
+        }
+    }
+}
+
+// BoundedRecordBatchReader implementation
+unsafe fn delete_bounded_record_batch_reader(reader: *mut BoundedRecordBatchReader) {
+    if !reader.is_null() {
+        unsafe {
+            drop(Box::from_raw(reader));
+        }
+    }
+}
+
+impl BoundedRecordBatchReader {
+    fn bounded_reader_next_batch(&self) -> ffi::FfiArrowRecordBatchesResult {
+        let mut reader = self.inner.lock().unwrap();
+        match RUNTIME.block_on(reader.next_batch()) {
+            Ok(Some(batch)) => arrow_batches_result(types::core_scan_batches_to_ffi(
+                std::slice::from_ref(&batch),
+            )),
+            Ok(None) => empty_arrow_batches_result(ok_result()),
+            Err(e) => empty_arrow_batches_result(err_from_core_error(&e)),
+        }
+    }
+
+    fn bounded_reader_collect_all_batches(&self) -> ffi::FfiArrowRecordBatchesResult {
+        let mut reader = self.inner.lock().unwrap();
+        match RUNTIME.block_on(reader.collect_all_batches()) {
             Ok(batches) => arrow_batches_result(types::core_scan_batches_to_ffi(&batches)),
             Err(e) => empty_arrow_batches_result(err_from_core_error(&e)),
         }

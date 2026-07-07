@@ -702,6 +702,69 @@ TEST_F(LogTableTest, TestPollBatches) {
     ASSERT_OK(adm.DropTable(table_path, false));
 }
 
+TEST_F(LogTableTest, BoundedRecordBatchReaderUntilOffsets) {
+    auto& adm = admin();
+    auto& conn = connection();
+
+    fluss::TablePath table_path("fluss", "test_bounded_record_batch_reader_offsets_cpp");
+
+    auto schema = fluss::Schema::NewBuilder()
+                      .AddColumn("id", fluss::DataType::Int())
+                      .AddColumn("name", fluss::DataType::String())
+                      .Build();
+
+    auto table_descriptor = fluss::TableDescriptor::NewBuilder()
+                                .SetSchema(schema)
+                                .SetBucketCount(1)
+                                .SetBucketKeys({"id"})
+                                .SetProperty("table.replication.factor", "1")
+                                .Build();
+
+    fluss_test::CreateTable(adm, table_path, table_descriptor);
+
+    fluss::Table table;
+    ASSERT_OK(conn.GetTable(table_path, table));
+
+    auto table_append = table.NewAppend();
+    fluss::AppendWriter writer;
+    ASSERT_OK(table_append.CreateWriter(writer));
+
+    auto id_builder = arrow::Int32Builder();
+    id_builder.AppendValues({1, 2, 3, 4, 5}).ok();
+    auto name_builder = arrow::StringBuilder();
+    name_builder.AppendValues({"a", "b", "c", "d", "e"}).ok();
+    auto batch = arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("id", arrow::int32()), arrow::field("name", arrow::utf8())}),
+        5, {id_builder.Finish().ValueOrDie(), name_builder.Finish().ValueOrDie()});
+    ASSERT_OK(writer.AppendArrowBatch(batch));
+    ASSERT_OK(writer.Flush());
+
+    fluss::LogScanner scanner;
+    ASSERT_OK(table.NewScan().CreateRecordBatchLogScanner(scanner));
+    ASSERT_OK(scanner.Subscribe(0, 1));
+
+    const int64_t table_id = table.GetTableInfo().table_id;
+    fluss::BoundedRecordBatchReader reader;
+    ASSERT_OK(scanner.CreateBoundedReaderUntilOffsets(
+        {fluss::ReaderStopOffset{fluss::TableBucket{table_id, 0}, 4}}, reader));
+    ASSERT_TRUE(reader.Available());
+
+    fluss::ArrowRecordBatches batches;
+    ASSERT_OK(reader.CollectAllBatches(batches));
+
+    std::vector<int32_t> ids;
+    for (const auto& bounded_batch : batches) {
+        auto arr = std::static_pointer_cast<arrow::Int32Array>(
+            bounded_batch->GetArrowRecordBatch()->column(0));
+        for (int64_t i = 0; i < arr->length(); ++i) {
+            ids.push_back(arr->Value(i));
+        }
+    }
+    EXPECT_EQ(ids, (std::vector<int32_t>{2, 3, 4}));
+
+    ASSERT_OK(adm.DropTable(table_path, false));
+}
+
 TEST_F(LogTableTest, AllSupportedDatatypes) {
     auto& adm = admin();
     auto& conn = connection();

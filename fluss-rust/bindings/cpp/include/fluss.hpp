@@ -48,6 +48,7 @@ struct AppendWriter;
 struct WriteResult;
 struct LogScanner;
 struct BatchScanner;
+struct BoundedRecordBatchReader;
 struct UpsertWriter;
 struct Lookuper;
 struct PrefixLookuper;
@@ -1237,6 +1238,11 @@ struct BucketOffset {
     int64_t offset;
 };
 
+struct ReaderStopOffset {
+    TableBucket bucket;
+    int64_t offset;
+};
+
 struct BucketSubscription {
     int32_t bucket_id;
     int64_t offset;
@@ -1515,6 +1521,7 @@ class Admin {
                          const std::string* partition_name = nullptr);
 
     friend class Connection;
+    friend class LogScanner;
     Admin(ffi::Admin* admin) noexcept;
 
     void Destroy() noexcept;
@@ -1785,6 +1792,30 @@ class PrefixLookuper {
     ffi::PrefixLookuper* lookuper_{nullptr};
 };
 
+// Bounded record-batch reader created from a subscribed record-batch log scanner.
+class BoundedRecordBatchReader {
+   public:
+    BoundedRecordBatchReader() noexcept;
+    ~BoundedRecordBatchReader() noexcept;
+
+    BoundedRecordBatchReader(const BoundedRecordBatchReader&) = delete;
+    BoundedRecordBatchReader& operator=(const BoundedRecordBatchReader&) = delete;
+    BoundedRecordBatchReader(BoundedRecordBatchReader&& other) noexcept;
+    BoundedRecordBatchReader& operator=(BoundedRecordBatchReader&& other) noexcept;
+
+    bool Available() const;
+
+    Result NextBatch(ArrowRecordBatches& out);
+    Result CollectAllBatches(ArrowRecordBatches& out);
+
+   private:
+    friend class LogScanner;
+    explicit BoundedRecordBatchReader(ffi::BoundedRecordBatchReader* reader) noexcept;
+
+    void Destroy() noexcept;
+    ffi::BoundedRecordBatchReader* reader_{nullptr};
+};
+
 class LogScanner {
    public:
     LogScanner() noexcept;
@@ -1805,6 +1836,9 @@ class LogScanner {
     Result UnsubscribePartition(int64_t partition_id, int32_t bucket_id);
     Result Poll(int64_t timeout_ms, ScanRecords& out);
     Result PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out);
+    Result CreateBoundedReaderUntilLatest(const Admin& admin, BoundedRecordBatchReader& out);
+    Result CreateBoundedReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets,
+                                           BoundedRecordBatchReader& out);
 
    private:
     friend class Table;
