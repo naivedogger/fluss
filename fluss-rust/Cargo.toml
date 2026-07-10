@@ -28,7 +28,7 @@ keywords = ["fluss", "streaming-storage", "datalake"]
 
 [workspace]
 resolver = "2"
-members = ["crates/fluss", "crates/fluss-test-cluster", "crates/examples", "bindings/python", "bindings/cpp", "bindings/elixir/native/fluss_nif"]
+members = ["crates/fluss", "crates/fluss-test-cluster", "crates/examples", "crates/integrations/datafusion", "bindings/python", "bindings/cpp", "bindings/elixir/native/fluss_nif"]
 
 [workspace.dependencies]
 fluss = { package = "fluss-rs", version = "1.0.0", path = "crates/fluss", features = ["storage-all"] }
@@ -41,3 +41,4 @@ serde_json = "1.0"
 metrics = "0.24"
 opendal = "0.53"
 jiff = { version = "0.2" }
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "215ebb8471dcc29234f84b79ba859d64f4733e06" }
