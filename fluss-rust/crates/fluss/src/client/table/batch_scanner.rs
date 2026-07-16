@@ -28,15 +28,15 @@ use crate::client::metadata::Metadata;
 use crate::client::table::read_context_resolver::ReadContextResolver;
 use crate::error::{ApiError, Error, FlussError, Result};
 use crate::metadata::{KvFormat, RowType, Schema, TableBucket, TableInfo};
-use crate::proto::ErrorResponse;
+use crate::proto::{ErrorResponse, PbScanReqForBucket, ScanKvResponse};
 use crate::record::kv::{SCHEMA_ID_LENGTH, ValueRecordBatch};
 use crate::record::{
     LogRecordsBatches, ReadContext as ArrowReadContext, RowAppendRecordBatchBuilder, ScanBatch,
     to_arrow_schema,
 };
 use crate::row::FixedSchemaDecoder;
-use crate::rpc::RpcClient;
-use crate::rpc::message::LimitScanRequest;
+use crate::rpc::message::{LimitScanRequest, ScanKvRequest};
+use crate::rpc::{RpcClient, ServerConnection};
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow_schema::SchemaRef;
@@ -46,6 +46,7 @@ use futures::Stream;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// One-shot bounded scanner: a single `LimitScanRequest` yielded as one
 /// [`ScanBatch`]. Creation is cheap; the request runs on the first
@@ -287,9 +288,10 @@ async fn decode_kv_batch(
     table_info: &TableInfo,
     schema_getter: &ClientSchemaGetter,
     projected_fields: Option<&[usize]>,
-    raw: Vec<u8>,
+    raw: impl Into<Bytes>,
     limit: usize,
 ) -> Result<RecordBatch> {
+    let raw: Bytes = raw.into();
     // No records: return an empty (projected) batch.
     if raw.is_empty() {
         return empty_record_batch(table_info.get_row_type(), projected_fields);
@@ -306,7 +308,7 @@ async fn decode_kv_batch(
             source: None,
         })?;
 
-    let batch = ValueRecordBatch::new(Bytes::from(raw));
+    let batch = ValueRecordBatch::new(raw);
     let ranges = batch.value_ranges()?;
 
     // Collect the distinct schema ids present, then build one decoder per id
@@ -452,6 +454,338 @@ fn project_batch(
                 .collect();
             Ok(RecordBatch::try_new(projected_schema, columns)?)
         }
+    }
+}
+
+/// Streams every live row of a single primary-key bucket from the tablet
+/// server's KV state via a sequence of `ScanKv` RPCs. The scan has snapshot
+/// isolation: rows reflect the KV state at the moment the server opened its
+/// snapshot; concurrent writes after that point are invisible.
+///
+/// Each [`next_batch`](Self::next_batch) issues one RPC — an open request while
+/// no session exists, then continuations — and returns the decoded rows as a
+/// [`ScanBatch`], or `None` once the server reports the scan is drained. Empty
+/// intermediate responses are skipped internally, so a returned batch always
+/// carries at least one row.
+pub struct KvBatchScanner {
+    bucket: TableBucket,
+    rpc_client: Arc<RpcClient>,
+    metadata: Arc<Metadata>,
+    table_info: TableInfo,
+    schema_getter: Arc<ClientSchemaGetter>,
+    projected_fields: Option<Vec<usize>>,
+    batch_size_bytes: i32,
+    /// Leader connection, resolved lazily on the first `next_batch`.
+    connection: Option<ServerConnection>,
+    /// Server-assigned session id; `None` until the first response.
+    scanner_id: Option<Vec<u8>>,
+    /// Monotonic sequence number: 0 for the open request, incremented per
+    /// continuation (matches the server's in-order delivery validation).
+    call_seq_id: i32,
+    /// Number of `TooManyScanners` open retries already attempted.
+    open_retries: u32,
+    /// Log high-watermark captured when the server opened the snapshot.
+    log_offset: Option<i64>,
+    drained: bool,
+    closed: bool,
+}
+
+impl KvBatchScanner {
+    const MAX_OPEN_RETRIES: u32 = 3;
+    const BASE_RETRY_DELAY_MS: u64 = 100;
+
+    pub(super) fn new(
+        rpc_client: Arc<RpcClient>,
+        metadata: Arc<Metadata>,
+        table_info: TableInfo,
+        schema_getter: Arc<ClientSchemaGetter>,
+        projected_fields: Option<Vec<usize>>,
+        bucket: TableBucket,
+        batch_size_bytes: i32,
+    ) -> Self {
+        Self {
+            bucket,
+            rpc_client,
+            metadata,
+            table_info,
+            schema_getter,
+            projected_fields,
+            batch_size_bytes: batch_size_bytes.max(1),
+            connection: None,
+            scanner_id: None,
+            call_seq_id: 0,
+            open_retries: 0,
+            log_offset: None,
+            drained: false,
+            closed: false,
+        }
+    }
+
+    /// The bucket scanned by this `KvBatchScanner`.
+    pub fn bucket(&self) -> &TableBucket {
+        &self.bucket
+    }
+
+    /// The log high-watermark captured when the server opened the KV snapshot,
+    /// available after the first `next_batch`. It marks the log offset from
+    /// which a changelog tail can resume to read rows written after the
+    /// snapshot (snapshot + changelog handoff).
+    pub fn snapshot_log_offset(&self) -> Option<i64> {
+        self.log_offset
+    }
+
+    /// Issues the next `ScanKv` RPC and returns its rows as a [`ScanBatch`], or
+    /// `None` once the scan is drained. Not retried on transient RPC failures —
+    /// an error leaves the scanner spent; create a new one to retry.
+    pub async fn next_batch(&mut self) -> Result<Option<ScanBatch>> {
+        loop {
+            if self.closed || self.drained {
+                return Ok(None);
+            }
+
+            let response = match self.send_next().await {
+                Ok(response) => response,
+                Err(e) => {
+                    self.terminate();
+                    return Err(e);
+                }
+            };
+
+            if let Some(code) = response.error_code
+                && code != FlussError::None.code()
+            {
+                // Either retries the open (and loops) or returns a terminal error.
+                self.handle_error_response(code, response.error_message)
+                    .await?;
+                continue;
+            }
+
+            if let Some(id) = response.scanner_id {
+                self.scanner_id = Some(id);
+            }
+            if self.log_offset.is_none() {
+                self.log_offset = response.log_offset;
+            }
+
+            // A terminal response (`has_more_results == false`) means the server
+            // has closed the session; no continuation or close is needed.
+            if !response.has_more_results.unwrap_or(false) {
+                self.drained = true;
+            }
+
+            match response.records {
+                Some(raw) if !raw.is_empty() => {
+                    let batch = decode_kv_batch(
+                        &self.table_info,
+                        &self.schema_getter,
+                        self.projected_fields.as_deref(),
+                        raw,
+                        usize::MAX,
+                    )
+                    .await?;
+                    // KV rows carry no per-row log offset, so base_offset is 0.
+                    return Ok(Some(ScanBatch::new(self.bucket.clone(), batch, 0)));
+                }
+                // Empty batch: stop if drained, otherwise fetch the next one.
+                _ => {
+                    if self.drained {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drains the scanner into all of its batches.
+    pub async fn collect_all_batches(&mut self) -> Result<Vec<ScanBatch>> {
+        let mut batches = Vec::new();
+        while let Some(batch) = self.next_batch().await? {
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
+
+    /// Best-effort close of the server-side scanner session. Only meaningful for
+    /// a scanner abandoned mid-scan; a drained scanner is already closed by the
+    /// server, and any failure here is reclaimed by the server-side session TTL.
+    pub async fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        if self.drained {
+            return Ok(());
+        }
+        if let (Some(connection), Some(scanner_id)) =
+            (self.connection.clone(), self.scanner_id.clone())
+        {
+            let request = ScanKvRequest::new(
+                Some(scanner_id),
+                None,
+                None,
+                Some(self.batch_size_bytes),
+                Some(true),
+            );
+            // Ignore the outcome: the session TTL reclaims it if this fails.
+            let _ = connection.request(request).await;
+        }
+        Ok(())
+    }
+
+    /// Sends the open request while no session exists, otherwise a continuation.
+    async fn send_next(&mut self) -> Result<ScanKvResponse> {
+        if self.scanner_id.is_none() {
+            self.open_scanner().await
+        } else {
+            self.continue_scanner().await
+        }
+    }
+
+    async fn open_scanner(&mut self) -> Result<ScanKvResponse> {
+        let leader = self
+            .metadata
+            .leader_for(&self.table_info.table_path, &self.bucket)
+            .await?
+            .ok_or_else(|| {
+                Error::leader_not_available(format!(
+                    "No leader found for table bucket: {}",
+                    self.bucket
+                ))
+            })?;
+        let connection = self.rpc_client.get_connection(&leader).await?;
+        self.connection = Some(connection.clone());
+
+        let bucket_req = PbScanReqForBucket {
+            table_id: self.bucket.table_id(),
+            partition_id: self.bucket.partition_id(),
+            bucket_id: self.bucket.bucket_id(),
+            limit: None,
+        };
+        // call_seq_id stays 0 for the open request (including open retries).
+        self.call_seq_id = 0;
+        let request = ScanKvRequest::new(
+            None,
+            Some(bucket_req),
+            Some(self.call_seq_id),
+            Some(self.batch_size_bytes),
+            None,
+        );
+        connection.request(request).await
+    }
+
+    async fn continue_scanner(&mut self) -> Result<ScanKvResponse> {
+        let connection = self
+            .connection
+            .clone()
+            .ok_or_else(|| Error::UnexpectedError {
+                message: "KvBatchScanner continuation issued without an open connection"
+                    .to_string(),
+                source: None,
+            })?;
+        self.call_seq_id += 1;
+        let request = ScanKvRequest::new(
+            self.scanner_id.clone(),
+            None,
+            Some(self.call_seq_id),
+            Some(self.batch_size_bytes),
+            None,
+        );
+        connection.request(request).await
+    }
+
+    /// Handles an error response. Returns `Ok(())` when the caller should retry
+    /// (re-open the scanner), or an `Err` for a terminal failure.
+    async fn handle_error_response(&mut self, code: i32, message: Option<String>) -> Result<()> {
+        let error = FlussError::for_code(code);
+        let api_error = ApiError {
+            code,
+            message: message.unwrap_or_else(|| error.message().to_string()),
+        };
+
+        match error {
+            // Retry the open with exponential backoff — only before a session
+            // was established, so no rows can be skipped or repeated.
+            FlussError::TooManyScanners
+                if self.scanner_id.is_none() && self.open_retries < Self::MAX_OPEN_RETRIES =>
+            {
+                let delay_ms = Self::BASE_RETRY_DELAY_MS * (1u64 << self.open_retries);
+                self.open_retries += 1;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                Ok(())
+            }
+            // Stale leader: refresh metadata so a fresh scan resolves the new
+            // leader. Auto-restarting here would silently swap the RocksDB
+            // snapshot and break snapshot isolation.
+            FlussError::NotLeaderOrFollower => {
+                let _ = self
+                    .metadata
+                    .update_table_metadata(&self.table_info.table_path)
+                    .await;
+                self.terminate();
+                Err(Error::FlussAPIError { api_error })
+            }
+            // The server-side session is already gone; skip the close request.
+            FlussError::ScannerExpired | FlussError::UnknownScannerId => {
+                self.scanner_id = None;
+                self.closed = true;
+                self.drained = true;
+                Err(Error::FlussAPIError { api_error })
+            }
+            _ => {
+                self.terminate();
+                Err(Error::FlussAPIError { api_error })
+            }
+        }
+    }
+
+    /// Marks the scanner closed. Any lingering server-side session is reclaimed
+    /// by its TTL; call [`close`](Self::close) to release it eagerly.
+    fn terminate(&mut self) {
+        self.closed = true;
+    }
+}
+
+/// Full primary-key table scan: scans a fixed set of buckets sequentially, each
+/// with its own [`KvBatchScanner`]. Buckets are scanned lazily and one at a
+/// time, so only a single `ScanKv` session is open at any moment.
+pub struct KvSnapshotScanner {
+    pending: std::collections::VecDeque<KvBatchScanner>,
+    current: Option<KvBatchScanner>,
+}
+
+impl KvSnapshotScanner {
+    pub(super) fn new(scanners: Vec<KvBatchScanner>) -> Self {
+        Self {
+            pending: scanners.into(),
+            current: None,
+        }
+    }
+
+    /// Returns the next non-empty [`ScanBatch`] across all buckets, advancing to
+    /// the next bucket as each one drains, or `None` once every bucket is done.
+    pub async fn next_batch(&mut self) -> Result<Option<ScanBatch>> {
+        loop {
+            if self.current.is_none() {
+                self.current = self.pending.pop_front();
+                if self.current.is_none() {
+                    return Ok(None);
+                }
+            }
+            let scanner = self.current.as_mut().expect("current scanner present");
+            match scanner.next_batch().await? {
+                Some(batch) => return Ok(Some(batch)),
+                None => self.current = None,
+            }
+        }
+    }
+
+    /// Drains the whole-table scan into all of its batches.
+    pub async fn collect_all_batches(&mut self) -> Result<Vec<ScanBatch>> {
+        let mut batches = Vec::new();
+        while let Some(batch) = self.next_batch().await? {
+            batches.push(batch);
+        }
+        Ok(batches)
     }
 }
 
