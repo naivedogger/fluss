@@ -172,6 +172,9 @@ public class FlinkTableSource
     /** Watermark strategy that is pushed down by the Flink optimizer. */
     @Nullable private WatermarkStrategy<RowData> watermarkStrategy;
 
+    /** Stashed at getLookupRuntimeProvider time, used by Flink-2.x custom lookup shuffle. */
+    @Nullable private LookupNormalizer lastLookupNormalizer;
+
     public FlinkTableSource(
             TablePath tablePath,
             Configuration flussConfig,
@@ -264,7 +267,11 @@ public class FlinkTableSource
                 PushdownUtils.computeAvailableStatsColumns(flussRowType, tableConfig);
     }
 
-    private FlinkTableSource(FlinkTableSource source) {
+    /**
+     * Copy constructor used by version-specific subclasses (e.g. the Flink 2.x
+     * custom-lookup-shuffle variant) to wrap an already-built source while preserving all state.
+     */
+    protected FlinkTableSource(FlinkTableSource source) {
         this.tablePath = source.tablePath;
         this.flussConfig = new Configuration(source.flussConfig);
         this.tableOutputType = source.tableOutputType;
@@ -295,6 +302,7 @@ public class FlinkTableSource
         this.lakeSource = source.lakeSource == null ? null : source.lakeSource.copy();
         this.logRecordBatchFilter = source.logRecordBatchFilter;
         this.watermarkStrategy = source.watermarkStrategy;
+        this.lastLookupNormalizer = source.lastLookupNormalizer;
     }
 
     @Override
@@ -501,6 +509,8 @@ public class FlinkTableSource
                         partitionKeyIndexes,
                         tableOutputType,
                         projectedFields);
+        // Stash for SupportsLookupCustomShuffle (Flink 2.x). Harmless for Flink 1.x.
+        this.lastLookupNormalizer = lookupNormalizer;
         if (lookupAsync) {
             AsyncLookupFunction asyncLookupFunction =
                     new FlinkAsyncLookupFunction(
@@ -535,6 +545,42 @@ public class FlinkTableSource
     @Override
     public DynamicTableSource copy() {
         return new FlinkTableSource(this);
+    }
+
+    // ---- accessors for version-specific (Flink 2.x) custom lookup shuffle ----
+
+    /** Returns the indexes of the bucket-key columns within the table output row. */
+    protected int[] bucketKeyIndexes() {
+        return bucketKeyIndexes;
+    }
+
+    /** Returns the indexes of the primary-key columns within the table output row. */
+    protected int[] primaryKeyIndexes() {
+        return primaryKeyIndexes;
+    }
+
+    /** Returns the Flink logical row type produced by this source. */
+    protected org.apache.flink.table.types.logical.RowType tableOutputType() {
+        return tableOutputType;
+    }
+
+    /** Returns the raw table options (used to read e.g. the bucket number). */
+    protected Map<String, String> tableOptions() {
+        return tableOptions;
+    }
+
+    /** Returns the table config, e.g. to resolve the data lake format for bucketing. */
+    protected TableConfig tableConfigInternal() {
+        return tableConfig;
+    }
+
+    /**
+     * Returns the lookup normalizer stashed by the last {@link #getLookupRuntimeProvider}, or
+     * {@code null} if the lookup runtime provider has not been requested yet.
+     */
+    @Nullable
+    protected LookupNormalizer lastLookupNormalizer() {
+        return lastLookupNormalizer;
     }
 
     @Override
