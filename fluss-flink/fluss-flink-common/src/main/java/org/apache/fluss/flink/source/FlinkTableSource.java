@@ -268,8 +268,9 @@ public class FlinkTableSource
     }
 
     /**
-     * Copy constructor used by version-specific subclasses (e.g. the Flink 2.x
-     * custom-lookup-shuffle variant) to wrap an already-built source while preserving all state.
+     * Copy constructor: the single source of truth for cloning this source's state. Used by {@link
+     * #copy()} and by version-specific subclasses (e.g. the Flink 2.x custom-lookup-shuffle
+     * variant) to wrap an already-built source while preserving all state.
      */
     protected FlinkTableSource(FlinkTableSource source) {
         this.tablePath = source.tablePath;
@@ -544,6 +545,9 @@ public class FlinkTableSource
 
     @Override
     public DynamicTableSource copy() {
+        // Single source of truth for state copying: the copy constructor. It also carries over the
+        // stashed lookup normalizer, so a copy made between getLookupRuntimeProvider() and
+        // getPartitioner() (Flink 2.x custom lookup shuffle) does not silently disable the shuffle.
         return new FlinkTableSource(this);
     }
 
