@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.source.reader;
 
+import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.scanner.ScanRecord;
@@ -244,6 +245,54 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
     }
 
     @Test
+    void testBoundedLogSplitStopsAtCapturedLatestOffset() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(1).build();
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "test-bounded-log-split");
+
+        long tableId = createTable(tablePath, tableDescriptor);
+        List<InternalRow> initialRows = appendRows(tablePath, 2);
+
+        long stoppingOffset =
+                admin.listOffsets(
+                                tablePath,
+                                Collections.singletonList(0),
+                                new OffsetSpec.LatestSpec())
+                        .bucketResult(0)
+                        .get();
+
+        // These records are written after stoppingOffset was captured.
+        appendRows(tablePath, 2);
+
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        LogSplit split = new LogSplit(tableBucket, null, 0L, stoppingOffset);
+
+        List<RecordAndPos> expected = new ArrayList<>();
+        for (int i = 0; i < initialRows.size(); i++) {
+            expected.add(
+                    new RecordAndPos(
+                            new ScanRecord(i, i, ChangeType.APPEND_ONLY, initialRows.get(i))));
+        }
+
+        Map<String, List<RecordAndPos>> expectedRecords = new HashMap<>();
+        expectedRecords.put(split.splitId(), expected);
+
+        try (FlinkSourceSplitReader splitReader =
+                createSplitReader(tablePath, schema.getRowType())) {
+            assignSplitsAndFetchUntilRetrieveRecords(
+                    splitReader,
+                    Collections.singletonList(split),
+                    expectedRecords,
+                    schema.getRowType());
+        }
+    }
+
+    @Test
     void testHandleMixSnapshotLogSplitChangesAndFetch() throws Exception {
         TablePath tablePath = TablePath.of(DEFAULT_DB, "test-mix-snapshot-log-table");
         long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
@@ -338,13 +387,15 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
         long tableId =
                 createTable(
                         tablePath,
-                        TableDescriptor.builder().schema(schema).distributedBy(3).build());
+                        TableDescriptor.builder().schema(schema).distributedBy(4).build());
 
-        // create two empty splits with log start offset equal to end offset
+        // create three bounded empty splits and one unbounded split
         LogSplit split1 = new LogSplit(new TableBucket(tableId, 0), null, 0, 0);
         LogSplit split2 = new LogSplit(new TableBucket(tableId, 1), null, 0, 0);
-        LogSplit split3 = new LogSplit(new TableBucket(tableId, 2), null, EARLIEST_OFFSET);
-        List<SourceSplitBase> subscribeSplits = Arrays.asList(split1, split2, split3);
+        LogSplit split3 = new LogSplit(new TableBucket(tableId, 2), null, EARLIEST_OFFSET, 0);
+        LogSplit split4 = new LogSplit(new TableBucket(tableId, 3), null, EARLIEST_OFFSET);
+
+        List<SourceSplitBase> subscribeSplits = Arrays.asList(split1, split2, split3, split4);
 
         try (FlinkSourceSplitReader splitReader =
                 createSplitReader(tablePath, schema.getRowType())) {
@@ -352,9 +403,10 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
 
             // fetch records
             RecordsWithSplitIds<RecordAndPos> records = splitReader.fetch();
-            // finished splits should be split1,split2
+            // finished splits should be split1, split2, split3
             assertThat(records.finishedSplits())
-                    .containsExactlyInAnyOrder(split1.splitId(), split2.splitId());
+                    .containsExactlyInAnyOrder(
+                            split1.splitId(), split2.splitId(), split3.splitId());
         }
     }
 

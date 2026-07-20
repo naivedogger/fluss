@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.source.enumerator;
 
+import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.UpsertWriter;
@@ -1060,6 +1061,124 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
 
             // check the assigned partitions, should equal to the assignment with removed partition
             assertThat(enumerator.getAssignedPartitions()).isEqualTo(assignedPartitions);
+        }
+    }
+
+    @Test
+    void testBatchModeNonLakeLogTable() throws Throwable {
+        int numSubtasks = DEFAULT_BUCKET_NUM;
+        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        List<InternalRow> rows = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            rows.add(row(i, "v" + i));
+        }
+        writeRows(conn, DEFAULT_TABLE_PATH, rows, true);
+
+        List<Integer> bucketIds = new ArrayList<>();
+        for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
+            bucketIds.add(bucket);
+        }
+        Map<Integer, Long> expectedStoppingOffsets =
+                admin.listOffsets(DEFAULT_TABLE_PATH, bucketIds, new OffsetSpec.LatestSpec())
+                        .all()
+                        .get();
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(numSubtasks)) {
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            false,
+                            false,
+                            context,
+                            OffsetsInitializer.earliest(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            false,
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false);
+
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+            }
+            context.runNextOneTimeCallable();
+
+            List<SourceSplitBase> assignedSplits =
+                    getReadersAssignments(context).values().stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits).hasSize(DEFAULT_BUCKET_NUM);
+            assertThat(assignedSplits)
+                    .allSatisfy(
+                            split -> {
+                                assertThat(split).isInstanceOf(LogSplit.class);
+                                LogSplit logSplit = split.asLogSplit();
+                                assertThat(logSplit.getStartingOffset()).isEqualTo(EARLIEST_OFFSET);
+                                assertThat(logSplit.getTableBucket().getTableId())
+                                        .isEqualTo(tableId);
+                                assertThat(logSplit.getStoppingOffset())
+                                        .contains(
+                                                expectedStoppingOffsets.get(
+                                                        logSplit.getTableBucket().getBucket()));
+                            });
+        }
+    }
+
+    @Test
+    void testBatchModeNonLakePartitionedLogTable() throws Throwable {
+        int numSubtasks = DEFAULT_BUCKET_NUM;
+        long tableId =
+                createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
+        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        Map<Long, String> partitionNameByIds =
+                waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(numSubtasks)) {
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            false,
+                            true,
+                            context,
+                            OffsetsInitializer.earliest(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            false,
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false);
+
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+            }
+            context.runNextOneTimeCallable();
+
+            List<SourceSplitBase> assignedSplits =
+                    getReadersAssignments(context).values().stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits).hasSize(partitionNameByIds.size() * DEFAULT_BUCKET_NUM);
+            Set<String> assignedPartitionNames = new HashSet<>();
+            assertThat(assignedSplits)
+                    .allSatisfy(
+                            split -> {
+                                assertThat(split).isInstanceOf(LogSplit.class);
+                                LogSplit logSplit = split.asLogSplit();
+                                assertThat(logSplit.getTableBucket().getTableId())
+                                        .isEqualTo(tableId);
+                                assertThat(logSplit.getStartingOffset()).isEqualTo(EARLIEST_OFFSET);
+                                // the partitions are empty, so the captured latest offset is 0
+                                assertThat(logSplit.getStoppingOffset()).contains(0L);
+                                assignedPartitionNames.add(logSplit.getPartitionName());
+                            });
+            assertThat(assignedPartitionNames)
+                    .containsExactlyInAnyOrderElementsOf(partitionNameByIds.values());
         }
     }
 
