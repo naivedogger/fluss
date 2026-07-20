@@ -437,9 +437,9 @@ public class FlinkTableSource
                                         + modificationScanType
                                         + " statement with conditions on primary key.");
                     }
-                    if (!isDataLakeEnabled) {
+                    if (!isDataLakeEnabled && hasPrimaryKey()) {
                         throw new UnsupportedOperationException(
-                                "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
+                                "Batch read on a primary key table requires datalake enabled, or a point query on the primary key.");
                     }
                     return source;
                 }

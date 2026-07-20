@@ -353,12 +353,18 @@ public class FlussSourceBuilder<OUT> {
         boolean lakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
         boolean fullStartup = offsetsInitializer instanceof SnapshotOffsetsInitializer;
 
-        if (bounded && !(lakeEnabled && fullStartup)) {
+        // Bounded (batch) read support:
+        //  - Log tables: read from the starting offsets up to the latest offsets captured at job
+        //    startup and then finish (pure Fluss bounded read), with or without datalake.
+        //  - Primary key tables: only supported via the datalake union read in full startup mode;
+        //    a pure KV snapshot batch read is not yet supported.
+        if (bounded && hasPrimaryKey && !(lakeEnabled && fullStartup)) {
             throw new IllegalArgumentException(
                     String.format(
-                            "Bounded (batch) read requires a datalake-enabled table started in "
-                                    + "full mode (OffsetsInitializer.full()), but table '%s' has "
-                                    + "datalake enabled=%s and full startup mode=%s.",
+                            "Bounded (batch) read on primary key table '%s' requires a "
+                                    + "datalake-enabled table started in full mode "
+                                    + "(OffsetsInitializer.full()), but datalake enabled=%s and "
+                                    + "full startup mode=%s.",
                             tablePath, lakeEnabled, fullStartup));
         }
 

@@ -235,30 +235,10 @@ public class FlinkUnionReadDataStreamITCase extends FlinkUnionReadTestBase {
     }
 
     @Test
-    void testBoundedRequiresFullStartupModeFailsFast() throws Exception {
-        String tableName = "ds_bounded_invalid_startup";
+    void testBoundedOnPkTableWithoutDataLakeFailsFast() throws Exception {
+        String tableName = "ds_bounded_pk_no_lake";
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
-        createLogTable(tablePath, false);
-
-        FlussSourceBuilder<RowData> builder =
-                FlussSource.<RowData>builder()
-                        .setBootstrapServers(bootstrapServers())
-                        .setDatabase(DEFAULT_DB)
-                        .setTable(tableName)
-                        .setStartingOffsets(OffsetsInitializer.earliest())
-                        .setBounded()
-                        .setDeserializationSchema(new RowDataDeserializationSchema());
-
-        assertThatThrownBy(builder::build)
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Bounded (batch) read requires");
-    }
-
-    @Test
-    void testBoundedRequiresDataLakeEnabledFailsFast() throws Exception {
-        String tableName = "ds_bounded_no_lake";
-        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
-        createNonLakeLogTable(tablePath);
+        createNonLakePkTable(tablePath);
 
         FlussSourceBuilder<RowData> builder =
                 FlussSource.<RowData>builder()
@@ -269,9 +249,38 @@ public class FlinkUnionReadDataStreamITCase extends FlinkUnionReadTestBase {
                         .setBounded()
                         .setDeserializationSchema(new RowDataDeserializationSchema());
 
+        // Bounded read on a primary key table still requires a datalake-enabled table; a pure KV
+        // snapshot batch read is not yet supported.
         assertThatThrownBy(builder::build)
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Bounded (batch) read requires");
+                .hasMessageContaining("Bounded (batch) read on primary key table");
+    }
+
+    @Test
+    void testBoundedLogTableWithoutDataLakeSucceeds() throws Exception {
+        String tableName = "ds_bounded_log_no_lake";
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        createNonLakeLogTable(tablePath);
+
+        // A pure log table now supports bounded (batch) read without datalake: it reads from the
+        // starting offsets up to the latest offsets captured at startup and then finishes.
+        List<Row> written = appendLogRows(tablePath, 0, 5, null);
+
+        StreamExecutionEnvironment batchEnv = StreamExecutionEnvironment.getExecutionEnvironment();
+        batchEnv.setRuntimeMode(RuntimeExecutionMode.BATCH);
+        batchEnv.setParallelism(2);
+        FlussSource<RowData> source =
+                FlussSource.<RowData>builder()
+                        .setBootstrapServers(bootstrapServers())
+                        .setDatabase(DEFAULT_DB)
+                        .setTable(tableName)
+                        .setStartingOffsets(OffsetsInitializer.earliest())
+                        .setBounded()
+                        .setDeserializationSchema(new RowDataDeserializationSchema())
+                        .build();
+        List<Row> actual = collectBounded(batchEnv, source, FULL_COLS);
+
+        assertRowsIgnoreOrder(actual, written);
     }
 
     @Test
@@ -534,6 +543,19 @@ public class FlinkUnionReadDataStreamITCase extends FlinkUnionReadTestBase {
                         .distributedBy(DEFAULT_BUCKET_NUM, "id")
                         .schema(schema)
                         .build();
+        return createTable(tablePath, descriptor);
+    }
+
+    private long createNonLakePkTable(TablePath tablePath) throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("amount", DataTypes.BIGINT())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor descriptor =
+                TableDescriptor.builder().distributedBy(DEFAULT_BUCKET_NUM).schema(schema).build();
         return createTable(tablePath, descriptor);
     }
 

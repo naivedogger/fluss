@@ -589,34 +589,44 @@ public class FlinkSourceEnumerator
                                     "No lake snapshot found for table {},"
                                             + " falling back to Fluss-only splits.",
                                     tablePath);
-                            if (isPartitioned) {
-                                Set<PartitionInfo> partitionInfos = listPartitions();
-                                Collection<Partition> partitions =
-                                        partitionInfos.stream()
-                                                .map(
-                                                        p ->
-                                                                new Partition(
-                                                                        p.getPartitionId(),
-                                                                        p.getPartitionName()))
-                                                .collect(Collectors.toList());
-                                // Use log-only splits to avoid generating mixed split
-                                // types (HybridSnapshotLogSplit + LogSplit) for
-                                // primary-key tables, which is not supported.
-                                splits =
-                                        this.initLogTablePartitionSplits(
-                                                partitions, startingOffsetsInitializer);
-                            } else {
-                                splits = this.getLogSplit(null, null);
-                            }
+                            splits = generateLogOnlySplits();
                         }
                         return splits;
                     },
                     this::handleSplitsAdd);
         } else {
-            throw new UnsupportedOperationException(
-                    String.format(
-                            "Batch only supports when table option '%s' is set to true.",
-                            ConfigOptions.TABLE_DATALAKE_ENABLED));
+            // No datalake: perform a pure Fluss bounded read by scanning from the starting offsets
+            // up to the latest offsets captured at startup (the stopping offsets are already set to
+            // latest() in non-streaming mode). Only log tables are supported here; primary key
+            // tables would need a KV snapshot batch scan, which is not yet supported in batch mode
+            // without datalake.
+            if (hasPrimaryKey) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "Batch read on primary key table is only supported when table "
+                                        + "option '%s' is set to true.",
+                                ConfigOptions.TABLE_DATALAKE_ENABLED));
+            }
+            context.callAsync(this::generateLogOnlySplits, this::handleSplitsAdd);
+        }
+    }
+
+    /**
+     * Generates log-only splits for a bounded (batch) read: one log split per bucket, spanning the
+     * starting offsets up to the stopping offsets. Used both as the fallback when a datalake table
+     * has no snapshot and when the table has no datalake at all. Log-only splits avoid generating
+     * mixed split types (HybridSnapshotLogSplit + LogSplit), which is not supported.
+     */
+    private List<SourceSplitBase> generateLogOnlySplits() {
+        if (isPartitioned) {
+            Set<PartitionInfo> partitionInfos = listPartitions();
+            Collection<Partition> partitions =
+                    partitionInfos.stream()
+                            .map(p -> new Partition(p.getPartitionId(), p.getPartitionName()))
+                            .collect(Collectors.toList());
+            return initLogTablePartitionSplits(partitions, startingOffsetsInitializer);
+        } else {
+            return getLogSplit(null, null);
         }
     }
 

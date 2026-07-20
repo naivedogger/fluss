@@ -250,8 +250,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         assertThatThrownBy(() -> tEnv.explainSql(query))
                 .isInstanceOf(UnsupportedOperationException.class)
                 .hasMessage(
-                        "Currently, Fluss only support queries on table with datalake enabled"
-                                + " or point queries on primary key when it's in batch execution mode.");
+                        "Batch read on a primary key table requires datalake enabled, or a point query on the primary key.");
     }
 
     @Test
@@ -420,7 +419,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                                 tEnv.explainSql(
                                         String.format("SELECT COUNT(address) FROM %s", tableName)))
                 .hasMessageContaining(
-                        "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
+                        "Batch read on a primary key table requires datalake enabled, or a point query on the primary key.");
 
         assertThatThrownBy(
                         () ->
@@ -429,7 +428,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                                                 "SELECT COUNT(DISTINCT address) FROM %s",
                                                 tableName)))
                 .hasMessageContaining(
-                        "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
+                        "Batch read on a primary key table requires datalake enabled, or a point query on the primary key.");
 
         // test not push down grouping count.
         assertThatThrownBy(
@@ -440,7 +439,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                                                         tableName))
                                         .wait())
                 .hasMessageContaining(
-                        "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
+                        "Batch read on a primary key table requires datalake enabled, or a point query on the primary key.");
     }
 
     @Test
@@ -488,33 +487,56 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         collected = collectRowsWithTimeout(iterRows, 1);
         assertThat(collected).isEqualTo(expected);
 
-        // test COUNT(column) with NULL values - should NOT push down for nullable columns
-        // This will fail because log table doesn't support full scan in batch mode
-        assertThatThrownBy(
-                        () ->
-                                tEnv.explainSql(
-                                        String.format("SELECT COUNT(address) FROM %s", tableName)))
-                .hasMessageContaining(
-                        "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
-        assertThatThrownBy(
-                        () ->
-                                tEnv.explainSql(
-                                        String.format(
-                                                "SELECT COUNT(DISTINCT address) FROM %s",
-                                                tableName)))
-                .hasMessageContaining(
-                        "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
+        // COUNT(column) on a nullable column does not qualify for the COUNT(*) pushdown, so it
+        // now falls back to a full bounded scan of the log table (enabled by P0 bounded log read).
+        // preparePartitionedLogTable writes 5 rows per partition (address NULL for even ids, i.e.
+        // 2 nulls), leaving 3 non-null addresses per partition; the non-partitioned prepareLogTable
+        // writes 5 rows total.
+        int expectedNonNullAddress = partitionTable ? 6 : 3;
+        query = String.format("SELECT COUNT(address) FROM %s", tableName);
+        iterRows = tEnv.executeSql(query).collect();
+        collected = collectRowsWithTimeout(iterRows, 1);
+        assertThat(collected)
+                .isEqualTo(
+                        Collections.singletonList(String.format("+I[%s]", expectedNonNullAddress)));
 
-        // test not push down grouping count.
-        assertThatThrownBy(
-                        () ->
-                                tEnv.explainSql(
-                                                String.format(
-                                                        "SELECT COUNT(*) FROM %s group by id",
-                                                        tableName))
-                                        .wait())
-                .hasMessageContaining(
-                        "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
+        // COUNT(DISTINCT ...) also falls back to a full bounded scan; the 3 distinct address
+        // values (address1/address3/address5) are shared across partitions.
+        query = String.format("SELECT COUNT(DISTINCT address) FROM %s", tableName);
+        iterRows = tEnv.executeSql(query).collect();
+        collected = collectRowsWithTimeout(iterRows, 1);
+        assertThat(collected).isEqualTo(Collections.singletonList("+I[3]"));
+
+        // Grouping count is not pushed down; it now runs as a full bounded scan and returns one
+        // row per id (each id appears once per partition).
+        int perIdCount = partitionTable ? 2 : 1;
+        query = String.format("SELECT COUNT(*) FROM %s group by id", tableName);
+        iterRows = tEnv.executeSql(query).collect();
+        collected = collectRowsWithTimeout(iterRows, 5);
+        assertThat(collected)
+                .containsExactlyInAnyOrder(
+                        String.format("+I[%s]", perIdCount),
+                        String.format("+I[%s]", perIdCount),
+                        String.format("+I[%s]", perIdCount),
+                        String.format("+I[%s]", perIdCount),
+                        String.format("+I[%s]", perIdCount));
+    }
+
+    @Test
+    void testFullScanLogTableInBatchMode() throws Exception {
+        // P0: a pure log table (no datalake) now supports a full bounded scan in batch mode,
+        // reading from the earliest offsets up to the latest offsets captured at startup.
+        String tableName = prepareLogTable();
+        String query = String.format("SELECT * FROM %s", tableName);
+        CloseableIterator<Row> iterRows = tEnv.executeSql(query).collect();
+        List<String> collected = collectRowsWithTimeout(iterRows, 5);
+        assertThat(collected)
+                .containsExactlyInAnyOrder(
+                        "+I[1, address1, name1]",
+                        "+I[2, null, name2]",
+                        "+I[3, address3, name3]",
+                        "+I[4, null, name4]",
+                        "+I[5, address5, name5]");
     }
 
     private String prepareSourceTable(String[] keys, String partitionedKey) throws Exception {
