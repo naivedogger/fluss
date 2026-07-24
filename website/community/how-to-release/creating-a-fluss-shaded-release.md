@@ -209,6 +209,10 @@ git push <remote> refs/tags/{$TAG}
 
 Once you have built and individually reviewed the release candidate, please share it for the community-wide review. Please review foundation-wide [voting guidelines](https://www.apache.org/foundation/voting.html) for more information.
 
+Fluss approves a release with a single vote on the dev@ mailing list; it passes by majority approval with at least three binding +1 votes from PMC members.
+
+### Community Vote
+
 Start the review-and-vote thread on the dev@ mailing list. Here’s an email template; please adjust as you see fit.
 
 ```

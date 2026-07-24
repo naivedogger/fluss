@@ -57,7 +57,7 @@ To prepare for each release, you should audit the project status in the GitHub i
 
 When contributors resolve an issue in GitHub, they are tagging it with a release milestone that will contain their changes. With the release currently underway, new issues should be resolved against a subsequent future release. Therefore, you should create a new milestone item for this subsequent release, as follows:
 
-In [GitHub Milestones](https://github.com/apache/fluss/milestones) page, add a new milestone: choose the next minor version number compared to the one currently underway. For example, add `v0.9` milestone if current version is `v0.8`. We only track the major and minor version, so no need to create milestone for bugfix versions, e.g., `v0.9.1`.
+In [GitHub Milestones](https://github.com/apache/fluss/milestones) page, add a new milestone: choose the next minor version number compared to the one currently underway. For example, add `v1.1` milestone if current version is `v1.0`. We only track the major and minor version, so no need to create milestone for bugfix versions, e.g., `v1.0.1`.
 
 (Note: Only PMC members have access to the project administration. If you do not have access, ask on the mailing list or Slack for assistance.)
 
@@ -65,7 +65,7 @@ In [GitHub Milestones](https://github.com/apache/fluss/milestones) page, add a n
 
 There could be outstanding release-blocking issues, which should be triaged before proceeding to build a release candidate. We track them by assigning a specific Fix version field even before the issue resolved.
 
-The list of release-blocking issues is available at the [issue page](https://github.com/apache/fluss/issues?q=is%3Aissue%20state%3Aopen%20milestone%3Av0.8) (please update the `milestone` condition to the current version name). Triage each unresolved issue with one of the following resolutions:
+The list of release-blocking issues is available at the [issue page](https://github.com/apache/fluss/issues?q=is%3Aissue%20state%3Aopen%20milestone%3Av1.0) (please update the `milestone` condition to the current version name). Triage each unresolved issue with one of the following resolutions:
 
 - If the issue has been resolved and issue was not updated, resolve it accordingly.
 - If the issue has not been resolved and it is acceptable to defer this until the next release, update the `Milestone` field to the new version you just created. Please consider discussing this with stakeholders and the dev@ mailing list, as appropriate. Use the "Bulk Change" functionality of GitHub Issue to update a batch of unresolved issues to new milestone version.
@@ -98,11 +98,11 @@ git clone git@github.com:apache/fluss.git
 Set up a few environment variables to simplify commands that follow. (We use bash Unix syntax in this guide.)
 
 ```bash
-RELEASE_VERSION="0.8.0"
-SHORT_RELEASE_VERSION="0.8"
+RELEASE_VERSION="1.0.0"
+SHORT_RELEASE_VERSION="1.0"
 CURRENT_SNAPSHOT_VERSION="$SHORT_RELEASE_VERSION-SNAPSHOT"
-NEXT_SNAPSHOT_VERSION="0.9-SNAPSHOT"
-SHORT_NEXT_VERSION="0.9"
+NEXT_SNAPSHOT_VERSION="1.1-SNAPSHOT"
+SHORT_NEXT_VERSION="1.1"
 ```
 
 ### 7. Create a release branch
@@ -131,7 +131,7 @@ $ git push origin release-${SHORT_RELEASE_VERSION}
   </TabItem>
 
   <TabItem value="bugfix" label="Bugfix release">
-If you're creating a new bugfix release (e.g., 0.9.1 instead of 0.9.0), you do not need to create a release branch. You can skip this step and check out the already existing branch for that version:
+If you're creating a new bugfix release (e.g., 1.0.1 instead of 1.0.0), you do not need to create a release branch. You can skip this step and check out the already existing branch for that version:
 
 ```bash
 $ git checkout release-$SHORT_RELEASE_VERSION
@@ -142,7 +142,7 @@ Update the version in the Helm Chart in:
 - `helm/values.yaml`
 - `helm/README.md`
 
-For a bugfix release you need to update the version in these files. For example, if you are releasing `0.8.1`, replace the previous version `0.8.0` with `0.8.1` in those files.
+For a bugfix release you need to update the version in these files. For example, if you are releasing `1.0.1`, replace the previous version `1.0.0` with `1.0.1` in those files.
 
 And commit/push the version bump:
 
@@ -174,7 +174,7 @@ tools $ git push origin main
 
 **(2) Create Upgrade Notes for the next version**
 
-Besides, in the `main` branch, create a new "Upgrade Notes" markdown file for the next version. The file name should be `upgrade-notes-x.y.md` (replace the `x.y` to the next version number, e.g., `0.9`) under path `website/docs/maintenance/operations/` with following initial content.
+Besides, in the `main` branch, create a new "Upgrade Notes" markdown file for the next version. The file name should be `upgrade-notes-x.y.md` (replace the `x.y` to the next version number, e.g., `1.1`) under path `website/docs/maintenance/operations/` with following initial content.
 
 ```
 ---
@@ -185,7 +185,7 @@ sidebar_position: 4
 # Upgrade Notes from v0.x to v0.y
 ```
 
-Additionally, for the upgrade notes page of the version currently being released (e.g., `upgrade-notes-0.8.md`), add `sidebar_class_name: hidden` front matter to hide it from the sidebar.
+Additionally, for the upgrade notes page of the version currently being released (e.g., `upgrade-notes-1.0.md`), add `sidebar_class_name: hidden` front matter to hide it from the sidebar.
 
 Commit the documentation changes, and push to the official repository.
 
@@ -197,14 +197,14 @@ $ git push origin main
 
 **(3) Add version item in fluss-versions.json**
 
-Next, add a new version item for the next release version in the `website/fluss-versions.json` file on the `main` branch. The new version item should have the following fields and values (current releasing `0.9.0`, next release `0.10.0` as an example):
+Next, add a new version item for the next release version in the `website/fluss-versions.json` file on the `main` branch. The new version item should have the following fields and values (current releasing `1.0.0`, next release `1.1.0` as an example):
 
 ```json
 {
   "versionName": "next",
-  "fullVersion": "0.10-SNAPSHOT",
-  "shortVersion": "0.10",
-  "dockerVersion": "0.10-SNAPSHOT",
+  "fullVersion": "1.1-SNAPSHOT",
+  "shortVersion": "1.1",
+  "dockerVersion": "1.1-SNAPSHOT",
   "paimonVersion": "1.3.1",
   "paimonVersionShort": "1.3",
   "released": false
@@ -215,10 +215,10 @@ Additionally, update the `fullVersion`, `shortVersion`, and `dockerVersion` fiel
 
 ```json
 {
-    "versionName": "version-0.9",
-    "fullVersion": "0.9.0",
-    "shortVersion": "0.9",
-    "dockerVersion": "0.9.0",
+    "versionName": "version-1.0",
+    "fullVersion": "1.0.0",
+    "shortVersion": "1.0",
+    "dockerVersion": "1.0.0",
     "paimonVersion": "1.3.1",
     "paimonVersionShort": "1.3",
     "released": false
@@ -239,7 +239,7 @@ Update the version in the Helm Chart in:
 - `helm/values.yaml`
 - `helm/README.md`
 
-For example, if the next major version is `0.9.0`, you should replace all the previous version `0.8.0` to the next release version `0.9.0`.
+For example, if the next major version is `1.1.0`, you should replace all the previous version `1.0.0` to the next release version `1.1.0`.
 
 And commit/push the version bump:
 
@@ -272,7 +272,7 @@ export FLUSS_PREVIOUS_RELEASE_BRANCH={previousReleaseBranch}
 export FLUSS_CURRENT_RELEASE_BRANCH={currentReleaseBranch}
 # e.g.
 # export FLUSS_PREVIOUS_RELEASE_BRANCH=release-0.7
-# export FLUSS_CURRENT_RELEASE_BRANCH=release-0.8
+# export FLUSS_CURRENT_RELEASE_BRANCH=release-1.0
 
 # get contributor list
 git log origin/$FLUSS_PREVIOUS_RELEASE_BRANCH..origin/$FLUSS_CURRENT_RELEASE_BRANCH --pretty=format:"%an" | sort -u | paste -sd "," - | sed 's/,/, /g'
@@ -371,25 +371,25 @@ tools $ RELEASE_VERSION=$RELEASE_VERSION RELEASE_CANDIDATE=$RC_NUM releasing/cre
 Now, we should already created the source distribution, binary distribution, and Helm Chart packages for the release candidate.
 Run the `tree releasing/release/` command under the `tools` directory to verify the created files.
 
-Example output for release version `0.8.0` and RC number `1`:
+Example output for release version `1.0.0` and RC number `1`:
 
 ```bash
 tools $ tree releasing/release
 releasing/release
-├── fluss-0.8.0-bin.tgz
-├── fluss-0.8.0-bin.tgz.asc
-├── fluss-0.8.0-bin.tgz.sha512
-├── fluss-0.8.0-src.tgz
-├── fluss-0.8.0-src.tgz.asc
-├── fluss-0.8.0-src.tgz.sha512
+├── fluss-1.0.0-bin.tgz
+├── fluss-1.0.0-bin.tgz.asc
+├── fluss-1.0.0-bin.tgz.sha512
+├── fluss-1.0.0-src.tgz
+├── fluss-1.0.0-src.tgz.asc
+├── fluss-1.0.0-src.tgz.sha512
 └── helm-chart
-    ├── 0.8.0-rc1
-    │     ├── fluss-0.8.0.tgz
-    │     ├── fluss-0.8.0.tgz.asc
-    │     ├── fluss-0.8.0.tgz.prov
-    │     ├── fluss-0.8.0.tgz.prov.asc
-    │     ├── fluss-0.8.0.tgz.prov.sha512
-    │     └── fluss-0.8.0.tgz.sha512
+    ├── 1.0.0-rc1
+    │     ├── fluss-1.0.0.tgz
+    │     ├── fluss-1.0.0.tgz.asc
+    │     ├── fluss-1.0.0.tgz.prov
+    │     ├── fluss-1.0.0.tgz.prov.asc
+    │     ├── fluss-1.0.0.tgz.prov.sha512
+    │     └── fluss-1.0.0.tgz.sha512
     └── index.yaml
 
 3 directories, 13 files
@@ -493,7 +493,7 @@ Verify the RC images are present:
 - https://hub.docker.com/r/apache/fluss/tags
 - https://hub.docker.com/r/apache/fluss-quickstart-flink/tags
 
-Then, update the `dockerVersion` field for the current release RC version in the `website/fluss-versions.json` file on the `main` branch to the value of `${RELEASE_VERSION}_rc${RC_NUM}` (which includes the RC suffix, e.g., `0.8.0-rc1`). This update should be committed and pushed to the `main` branch.
+Then, update the `dockerVersion` field for the current release RC version in the `website/fluss-versions.json` file on the `main` branch to the value of `${RELEASE_VERSION}_rc${RC_NUM}` (which includes the RC suffix, e.g., `1.0.0-rc1`). This update should be committed and pushed to the `main` branch.
 
 This ensures that the **Quickstart guide** in the documentation references the correct Docker image for the release candidate. This will help developers to easily test the new release candidate using the Quickstart guide.
 
@@ -541,16 +541,20 @@ The final publish to **crates.io** and **PyPI** happens when the release tag is 
 
 Once you have built and individually reviewed the release candidate, please share it for the community-wide review. Please review foundation-wide [voting guidelines](https://www.apache.org/foundation/voting.html) for more information.
 
+Fluss approves a release with a single vote on the dev@ mailing list; it passes by majority approval with at least three binding +1 votes from PMC members.
+
+### Community Vote
+
 Start the review-and-vote thread on the dev@ mailing list. Here’s an email template; please adjust as you see fit.
 
 ```
 From: Release Manager
 To: dev@fluss.apache.org
-Subject: [VOTE] Release Fluss 0.8.0 (RC1)
+Subject: [VOTE] Release Fluss 1.0.0 (RC1)
 
 Hi everyone,
 
-Please review and vote on the release candidate #1 for the Apache Fluss version 0.8.0, as follows:
+Please review and vote on the release candidate #1 for the Apache Fluss version 1.0.0, as follows:
 [ ] +1, Approve the release
 [ ] -1, Do not approve the release (please provide specific comments)
 
@@ -562,7 +566,7 @@ The official source release and binary convenience releases to be deployed to:
 
 Helm charts are available on:
 * https://dist.apache.org/repos/dist/dev/fluss/helm-chart
-(NB: you have to build the Docker images locally with the version 0.8.0 in order to test Helm charts)
+(NB: you have to build the Docker images locally with the version 1.0.0 in order to test Helm charts)
 
 All the files are signed with the key with fingerprint FFFFFFFF, you can find the KEYS file here:
 * https://dist.apache.org/repos/dist/release/fluss/KEYS
@@ -571,7 +575,7 @@ All artifacts to be deployed to the Maven Central Repository:
 * https://repository.apache.org/content/repositories/orgapachefluss-<ID>/
 
 Git tag for the release:
-* https://github.com/apache/fluss/releases/tag/v0.8.0-rc1
+* https://github.com/apache/fluss/releases/tag/v1.0.0-rc1
 
 Git commit for the release:
 * https://github.com/apache/fluss/commit/<COMMIT>
@@ -583,7 +587,7 @@ Website pull request for listing the new release on the download page
 * https://github.com/apache/fluss/pull/<ID>
 
 Upgrade note for the new release:
-* https://github.com/apache/fluss/blob/release-0.8/website/docs/maintenance/operations/upgrade-notes-0.8.md
+* https://github.com/apache/fluss/blob/release-1.0/website/docs/maintenance/operations/upgrade-notes-1.0.md
 
 Docker images for the release candidate:
 * fluss
@@ -611,7 +615,7 @@ For cancelling a release, the release manager needs to send an email to the rele
 ```
 From: Release Manager
 To: dev@fluss.apache.org
-Subject: [RESULT][VOTE] Release Fluss 0.8.0 (RC1)
+Subject: [RESULT][VOTE] Release Fluss 1.0.0 (RC1)
 
 I'm happy to announce that we have unanimously approved this release.
 
@@ -723,10 +727,10 @@ This will refresh the documentation website to reflect that the new version has 
 
 ```json
 {
-  "versionName": "version-0.8",
-  "fullVersion": "0.8.0",
-  "shortVersion": "0.8",
-  "dockerVersion": "0.8.0-rc1", // ==> "0.8.0"
+  "versionName": "version-1.0",
+  "fullVersion": "1.0.0",
+  "shortVersion": "1.0",
+  "dockerVersion": "1.0.0-rc1", // ==> "1.0.0"
   "released": false // ==> true
 }
 ```
@@ -772,21 +776,21 @@ Make sure use the `apache.org` email address associated with your Apache account
 ```
 From: Release Manager
 To: dev@fluss.apache.org, user@fluss.apache.org, announce@apache.org
-Subject: [ANNOUNCE] Apache Fluss 0.8.0 released
+Subject: [ANNOUNCE] Apache Fluss 1.0.0 released
 
-The Apache Fluss community is very happy to announce the release of Apache Fluss 0.8.0.
+The Apache Fluss community is very happy to announce the release of Apache Fluss 1.0.0.
 
 Apache Fluss is a streaming storage built for real-time analytics & AI which can serve as the real-time data layer for Lakehouse architectures.
 
 The release is available for download at:
-https://downloads.apache.org/fluss/fluss-0.8.0/
+https://downloads.apache.org/fluss/fluss-1.0.0/
 
 Maven artifacts for Fluss can be found at:
 
-https://search.maven.org/search?q=g:org.apache.fluss%20AND%20v:0.8.0
+https://search.maven.org/search?q=g:org.apache.fluss%20AND%20v:1.0.0
 
 Please check out the release blog post for an overview of this release:
-https://fluss.apache.org/blog/releases/0.8/
+https://fluss.apache.org/blog/releases/1.0/
 
 We would like to thank all contributors of the Apache Fluss community who made this release possible!
 
@@ -806,8 +810,8 @@ We usually include the names of all contributors in the announcement blog post. 
 export PREVIOUS_RELEASE_BRANCH=<previousReleaseBranch>
 export CURRENT_RELEASE_BRANCH=<currentReleaseBranch>
 # e.g.
-# export PREVIOUS_RELEASE_BRANCH=release-0.8
-# export CURRENT_RELEASE_BRANCH=release-0.9
+# export PREVIOUS_RELEASE_BRANCH=release-0.9
+# export CURRENT_RELEASE_BRANCH=release-1.0
 # please make sure the previous release branch and current release branch are both up-to-date with the official repository before running the command below
 git log $PREVIOUS_RELEASE_BRANCH..$CURRENT_RELEASE_BRANCH --format='%an' | sort -u | paste -sd ',' - | sed 's/,/, /g'
 ```

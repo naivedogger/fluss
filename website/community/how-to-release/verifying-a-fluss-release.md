@@ -33,7 +33,7 @@ for i in *.tgz; do echo $i; gpg --verify $i.asc $i; done
 If the verification is successful, you will see a message like this:
 
 ```
-fluss-0.8.0-src.tgz
+fluss-1.0.0-src.tgz
 gpg: Signature made Mon 01 Jan 2024 12:00:00 PM UTC
 gpg:                using RSA key E2C45417BED5C104154F341085BACB5AEFAE3202
 gpg: Good signature from "Jark Wu (CODE SIGNING KEY) <jark@apache.org>"
@@ -50,13 +50,13 @@ shasum *.sha512 > checklist.chk; shasum -c checklist.chk
 If the verification is successful, you will see a message like this:
 
 ```
-fluss-0.8.0-bin.tgz.sha512: OK
-fluss-0.8.0-src.tgz.sha512: OK
+fluss-1.0.0-bin.tgz.sha512: OK
+fluss-1.0.0-src.tgz.sha512: OK
 ```
 
 ## Verifying build
 
-Unzip the source release archive (`fluss-0.8.0-src.tgz`), and verify that the source release builds correctly (may with different Java version and Maven version), you can run the following commands:
+Unzip the source release archive (`fluss-1.0.0-src.tgz`), and verify that the source release builds correctly (may with different Java version and Maven version), you can run the following commands:
 
 ```bash
 mvn clean package -DskipTests
