@@ -83,6 +83,7 @@ public class FlussSourceBuilder<OUT> {
     private Long scanPartitionDiscoveryIntervalMs;
     private Integer splitPerAssignmentBatchSize;
     private OffsetsInitializer offsetsInitializer;
+    private OffsetsInitializer stoppingOffsetsInitializer;
     private boolean bounded;
     private FlussDeserializationSchema<OUT> deserializationSchema;
 
@@ -182,6 +183,27 @@ public class FlussSourceBuilder<OUT> {
      */
     public FlussSourceBuilder<OUT> setBounded() {
         this.bounded = true;
+        return this;
+    }
+
+    /**
+     * Builds a bounded streaming source that stops once it reaches the given stopping (terminal)
+     * offsets, then finishes. Unlike {@link #setBounded()}, the source keeps running under
+     * streaming execution mode but reports {@link
+     * org.apache.flink.api.connector.source.Boundedness#BOUNDED}, so the job terminates after
+     * reaching the terminal offsets ("bounded streaming read").
+     *
+     * <p>Supported stopping initializers are {@link OffsetsInitializer#latest()} and {@link
+     * OffsetsInitializer#timestamp(long)}. This is intended for log tables and for primary-key
+     * tables read in changelog/log-only startup mode (earliest/latest/timestamp).
+     *
+     * @param stoppingOffsetsInitializer the strategy for determining the terminal offsets
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setBounded(OffsetsInitializer stoppingOffsetsInitializer) {
+        this.stoppingOffsetsInitializer =
+                checkNotNull(
+                        stoppingOffsetsInitializer, "stoppingOffsetsInitializer must not be null");
         return this;
     }
 
@@ -397,6 +419,7 @@ public class FlussSourceBuilder<OUT> {
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
                 !bounded,
-                lakeSource);
+                lakeSource,
+                stoppingOffsetsInitializer);
     }
 }

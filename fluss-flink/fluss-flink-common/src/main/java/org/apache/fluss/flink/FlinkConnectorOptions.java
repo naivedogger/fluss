@@ -137,6 +137,28 @@ public class FlinkConnectorOptions {
                                     + "The format is 'timestamp' or 'yyyy-MM-dd HH:mm:ss'. "
                                     + "Like '1678883047356' or '2023-12-09 23:09:12'.");
 
+    public static final ConfigOption<ScanBoundedMode> SCAN_BOUNDED_MODE =
+            ConfigOptions.key("scan.bounded.mode")
+                    .enumType(ScanBoundedMode.class)
+                    .defaultValue(ScanBoundedMode.UNBOUNDED)
+                    .withDescription(
+                            String.format(
+                                    "Optional bounded (stopping) mode for Fluss source. When set to a value other "
+                                            + "than '%s', the source stops once it reaches the resolved stopping "
+                                            + "offsets, even under streaming execution mode (bounded streaming read). "
+                                            + "Default is '%s'.",
+                                    ScanBoundedMode.UNBOUNDED.value,
+                                    ScanBoundedMode.UNBOUNDED.value));
+
+    public static final ConfigOption<String> SCAN_BOUNDED_TIMESTAMP =
+            ConfigOptions.key("scan.bounded.timestamp")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional timestamp for Fluss source in case of bounded mode is timestamp. "
+                                    + "The format is 'timestamp' or 'yyyy-MM-dd HH:mm:ss'. "
+                                    + "Like '1678883047356' or '2023-12-09 23:09:12'.");
+
     public static final ConfigOption<Duration> SCAN_PARTITION_DISCOVERY_INTERVAL =
             ConfigOptions.key("scan.partition.discovery.interval")
                     .durationType()
@@ -299,6 +321,41 @@ public class FlinkConnectorOptions {
                     .defaultValue(false)
                     .withDescription(
                             "Internal option: indicates whether the base table is partitioned for $binlog virtual tables. Not part of public API.");
+
+    /** Bounded (stopping) mode for the fluss scanner, see {@link #SCAN_BOUNDED_MODE}. */
+    public enum ScanBoundedMode implements DescribedEnum {
+        UNBOUNDED(
+                "unbounded",
+                text(
+                        "The source is unbounded. Under streaming execution mode the job keeps "
+                                + "reading the latest changelog without a stopping offset.")),
+        LATEST(
+                "latest",
+                text(
+                        "Stop reading logs at the latest offset captured at job startup, then "
+                                + "finish (bounded streaming read).")),
+        TIMESTAMP(
+                "timestamp",
+                text("Stop reading logs at the user-supplied timestamp, then finish."));
+
+        private final String value;
+        private final InlineElement description;
+
+        ScanBoundedMode(String value, InlineElement description) {
+            this.value = value;
+            this.description = description;
+        }
+
+        @Override
+        public String toString() {
+            return value;
+        }
+
+        @Override
+        public InlineElement getDescription() {
+            return description;
+        }
+    }
 
     /** Startup mode for the fluss scanner, see {@link #SCAN_STARTUP_MODE}. */
     public enum ScanStartupMode implements DescribedEnum {

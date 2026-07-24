@@ -57,6 +57,7 @@ import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.Source;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.ProviderContext;
 import org.apache.flink.table.connector.RowLevelModificationScanContext;
@@ -133,6 +134,7 @@ public class FlinkTableSource
     private final int[] partitionKeyIndexes;
     private final boolean streaming;
     private final FlinkConnectorOptionsUtils.StartupOptions startupOptions;
+    private final FlinkConnectorOptionsUtils.BoundedOptions boundedOptions;
 
     // options for lookup source
     private final boolean lookupAsync;
@@ -236,6 +238,48 @@ public class FlinkTableSource
             @Nullable MergeEngineType mergeEngineType,
             Map<String, String> tableOptions,
             LeaseContext leaseContext) {
+        this(
+                tablePath,
+                flussConfig,
+                tableConfig,
+                tableOutputType,
+                primaryKeyIndexes,
+                bucketKeyIndexes,
+                partitionKeyIndexes,
+                streaming,
+                startupOptions,
+                lookupAsync,
+                insertIfNotExists,
+                cache,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                isDataLakeEnabled,
+                mergeEngineType,
+                tableOptions,
+                leaseContext,
+                new FlinkConnectorOptionsUtils.BoundedOptions());
+    }
+
+    public FlinkTableSource(
+            TablePath tablePath,
+            Configuration flussConfig,
+            TableConfig tableConfig,
+            org.apache.flink.table.types.logical.RowType tableOutputType,
+            int[] primaryKeyIndexes,
+            int[] bucketKeyIndexes,
+            int[] partitionKeyIndexes,
+            boolean streaming,
+            FlinkConnectorOptionsUtils.StartupOptions startupOptions,
+            boolean lookupAsync,
+            boolean insertIfNotExists,
+            @Nullable LookupCache cache,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean isDataLakeEnabled,
+            @Nullable MergeEngineType mergeEngineType,
+            Map<String, String> tableOptions,
+            LeaseContext leaseContext,
+            FlinkConnectorOptionsUtils.BoundedOptions boundedOptions) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableOutputType = tableOutputType;
@@ -245,6 +289,7 @@ public class FlinkTableSource
         this.partitionKeyIndexes = partitionKeyIndexes;
         this.streaming = streaming;
         this.startupOptions = checkNotNull(startupOptions, "startupOptions must not be null");
+        this.boundedOptions = checkNotNull(boundedOptions, "boundedOptions must not be null");
 
         this.lookupAsync = lookupAsync;
         this.insertIfNotExists = insertIfNotExists;
@@ -402,6 +447,27 @@ public class FlinkTableSource
                         "Unsupported startup mode: " + startupOptions.startupMode);
         }
 
+        OffsetsInitializer stoppingOffsetsInitializer =
+                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions);
+        boolean bounded = stoppingOffsetsInitializer != null;
+
+        // A bounded terminal on a primary-key table read in full (snapshot) startup mode is only
+        // supported for datalake-enabled tables (union read). Full-mode PK snapshot + log bounded
+        // reads are out of scope; use earliest/latest/timestamp startup for a log-only bounded
+        // read instead.
+        if (bounded
+                && hasPrimaryKey()
+                && startupOptions.startupMode == FlinkConnectorOptions.ScanStartupMode.FULL
+                && !isDataLakeEnabled) {
+            throw new ValidationException(
+                    String.format(
+                            "Bounded read ('%s') with full startup mode on primary-key table '%s' "
+                                    + "is only supported when datalake is enabled. Use "
+                                    + "'earliest'/'latest'/'timestamp' startup mode for a log-only "
+                                    + "bounded read instead.",
+                            FlinkConnectorOptions.SCAN_BOUNDED_MODE.key(), tablePath));
+        }
+
         FlinkSource<RowData> source =
                 new FlinkSource<>(
                         flussConfig,
@@ -418,9 +484,10 @@ public class FlinkTableSource
                         streaming,
                         partitionFilters,
                         enableLakeSource ? lakeSource : null,
-                        leaseContext);
+                        leaseContext,
+                        stoppingOffsetsInitializer);
 
-        if (!streaming) {
+        if (!streaming && !bounded) {
             // return a bounded source provide to make planner happy,
             // but this should throw exception when used to create source
             return new SourceProvider() {
@@ -526,7 +593,8 @@ public class FlinkTableSource
                         isDataLakeEnabled,
                         mergeEngineType,
                         tableOptions,
-                        leaseContext);
+                        leaseContext,
+                        boundedOptions);
         source.producedDataType = producedDataType;
         source.projectedFields = projectedFields;
         source.singleRowFilter = singleRowFilter;

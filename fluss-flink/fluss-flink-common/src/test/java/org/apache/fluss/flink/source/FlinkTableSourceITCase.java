@@ -196,6 +196,52 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @Test
+    void testLogTableBoundedReadLatest() throws Exception {
+        tEnv.executeSql("create table bounded_log_latest (a int, b varchar)");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded_log_latest");
+        writeRows(conn, tablePath, Arrays.asList(row(1, "v1"), row(2, "v2"), row(3, "v3")), true);
+
+        // bounded streaming read: the streaming job stops once it reaches the latest offsets
+        // captured at startup, then finishes.
+        CloseableIterator<Row> iter =
+                tEnv.executeSql(
+                                "select * from bounded_log_latest "
+                                        + "/*+ OPTIONS('scan.bounded.mode'='latest') */")
+                        .collect();
+        assertThat(collectAllRows(iter))
+                .containsExactlyInAnyOrder("+I[1, v1]", "+I[2, v2]", "+I[3, v3]");
+    }
+
+    @Test
+    void testPkTableChangelogBoundedReadLatest() throws Exception {
+        tEnv.executeSql(
+                "create table bounded_pk_changelog "
+                        + "(a int not null primary key not enforced, b varchar)");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded_pk_changelog");
+        writeRows(conn, tablePath, Arrays.asList(row(1, "v1"), row(2, "v2")), false);
+
+        // log-only bounded read of a primary-key table: read the changelog from earliest to the
+        // latest offset, then finish. full()-startup PK snapshot bounded reads are out of scope.
+        CloseableIterator<Row> iter =
+                tEnv.executeSql(
+                                "select * from bounded_pk_changelog "
+                                        + "/*+ OPTIONS('scan.startup.mode'='earliest', "
+                                        + "'scan.bounded.mode'='latest') */")
+                        .collect();
+        assertThat(collectAllRows(iter)).containsExactlyInAnyOrder("+I[1, v1]", "+I[2, v2]");
+    }
+
+    private static List<String> collectAllRows(CloseableIterator<Row> iterator) throws Exception {
+        List<String> result = new ArrayList<>();
+        try (CloseableIterator<Row> iter = iterator) {
+            while (iter.hasNext()) {
+                result.add(iter.next().toString());
+            }
+        }
+        return result;
+    }
+
+    @Test
     void testNonPkTableRead() throws Exception {
         tEnv.executeSql("create table non_pk_table_test (a int, b varchar)");
         TablePath tablePath = TablePath.of(DEFAULT_DB, "non_pk_table_test");

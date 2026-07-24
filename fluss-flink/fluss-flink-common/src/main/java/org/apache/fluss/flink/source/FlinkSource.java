@@ -70,6 +70,7 @@ public class FlinkSource<OUT>
     private final RowType sourceOutputType;
     @Nullable private final int[] projectedFields;
     protected final OffsetsInitializer offsetsInitializer;
+    @Nullable protected final OffsetsInitializer stoppingOffsetsInitializer;
     protected final long scanPartitionDiscoveryIntervalMs;
     protected final int splitPerAssignmentBatchSize;
     private final boolean streaming;
@@ -194,6 +195,42 @@ public class FlinkSource<OUT>
             @Nullable Predicate partitionFilters,
             @Nullable LakeSource<LakeSplit> lakeSource,
             LeaseContext leaseContext) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                deserializationSchema,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                leaseContext,
+                null);
+    }
+
+    public FlinkSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer) {
         this.flussConf = flussConf;
         this.tablePath = tablePath;
         this.hasPrimaryKey = hasPrimaryKey;
@@ -202,6 +239,7 @@ public class FlinkSource<OUT>
         this.projectedFields = projectedFields;
         this.logRecordBatchFilter = logRecordBatchFilter;
         this.offsetsInitializer = offsetsInitializer;
+        this.stoppingOffsetsInitializer = stoppingOffsetsInitializer;
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.deserializationSchema = deserializationSchema;
@@ -213,7 +251,11 @@ public class FlinkSource<OUT>
 
     @Override
     public Boundedness getBoundedness() {
-        return streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED;
+        // A bounded terminal (stopping offsets) makes the source bounded even under streaming
+        // execution mode (bounded streaming read).
+        return (!streaming || stoppingOffsetsInitializer != null)
+                ? Boundedness.BOUNDED
+                : Boundedness.CONTINUOUS_UNBOUNDED;
     }
 
     @Override
@@ -232,7 +274,8 @@ public class FlinkSource<OUT>
                 partitionFilters,
                 lakeSource,
                 leaseContext,
-                false);
+                false,
+                stoppingOffsetsInitializer);
     }
 
     @Override
@@ -267,7 +310,8 @@ public class FlinkSource<OUT>
                         leaseContext.getKvSnapshotLeaseDurationMs()),
                 true,
                 sourceEnumeratorState.isInitialDiscoveryFinished(),
-                sourceEnumeratorState.getUnassignedSplits());
+                sourceEnumeratorState.getUnassignedSplits(),
+                stoppingOffsetsInitializer);
     }
 
     @Override

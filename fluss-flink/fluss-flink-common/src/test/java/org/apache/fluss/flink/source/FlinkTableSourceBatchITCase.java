@@ -527,6 +527,49 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                         "Currently, Fluss only support queries on table with datalake enabled or point queries on primary key when it's in batch execution mode.");
     }
 
+    @Test
+    void testLogTableBoundedReadLatest() throws Exception {
+        String tableName = prepareLogTable();
+        CloseableIterator<Row> collected =
+                tEnv.executeSql(
+                                "select id, name from "
+                                        + tableName
+                                        + " /*+ OPTIONS('scan.bounded.mode'='latest') */")
+                        .collect();
+        List<String> expected =
+                Arrays.asList(
+                        "+I[1, name1]",
+                        "+I[2, name2]",
+                        "+I[3, name3]",
+                        "+I[4, name4]",
+                        "+I[5, name5]");
+        assertResultsIgnoreOrder(collected, expected, true);
+    }
+
+    @Test
+    void testLogTableBoundedReadTimestamp() throws Exception {
+        String tableName = prepareLogTable();
+        // capture a stopping timestamp right after the writes: it is >= all commit timestamps
+        // and, by the time the query runs, <= the current server timestamp, so all rows are read.
+        long stopTimestamp = System.currentTimeMillis();
+        CloseableIterator<Row> collected =
+                tEnv.executeSql(
+                                String.format(
+                                        "select id, name from %s "
+                                                + "/*+ OPTIONS('scan.bounded.mode'='timestamp', "
+                                                + "'scan.bounded.timestamp'='%d') */",
+                                        tableName, stopTimestamp))
+                        .collect();
+        List<String> expected =
+                Arrays.asList(
+                        "+I[1, name1]",
+                        "+I[2, name2]",
+                        "+I[3, name3]",
+                        "+I[4, name4]",
+                        "+I[5, name5]");
+        assertResultsIgnoreOrder(collected, expected, true);
+    }
+
     private String prepareSourceTable(String[] keys, String partitionedKey) throws Exception {
         String tableName =
                 String.format("test_%s_%s", String.join("_", keys), RandomUtils.nextInt());

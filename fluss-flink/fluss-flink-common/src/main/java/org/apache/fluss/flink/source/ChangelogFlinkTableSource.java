@@ -57,6 +57,7 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
     private final int[] partitionKeyIndexes;
     private final boolean streaming;
     private final FlinkConnectorOptionsUtils.StartupOptions startupOptions;
+    private final FlinkConnectorOptionsUtils.BoundedOptions boundedOptions;
     private final long scanPartitionDiscoveryIntervalMs;
     private final int splitPerAssignmentBatchSize;
     private final Map<String, String> tableOptions;
@@ -92,7 +93,8 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
                 startupOptions,
                 scanPartitionDiscoveryIntervalMs,
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
-                tableOptions);
+                tableOptions,
+                new FlinkConnectorOptionsUtils.BoundedOptions());
     }
 
     public ChangelogFlinkTableSource(
@@ -105,6 +107,30 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             Map<String, String> tableOptions) {
+        this(
+                tablePath,
+                flussConfig,
+                changelogOutputType,
+                partitionKeyIndexes,
+                streaming,
+                startupOptions,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                tableOptions,
+                new FlinkConnectorOptionsUtils.BoundedOptions());
+    }
+
+    public ChangelogFlinkTableSource(
+            TablePath tablePath,
+            Configuration flussConfig,
+            org.apache.flink.table.types.logical.RowType changelogOutputType,
+            int[] partitionKeyIndexes,
+            boolean streaming,
+            FlinkConnectorOptionsUtils.StartupOptions startupOptions,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            Map<String, String> tableOptions,
+            FlinkConnectorOptionsUtils.BoundedOptions boundedOptions) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         // The changelogOutputType already includes metadata columns from FlinkCatalog
@@ -112,6 +138,7 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
         this.partitionKeyIndexes = partitionKeyIndexes;
         this.streaming = streaming;
         this.startupOptions = startupOptions;
+        this.boundedOptions = boundedOptions;
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.tableOptions = tableOptions;
@@ -176,6 +203,8 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
         }
 
         // Create the source with the changelog deserialization schema
+        OffsetsInitializer stoppingOffsetsInitializer =
+                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions);
         FlinkSource<RowData> source =
                 new FlinkSource<>(
                         flussConfig,
@@ -195,7 +224,9 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
                         new ChangelogDeserializationSchema(),
                         streaming,
                         partitionFilters,
-                        LeaseContext.DEFAULT); // Lake source not supported
+                        null,
+                        LeaseContext.DEFAULT, // Lake source not supported
+                        stoppingOffsetsInitializer);
 
         return SourceProvider.of(source);
     }
@@ -212,7 +243,8 @@ public class ChangelogFlinkTableSource implements ScanTableSource {
                         startupOptions,
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
-                        tableOptions);
+                        tableOptions,
+                        boundedOptions);
         copy.producedDataType = producedDataType;
         copy.projectedFields = projectedFields;
         copy.partitionFilters = partitionFilters;

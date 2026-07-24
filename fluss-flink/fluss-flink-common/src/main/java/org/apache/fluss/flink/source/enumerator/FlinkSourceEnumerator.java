@@ -26,6 +26,7 @@ import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer.BucketOffsetsRetriever;
 import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.client.metadata.KvSnapshots;
+import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.UnsupportedVersionException;
@@ -390,7 +391,8 @@ public class FlinkSourceEnumerator
                 leaseContext,
                 checkpointTriggeredBefore,
                 initialDiscoveryFinished,
-                unassignedSplits);
+                unassignedSplits,
+                null);
     }
 
     FlinkSourceEnumerator(
@@ -429,7 +431,8 @@ public class FlinkSourceEnumerator
                 leaseContext,
                 checkpointTriggeredBefore,
                 false,
-                Collections.emptyList());
+                Collections.emptyList(),
+                null);
     }
 
     FlinkSourceEnumerator(
@@ -451,7 +454,8 @@ public class FlinkSourceEnumerator
             LeaseContext leaseContext,
             boolean checkpointTriggeredBefore,
             boolean initialDiscoveryFinished,
-            Collection<SourceSplitBase> unassignedSplits) {
+            Collection<SourceSplitBase> unassignedSplits,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer) {
         checkArgument(
                 splitPerAssignmentBatchSize > 0,
                 "Split assignment batch size must be positive, but was %s.",
@@ -474,7 +478,11 @@ public class FlinkSourceEnumerator
         this.streaming = streaming;
         this.partitionFilters = partitionFilters;
         this.stoppingOffsetsInitializer =
-                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest();
+                stoppingOffsetsInitializer != null
+                        ? stoppingOffsetsInitializer
+                        : (streaming
+                                ? new NoStoppingOffsetsInitializer()
+                                : OffsetsInitializer.latest());
         this.lakeSource = lakeSource;
         this.workerExecutor = workerExecutor;
         this.leaseContext = leaseContext;
@@ -482,6 +490,97 @@ public class FlinkSourceEnumerator
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.initialDiscoveryFinished = initialDiscoveryFinished;
         this.unassignedSplits = new ArrayList<>(unassignedSplits);
+    }
+
+    /**
+     * Create-path constructor that additionally accepts a user-configured stopping (terminal)
+     * offsets initializer for bounded (streaming) reads. A {@code null} stopping initializer keeps
+     * the default behavior (no stopping in streaming mode, latest in batch mode).
+     */
+    public FlinkSourceEnumerator(
+            TablePath tablePath,
+            Configuration flussConf,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            SplitEnumeratorContext<SourceSplitBase> context,
+            OffsetsInitializer startingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext,
+            boolean checkpointTriggeredBefore,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer) {
+        this(
+                tablePath,
+                flussConf,
+                hasPrimaryKey,
+                isPartitioned,
+                context,
+                Collections.emptySet(),
+                Collections.emptyMap(),
+                null,
+                startingOffsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                new WorkerExecutor(context),
+                leaseContext,
+                checkpointTriggeredBefore,
+                false,
+                Collections.emptyList(),
+                stoppingOffsetsInitializer);
+    }
+
+    /**
+     * Restore-path constructor that additionally accepts a user-configured stopping (terminal)
+     * offsets initializer for bounded (streaming) reads. A {@code null} stopping initializer keeps
+     * the default behavior (no stopping in streaming mode, latest in batch mode).
+     */
+    public FlinkSourceEnumerator(
+            TablePath tablePath,
+            Configuration flussConf,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            SplitEnumeratorContext<SourceSplitBase> context,
+            Set<TableBucket> assignedTableBuckets,
+            Map<Long, String> assignedPartitions,
+            List<SourceSplitBase> pendingHybridLakeFlussSplits,
+            OffsetsInitializer startingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext,
+            boolean checkpointTriggeredBefore,
+            boolean initialDiscoveryFinished,
+            Collection<SourceSplitBase> unassignedSplits,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer) {
+        this(
+                tablePath,
+                flussConf,
+                hasPrimaryKey,
+                isPartitioned,
+                context,
+                assignedTableBuckets,
+                assignedPartitions,
+                pendingHybridLakeFlussSplits,
+                startingOffsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                new WorkerExecutor(context),
+                leaseContext,
+                checkpointTriggeredBefore,
+                initialDiscoveryFinished,
+                unassignedSplits,
+                stoppingOffsetsInitializer);
     }
 
     @Override
@@ -589,34 +688,43 @@ public class FlinkSourceEnumerator
                                     "No lake snapshot found for table {},"
                                             + " falling back to Fluss-only splits.",
                                     tablePath);
-                            if (isPartitioned) {
-                                Set<PartitionInfo> partitionInfos = listPartitions();
-                                Collection<Partition> partitions =
-                                        partitionInfos.stream()
-                                                .map(
-                                                        p ->
-                                                                new Partition(
-                                                                        p.getPartitionId(),
-                                                                        p.getPartitionName()))
-                                                .collect(Collectors.toList());
-                                // Use log-only splits to avoid generating mixed split
-                                // types (HybridSnapshotLogSplit + LogSplit) for
-                                // primary-key tables, which is not supported.
-                                splits =
-                                        this.initLogTablePartitionSplits(
-                                                partitions, startingOffsetsInitializer);
-                            } else {
-                                splits = this.getLogSplit(null, null);
-                            }
+                            splits = generateLogOnlySplits();
                         }
                         return splits;
                     },
                     this::handleSplitsAdd);
         } else {
-            throw new UnsupportedOperationException(
-                    String.format(
-                            "Batch only supports when table option '%s' is set to true.",
-                            ConfigOptions.TABLE_DATALAKE_ENABLED));
+            // Non-lake batch / bounded read. Primary-key tables that require a snapshot
+            // (full startup mode) are not supported without a lake, because generating snapshot
+            // splits here would produce mixed split types (HybridSnapshotLogSplit + LogSplit).
+            if (hasPrimaryKey && startingOffsetsInitializer instanceof SnapshotOffsetsInitializer) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "Bounded read with full (snapshot) startup mode on primary-key "
+                                        + "table '%s' requires table option '%s' to be set to true. "
+                                        + "Use earliest/latest/timestamp startup mode for a "
+                                        + "log-only bounded read instead.",
+                                tablePath, ConfigOptions.TABLE_DATALAKE_ENABLED));
+            }
+            context.callAsync(this::generateLogOnlySplits, this::handleSplitsAdd);
+        }
+    }
+
+    /**
+     * Generate log-only splits for the whole table (all partitions for partitioned tables).
+     * Log-only splits avoid mixing split types (HybridSnapshotLogSplit + LogSplit), and each split
+     * carries the resolved stopping offset when a bounded terminal is configured.
+     */
+    private List<SourceSplitBase> generateLogOnlySplits() {
+        if (isPartitioned) {
+            Set<PartitionInfo> partitionInfos = listPartitions();
+            Collection<Partition> partitions =
+                    partitionInfos.stream()
+                            .map(p -> new Partition(p.getPartitionId(), p.getPartitionName()))
+                            .collect(Collectors.toList());
+            return initLogTablePartitionSplits(partitions, startingOffsetsInitializer);
+        } else {
+            return getLogSplit(null, null);
         }
     }
 
@@ -1039,6 +1147,28 @@ public class FlinkSourceEnumerator
             Map<Integer, Long> stoppingOffsets =
                     stoppingOffsetsInitializer.getBucketOffsets(
                             partitionName, bucketsNeedInitOffset, bucketOffsetsRetriever);
+
+            // For bounded reads, the reader detects empty splits via 'startingOffset >=
+            // stoppingOffset'. The earliest() initializer returns the EARLIEST_OFFSET sentinel
+            // instead of a resolved offset, which breaks that comparison (e.g. an empty bucket
+            // has earliest == latest). Resolve the sentinel to the actual earliest offset so
+            // empty bounded splits are detected and the job can finish.
+            if (!(stoppingOffsetsInitializer instanceof NoStoppingOffsetsInitializer)) {
+                List<Integer> sentinelBuckets = new ArrayList<>();
+                for (Map.Entry<Integer, Long> entry : startingOffsets.entrySet()) {
+                    if (entry.getValue() == LogScanner.EARLIEST_OFFSET) {
+                        sentinelBuckets.add(entry.getKey());
+                    }
+                }
+                if (!sentinelBuckets.isEmpty()) {
+                    // The default retriever returns the EARLIEST_OFFSET sentinel without a
+                    // server round trip; use a fetching retriever to resolve actual offsets.
+                    startingOffsets.putAll(
+                            new BucketOffsetsRetrieverImpl(flussAdmin, tablePath, true)
+                                    .earliestOffsets(partitionName, sentinelBuckets));
+                }
+            }
+
             startingOffsets.forEach(
                     (bucketId, startingOffset) ->
                             splits.add(

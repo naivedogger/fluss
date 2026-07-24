@@ -17,7 +17,9 @@
 
 package org.apache.fluss.flink.utils;
 
+import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.FlinkConnectorOptions.ScanBoundedMode;
 
 import org.apache.flink.table.api.ValidationException;
 import org.junit.jupiter.api.Test;
@@ -27,6 +29,8 @@ import java.util.TimeZone;
 
 import static org.apache.flink.configuration.CoreOptions.TMP_DIRS;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
+import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_BOUNDED_MODE;
+import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_BOUNDED_TIMESTAMP;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.parseTimestamp;
@@ -77,6 +81,64 @@ class FlinkConnectorOptionsUtilTest {
                         () -> FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions))
                 .isInstanceOf(ValidationException.class)
                 .hasMessage("'scan.split.assignment.batch-size' must be positive, but was 0.");
+    }
+
+    @Test
+    void testGetBoundedOptions() {
+        org.apache.flink.configuration.Configuration tableOptions =
+                new org.apache.flink.configuration.Configuration();
+        // default: unbounded
+        FlinkConnectorOptionsUtils.BoundedOptions boundedOptions =
+                FlinkConnectorOptionsUtils.getBoundedOptions(tableOptions, ZoneId.systemDefault());
+        assertThat(boundedOptions.boundedMode).isEqualTo(ScanBoundedMode.UNBOUNDED);
+
+        // latest
+        tableOptions.set(SCAN_BOUNDED_MODE, ScanBoundedMode.LATEST);
+        boundedOptions =
+                FlinkConnectorOptionsUtils.getBoundedOptions(tableOptions, ZoneId.systemDefault());
+        assertThat(boundedOptions.boundedMode).isEqualTo(ScanBoundedMode.LATEST);
+
+        // timestamp
+        tableOptions.set(SCAN_BOUNDED_MODE, ScanBoundedMode.TIMESTAMP);
+        tableOptions.set(SCAN_BOUNDED_TIMESTAMP, "1702134552000");
+        boundedOptions =
+                FlinkConnectorOptionsUtils.getBoundedOptions(tableOptions, ZoneId.systemDefault());
+        assertThat(boundedOptions.boundedMode).isEqualTo(ScanBoundedMode.TIMESTAMP);
+        assertThat(boundedOptions.boundedTimestampMs).isEqualTo(1702134552000L);
+    }
+
+    @Test
+    void testToStoppingOffsetsInitializer() {
+        FlinkConnectorOptionsUtils.BoundedOptions unbounded =
+                new FlinkConnectorOptionsUtils.BoundedOptions();
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(unbounded)).isNull();
+
+        FlinkConnectorOptionsUtils.BoundedOptions latest =
+                new FlinkConnectorOptionsUtils.BoundedOptions();
+        latest.boundedMode = ScanBoundedMode.LATEST;
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(latest))
+                .isInstanceOf(OffsetsInitializer.latest().getClass());
+
+        FlinkConnectorOptionsUtils.BoundedOptions timestamp =
+                new FlinkConnectorOptionsUtils.BoundedOptions();
+        timestamp.boundedMode = ScanBoundedMode.TIMESTAMP;
+        timestamp.boundedTimestampMs = 100L;
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(timestamp))
+                .isInstanceOf(OffsetsInitializer.timestamp(100L).getClass());
+    }
+
+    @Test
+    void testValidateScanBoundedMode() {
+        org.apache.flink.configuration.Configuration tableOptions =
+                new org.apache.flink.configuration.Configuration();
+        tableOptions.set(SCAN_BOUNDED_MODE, ScanBoundedMode.TIMESTAMP);
+        assertThatThrownBy(
+                        () -> FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(SCAN_BOUNDED_TIMESTAMP.key());
+
+        tableOptions.set(SCAN_BOUNDED_TIMESTAMP, "2023-12-09 23:09:12");
+        FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions);
     }
 
     @Test

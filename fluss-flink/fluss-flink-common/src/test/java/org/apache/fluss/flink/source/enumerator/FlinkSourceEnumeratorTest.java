@@ -216,6 +216,106 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     }
 
     @Test
+    void testLogSplitsCarryStoppingOffsetWhenBounded() throws Throwable {
+        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        // write rows so the log buckets are materialized and latest offsets are resolvable.
+        writeRows(
+                conn,
+                DEFAULT_TABLE_PATH,
+                Arrays.asList(row(1, "v1"), row(2, "v2"), row(3, "v3")),
+                true);
+        int numSubtasks = DEFAULT_BUCKET_NUM;
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(numSubtasks)) {
+            // bounded streaming read: streaming enumerator with a latest() stopping initializer.
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            false,
+                            false,
+                            context,
+                            OffsetsInitializer.earliest(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
+                            streaming,
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false,
+                            OffsetsInitializer.latest());
+
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+            }
+            context.runNextOneTimeCallable();
+
+            List<SourceSplitBase> assignedSplits =
+                    getReadersAssignments(context).values().stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits).hasSize(DEFAULT_BUCKET_NUM);
+            long totalStoppingOffset = 0L;
+            for (SourceSplitBase split : assignedSplits) {
+                assertThat(split).isInstanceOf(LogSplit.class);
+                LogSplit logSplit = (LogSplit) split;
+                assertThat(logSplit.getStoppingOffset()).isPresent();
+                // With sentinel resolution for bounded reads, the EARLIEST_OFFSET
+                // sentinel is resolved to the actual earliest offset (0).
+                assertThat(logSplit.getStartingOffset()).isEqualTo(0L);
+                assertThat(logSplit.getTableBucket().getTableId()).isEqualTo(tableId);
+                totalStoppingOffset += logSplit.getStoppingOffset().get();
+            }
+            // the 3 written rows are distributed across buckets; the latest stopping offsets
+            // sum up to the total number of records.
+            assertThat(totalStoppingOffset).isEqualTo(3L);
+        }
+    }
+
+    @Test
+    void testLogSplitsHaveNoStoppingOffsetWhenUnbounded() throws Throwable {
+        createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        int numSubtasks = DEFAULT_BUCKET_NUM;
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(numSubtasks)) {
+            // no stopping initializer => unbounded streaming read.
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            false,
+                            false,
+                            context,
+                            OffsetsInitializer.earliest(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
+                            streaming,
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false,
+                            null);
+
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+            }
+            context.runNextOneTimeCallable();
+
+            List<SourceSplitBase> assignedSplits =
+                    getReadersAssignments(context).values().stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits).hasSize(DEFAULT_BUCKET_NUM);
+            for (SourceSplitBase split : assignedSplits) {
+                assertThat(split).isInstanceOf(LogSplit.class);
+                assertThat(((LogSplit) split).getStoppingOffset()).isNotPresent();
+            }
+        }
+    }
+
+    @Test
     void testRestoreFlussOnlySourceWithLakeSourceDoesNotGenerateLakeSplits(@TempDir Path tempDir)
             throws Throwable {
         long tableId =
@@ -714,7 +814,8 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                 LeaseContext.DEFAULT,
                                 false,
                                 true,
-                                Collections.singletonList(unassignedSplit))) {
+                                Collections.singletonList(unassignedSplit),
+                                null)) {
 
             enumerator.start();
 
@@ -1214,7 +1315,8 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                 LeaseContext.DEFAULT,
                                 false,
                                 true,
-                                unassignedSplits)) {
+                                unassignedSplits,
+                                null)) {
 
             enumerator.start();
 

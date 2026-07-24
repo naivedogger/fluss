@@ -88,7 +88,8 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                 deserializationSchema,
                 streaming,
-                lakeSource);
+                lakeSource,
+                null);
     }
 
     FlussSource(
@@ -105,6 +106,38 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
             FlussDeserializationSchema<OUT> deserializationSchema,
             boolean streaming,
             @Nullable LakeSource<LakeSplit> lakeSource) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                deserializationSchema,
+                streaming,
+                lakeSource,
+                null);
+    }
+
+    FlussSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer) {
         // TODO: Support partition pushDown in datastream
         super(
                 flussConf,
@@ -121,7 +154,8 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 streaming,
                 null,
                 lakeSource,
-                LeaseContext.DEFAULT);
+                LeaseContext.DEFAULT,
+                stoppingOffsetsInitializer);
     }
 
     /**
