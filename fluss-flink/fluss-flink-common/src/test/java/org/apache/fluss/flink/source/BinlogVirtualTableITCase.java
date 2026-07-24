@@ -60,6 +60,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectBatchRows;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
 import static org.apache.fluss.flink.utils.FlinkTestBase.writeRows;
 import static org.apache.fluss.server.testutils.FlussClusterExtension.BUILTIN_DATABASE;
@@ -236,7 +237,7 @@ abstract class BinlogVirtualTableITCase {
     }
 
     @Test
-    public void testBatchReadBinlogTableFailsFast() throws Exception {
+    public void testBatchReadBinlogTable() throws Exception {
         tEnv.executeSql(
                 "CREATE TABLE batch_binlog_test ("
                         + "  id INT NOT NULL,"
@@ -244,11 +245,78 @@ abstract class BinlogVirtualTableITCase {
                         + "  PRIMARY KEY (id) NOT ENFORCED"
                         + ") WITH ('bucket.num' = '1')");
 
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "batch_binlog_test");
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice"), row(2, "Bob")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice-updated")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        deleteRows(conn, tablePath, Arrays.asList(row(2, "Bob")));
+
         tEnv = initBatchTableEnvironment();
 
-        assertThatThrownBy(() -> tEnv.explainSql("SELECT * FROM batch_binlog_test$binlog"))
-                .hasRootCauseInstanceOf(UnsupportedOperationException.class)
-                .hasRootCauseMessage("$binlog virtual tables only support streaming mode.");
+        // The batch source resolves the configured starting offsets and captures the latest log
+        // offsets as stopping offsets, so historical binlog replay completes as a bounded query.
+        List<String> allChanges =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, "
+                                                + "before.id, before.name, after.id, after.name "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(allChanges)
+                .containsExactly(
+                        "+I[insert, 0, null, null, 1, Alice]",
+                        "+I[insert, 1, null, null, 2, Bob]",
+                        "+I[update, 2, 1, Alice, 1, Alice-updated]",
+                        "+I[delete, 4, 2, Bob, null, null]");
+
+        List<String> limited =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "ORDER BY _log_offset LIMIT 2")
+                                .collect());
+        assertThat(limited).containsExactly("+I[insert, 0]", "+I[insert, 1]");
+
+        List<String> primaryKeyFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, before.id, before.name, "
+                                                + "after.id, after.name "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "WHERE after.id = 1 "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(primaryKeyFiltered)
+                .containsExactly(
+                        "+I[insert, null, null, 1, Alice]",
+                        "+I[update, 1, Alice, 1, Alice-updated]");
+
+        List<String> metadataFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, before.id "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "WHERE _change_type = 'delete' "
+                                                + "AND _log_offset = 4 "
+                                                + "AND _commit_timestamp = TO_TIMESTAMP_LTZ(3000, 3)")
+                                .collect());
+        assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
+
+        List<String> timestampStartup =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset "
+                                                + "FROM batch_binlog_test$binlog "
+                                                + "/*+ OPTIONS("
+                                                + "'scan.startup.mode' = 'timestamp', "
+                                                + "'scan.startup.timestamp' = '1500') */ "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(timestampStartup).containsExactly("+I[update, 2]", "+I[delete, 4]");
     }
 
     @Test
