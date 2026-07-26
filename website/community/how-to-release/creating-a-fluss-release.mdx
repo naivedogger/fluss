@@ -182,7 +182,7 @@ title: Upgrade Notes
 sidebar_position: 4
 ---
 
-# Upgrade Notes from v0.x to v0.y
+# Upgrade Notes from v1.0 to v1.1
 ```
 
 Additionally, for the upgrade notes page of the version currently being released (e.g., `upgrade-notes-1.0.md`), add `sidebar_class_name: hidden` front matter to hide it from the sidebar.
@@ -493,7 +493,7 @@ Verify the RC images are present:
 - https://hub.docker.com/r/apache/fluss/tags
 - https://hub.docker.com/r/apache/fluss-quickstart-flink/tags
 
-Then, update the `dockerVersion` field for the current release RC version in the `website/fluss-versions.json` file on the `main` branch to the value of `${RELEASE_VERSION}_rc${RC_NUM}` (which includes the RC suffix, e.g., `1.0.0-rc1`). This update should be committed and pushed to the `main` branch.
+Then, update the `dockerVersion` field for the current release RC version in the `website/fluss-versions.json` file on the `main` branch to the value of `${RELEASE_VERSION}-rc${RC_NUM}` (which includes the RC suffix, e.g., `1.0.0-rc1`). This update should be committed and pushed to the `main` branch.
 
 This ensures that the **Quickstart guide** in the documentation references the correct Docker image for the release candidate. This will help developers to easily test the new release candidate using the Quickstart guide.
 

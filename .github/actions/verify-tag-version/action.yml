@@ -15,22 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Verify that the pushed tag version matches the workspace package version in Cargo.toml.
-# Tag v0.2.0 or v0.2.0-rc1; Cargo 0.2.0. Compare base version (strip -rc*): both pass when Cargo is 0.2.0.
-# Requires: checkout before this step (Cargo.toml in workspace root). Use on tag push (GITHUB_REF like refs/tags/v0.1.0).
+# Verify that the pushed tag version matches the workspace package version in fluss-rust/Cargo.toml.
+# Tag v1.0.0 or v1.0.0-rc1; Cargo 1.0.0. Compare base version (strip -rc*): both pass when Cargo is 1.0.0.
+# Requires: checkout before this step. Reads the Rust workspace version from fluss-rust/Cargo.toml and compares it with the pushed tag.
 
 name: 'Verify tag matches crate version'
-description: 'Exits with error if GITHUB_REF tag base version does not match [workspace.package] version in Cargo.toml (strips -rc*).'
+description: 'Exits with an error if the pushed tag base version does not match [workspace.package] version in fluss-rust/Cargo.toml.'
 
 runs:
   using: 'composite'
   steps:
     - run: |
         TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-        CRATE_VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml | grep '^\s*version\s*=' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+        CARGO_TOML="${GITHUB_WORKSPACE}/fluss-rust/Cargo.toml"
+        CRATE_VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/p' "${CARGO_TOML}" | grep '^\s*version\s*=' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
         base() { echo "$1" | sed -E 's/-rc(\.[0-9]+|[0-9]+)$//'; }
         if [ "$(base "$TAG_VERSION")" != "$(base "$CRATE_VERSION")" ]; then
-          echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CRATE_VERSION). Run scripts/bump-version.sh before tagging, or tag the version that is in Cargo.toml."
+          echo "::error::Tag version ($TAG_VERSION) does not match fluss-rust/Cargo.toml version ($CRATE_VERSION). Run fluss-rust/scripts/bump-version.sh before tagging, or tag the version configured in Cargo.toml."
           exit 1
         fi
         echo "Tag and crate version match: $TAG_VERSION"

@@ -36,7 +36,7 @@ We'd like to thank the following members and committers to the Apache Fluss proj
 
 The Apache Fluss project recognizes the following roles, each representing a distinct type of contribution to the project’s development:
 
-- **PMC Chair** - The PMC Chair is a PMC member appointed by the ASF Board of Directors as an officer (Vice President) of the foundation. The Chair acts as the primary point of contact between the board and the project, and is responsible for submitting regular reports on the health of the project. The Chair holds no additional authority or decision-making power over other PMC members.
+- **PMC Chair** - The PMC Chair is a PMC member appointed by the ASF Board of Directors as an officer of the Foundation and Vice President of Apache Fluss. The Chair serves as the primary point of contact between the Board and the project and is responsible for submitting regular reports on the health of the project. The Chair has no additional authority or decision-making power over other PMC members.
 
 - **PMC Member** - The Project Management Committee (PMC) is responsible for the management and oversight of the Apache Fluss project. While committers have the ability to update the code, only the PMC as a body has the authority to vote on formal releases of the project's software. The PMC is also responsible for voting in new committers and PMC members, and for the project's legal, IP, trademark, and community affairs following ASF policy.
 
