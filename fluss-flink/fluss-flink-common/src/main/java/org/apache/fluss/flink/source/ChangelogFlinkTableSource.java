@@ -53,6 +53,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -263,23 +264,24 @@ public class ChangelogFlinkTableSource
 
         // Derive the data-column indices actually scanned from Fluss (first-appearance order),
         // and the projection over the base changelog row [metadata columns + scanned data columns].
-        List<Integer> dataColumns = new ArrayList<>();
+        Map<Integer, Integer> dataColumnPositions = new LinkedHashMap<>();
         for (int virtualIndex : this.projectedFields) {
             if (virtualIndex >= METADATA_COLUMN_COUNT) {
-                int dataIndex = virtualIndex - METADATA_COLUMN_COUNT;
-                if (!dataColumns.contains(dataIndex)) {
-                    dataColumns.add(dataIndex);
-                }
+                dataColumnPositions.putIfAbsent(
+                        virtualIndex - METADATA_COLUMN_COUNT, dataColumnPositions.size());
             }
         }
+
         // When no data column is projected (metadata-only projection, e.g. SELECT _change_type),
         // normalize the scan projection to null so Fluss reads the full data row. A zero-column
         // scan produces no records, so the metadata columns must be emitted from a full data scan
         // and selected later during deserialization via baseRowProjection.
         this.dataProjection =
-                dataColumns.isEmpty()
+                dataColumnPositions.isEmpty()
                         ? null
-                        : dataColumns.stream().mapToInt(Integer::intValue).toArray();
+                        : dataColumnPositions.keySet().stream()
+                                .mapToInt(Integer::intValue)
+                                .toArray();
 
         int[] base = new int[this.projectedFields.length];
         for (int i = 0; i < this.projectedFields.length; i++) {
@@ -288,7 +290,7 @@ public class ChangelogFlinkTableSource
                     virtualIndex < METADATA_COLUMN_COUNT
                             ? virtualIndex
                             : METADATA_COLUMN_COUNT
-                                    + dataColumns.indexOf(virtualIndex - METADATA_COLUMN_COUNT);
+                                    + dataColumnPositions.get(virtualIndex - METADATA_COLUMN_COUNT);
         }
         this.baseRowProjection = base;
     }
@@ -319,8 +321,8 @@ public class ChangelogFlinkTableSource
                         remainingFilters.add(filter);
                     } else {
                         acceptedFilters.add(filter);
+                        converted.add(p);
                     }
-                    converted.add(p);
                 } else {
                     remainingFilters.add(filter);
                 }
@@ -362,7 +364,7 @@ public class ChangelogFlinkTableSource
         List<ResolvedExpression> remainingFilters = new ArrayList<>();
 
         for (ResolvedExpression filter : filters) {
-            Optional<Predicate> predicateOpt = convertToFlussPredicate(dataColumnsType, filter);
+            Optional<Predicate> predicateOpt = convertToFlussPredicate(dataFlussRowType, filter);
             if (predicateOpt.isPresent()
                     && PushdownUtils.canPredicateUseStatistics(
                             predicateOpt.get(), dataFlussRowType, availableStatsColumns)) {
