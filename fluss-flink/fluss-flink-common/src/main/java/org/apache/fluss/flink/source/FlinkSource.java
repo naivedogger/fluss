@@ -75,6 +75,7 @@ public class FlinkSource<OUT>
     @Nullable private final FlinkRecordEmitter.OutputProjection<OUT> outputProjection;
     @Nullable private final int[] projectedFields;
     protected final OffsetsInitializer offsetsInitializer;
+    @Nullable protected final OffsetsInitializer stoppingOffsetsInitializer;
     protected final long scanPartitionDiscoveryIntervalMs;
     protected final int splitPerAssignmentBatchSize;
     private final boolean streaming;
@@ -208,6 +209,7 @@ public class FlinkSource<OUT>
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
+                null,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
@@ -243,6 +245,7 @@ public class FlinkSource<OUT>
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
+                null,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
@@ -262,6 +265,7 @@ public class FlinkSource<OUT>
             @Nullable int[] projectedFields,
             @Nullable Predicate logRecordBatchFilter,
             OffsetsInitializer offsetsInitializer,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             FlussDeserializationSchema<OUT> deserializationSchema,
@@ -278,6 +282,7 @@ public class FlinkSource<OUT>
         this.projectedFields = projectedFields;
         this.logRecordBatchFilter = logRecordBatchFilter;
         this.offsetsInitializer = offsetsInitializer;
+        this.stoppingOffsetsInitializer = stoppingOffsetsInitializer;
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.deserializationSchema = deserializationSchema;
@@ -304,6 +309,7 @@ public class FlinkSource<OUT>
                 isPartitioned,
                 splitEnumeratorContext,
                 offsetsInitializer,
+                stoppingOffsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,

@@ -396,6 +396,29 @@ SELECT * FROM log_table
 'scan.startup.timestamp' = '2023-12-09 23:09:12') */;
 ```
 
+### Stop Reading Position
+
+The config option `scan.bounded.mode` enables you to specify where the source stops reading. It is currently only supported for Log Tables. Fluss supports the following `scan.bounded.mode` options:
+- `unbounded` (default): In streaming execution mode, the source never stops. In batch execution mode, the source reads up to the latest log offsets captured when the source starts.
+- `latest-offset`: The source stops at the latest log offsets captured when the source starts. In batch execution mode, this behaves the same as `unbounded`.
+- `timestamp`: The source stops before the first record batch whose commit timestamp is greater than or equal to the specified time (defined by the configuration item `scan.bounded.timestamp`), i.e. only records with a commit timestamp smaller than the specified time are read. The specified time must not be in the future.
+
+The following SQL statement reads the `log_table` table up to a specified time.
+```sql title="Flink SQL"
+SELECT * FROM log_table
+/*+ OPTIONS('scan.bounded.mode' = 'timestamp',
+'scan.bounded.timestamp' = '2023-12-09 23:09:12') */;
+```
+
+The start and stop reading positions can be combined to read a time range of the log.
+```sql title="Flink SQL"
+SELECT * FROM log_table
+/*+ OPTIONS('scan.startup.mode' = 'timestamp',
+'scan.startup.timestamp' = '2023-12-09 00:00:00',
+'scan.bounded.mode' = 'timestamp',
+'scan.bounded.timestamp' = '2023-12-10 00:00:00') */;
+```
+
 
 
 

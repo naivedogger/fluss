@@ -268,6 +268,7 @@ public class FlinkSourceEnumerator
                 isPartitioned,
                 context,
                 startingOffsetsInitializer,
+                null,
                 scanPartitionDiscoveryIntervalMs,
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                 streaming,
@@ -297,15 +298,49 @@ public class FlinkSourceEnumerator
                 hasPrimaryKey,
                 isPartitioned,
                 context,
-                Collections.emptySet(),
-                Collections.emptyMap(),
-                null,
                 startingOffsetsInitializer,
+                null,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
                 partitionFilters,
                 lakeSource,
+                leaseContext,
+                checkpointTriggeredBefore);
+    }
+
+    public FlinkSourceEnumerator(
+            TablePath tablePath,
+            Configuration flussConf,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            SplitEnumeratorContext<SourceSplitBase> context,
+            OffsetsInitializer startingOffsetsInitializer,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext,
+            boolean checkpointTriggeredBefore) {
+        this(
+                tablePath,
+                flussConf,
+                hasPrimaryKey,
+                isPartitioned,
+                context,
+                Collections.emptySet(),
+                Collections.emptyMap(),
+                null,
+                startingOffsetsInitializer,
+                stoppingOffsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                new WorkerExecutor(context),
                 leaseContext,
                 checkpointTriggeredBefore,
                 false,
@@ -380,6 +415,7 @@ public class FlinkSourceEnumerator
                 assignedPartitions,
                 pendingHybridLakeFlussSplits,
                 startingOffsetsInitializer,
+                null,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -419,6 +455,7 @@ public class FlinkSourceEnumerator
                 assignedPartitions,
                 pendingHybridLakeFlussSplits,
                 startingOffsetsInitializer,
+                null,
                 scanPartitionDiscoveryIntervalMs,
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                 streaming,
@@ -451,6 +488,50 @@ public class FlinkSourceEnumerator
             boolean checkpointTriggeredBefore,
             boolean initialDiscoveryFinished,
             Collection<SourceSplitBase> unassignedSplits) {
+        this(
+                tablePath,
+                flussConf,
+                hasPrimaryKey,
+                isPartitioned,
+                context,
+                assignedTableBuckets,
+                assignedPartitions,
+                pendingHybridLakeFlussSplits,
+                startingOffsetsInitializer,
+                null,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                workerExecutor,
+                leaseContext,
+                checkpointTriggeredBefore,
+                initialDiscoveryFinished,
+                unassignedSplits);
+    }
+
+    FlinkSourceEnumerator(
+            TablePath tablePath,
+            Configuration flussConf,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            SplitEnumeratorContext<SourceSplitBase> context,
+            Set<TableBucket> assignedTableBuckets,
+            Map<Long, String> assignedPartitions,
+            List<SourceSplitBase> pendingHybridLakeFlussSplits,
+            OffsetsInitializer startingOffsetsInitializer,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            WorkerExecutor workerExecutor,
+            LeaseContext leaseContext,
+            boolean checkpointTriggeredBefore,
+            boolean initialDiscoveryFinished,
+            Collection<SourceSplitBase> unassignedSplits) {
         checkArgument(
                 splitPerAssignmentBatchSize > 0,
                 "Split assignment batch size must be positive, but was %s.",
@@ -473,7 +554,11 @@ public class FlinkSourceEnumerator
         this.streaming = streaming;
         this.partitionFilters = partitionFilters;
         this.stoppingOffsetsInitializer =
-                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest();
+                streaming
+                        ? new NoStoppingOffsetsInitializer()
+                        : (stoppingOffsetsInitializer != null
+                                ? stoppingOffsetsInitializer
+                                : OffsetsInitializer.latest());
         this.lakeSource = lakeSource;
         this.workerExecutor = workerExecutor;
         this.leaseContext = leaseContext;

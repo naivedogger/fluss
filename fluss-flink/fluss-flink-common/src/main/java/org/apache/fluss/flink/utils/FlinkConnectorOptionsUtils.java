@@ -19,6 +19,7 @@ package org.apache.fluss.flink.utils;
 
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
+import org.apache.fluss.flink.FlinkConnectorOptions.ScanBoundedMode;
 import org.apache.fluss.flink.FlinkConnectorOptions.ScanStartupMode;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.metadata.MergeEngineType;
@@ -43,6 +44,8 @@ import java.util.stream.Collectors;
 
 import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
 import static org.apache.fluss.config.ConfigOptions.LAKE_TIERING_IO_TMP_DIRS;
+import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_BOUNDED_MODE;
+import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_BOUNDED_TIMESTAMP;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_STARTUP_MODE;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP;
@@ -62,6 +65,7 @@ public class FlinkConnectorOptionsUtils {
 
     public static void validateTableSourceOptions(ReadableConfig tableOptions) {
         validateScanStartupMode(tableOptions);
+        validateScanBoundedMode(tableOptions);
         validateScanSplitAssignmentBatchSize(tableOptions);
     }
 
@@ -104,6 +108,20 @@ public class FlinkConnectorOptionsUtils {
                     parseTimestamp(
                             tableOptions.get(SCAN_STARTUP_TIMESTAMP),
                             SCAN_STARTUP_TIMESTAMP.key(),
+                            timeZone);
+        }
+        return options;
+    }
+
+    public static BoundedOptions getBoundedOptions(ReadableConfig tableOptions, ZoneId timeZone) {
+        ScanBoundedMode scanBoundedMode = tableOptions.get(SCAN_BOUNDED_MODE);
+        final BoundedOptions options = new BoundedOptions();
+        options.boundedMode = scanBoundedMode;
+        if (scanBoundedMode == ScanBoundedMode.TIMESTAMP) {
+            options.boundedTimestampMs =
+                    parseTimestamp(
+                            tableOptions.get(SCAN_BOUNDED_TIMESTAMP),
+                            SCAN_BOUNDED_TIMESTAMP.key(),
                             timeZone);
         }
         return options;
@@ -152,6 +170,18 @@ public class FlinkConnectorOptionsUtils {
                         String.format(
                                 "'%s' is required int '%s' startup mode but missing.",
                                 SCAN_STARTUP_TIMESTAMP.key(), TIMESTAMP));
+            }
+        }
+    }
+
+    private static void validateScanBoundedMode(ReadableConfig tableOptions) {
+        ScanBoundedMode scanBoundedMode = tableOptions.get(SCAN_BOUNDED_MODE);
+        if (scanBoundedMode == ScanBoundedMode.TIMESTAMP) {
+            if (!tableOptions.getOptional(SCAN_BOUNDED_TIMESTAMP).isPresent()) {
+                throw new ValidationException(
+                        String.format(
+                                "'%s' is required in '%s' bounded mode but missing.",
+                                SCAN_BOUNDED_TIMESTAMP.key(), ScanBoundedMode.TIMESTAMP));
             }
         }
     }
@@ -237,5 +267,18 @@ public class FlinkConnectorOptionsUtils {
     public static class StartupOptions {
         public ScanStartupMode startupMode;
         public long startupTimestampMs;
+    }
+
+    /** Fluss bounded options. * */
+    public static class BoundedOptions {
+        public ScanBoundedMode boundedMode;
+        public long boundedTimestampMs;
+
+        /** Returns the default bounded options, i.e. no user-specified stopping offsets. */
+        public static BoundedOptions unbounded() {
+            BoundedOptions options = new BoundedOptions();
+            options.boundedMode = ScanBoundedMode.UNBOUNDED;
+            return options;
+        }
     }
 }
