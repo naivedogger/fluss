@@ -83,6 +83,7 @@ public class FlussSourceBuilder<OUT> {
     private Long scanPartitionDiscoveryIntervalMs;
     private Integer splitPerAssignmentBatchSize;
     private OffsetsInitializer offsetsInitializer;
+    private OffsetsInitializer stoppingOffsetsInitializer;
     private boolean bounded;
     private FlussDeserializationSchema<OUT> deserializationSchema;
 
@@ -182,6 +183,24 @@ public class FlussSourceBuilder<OUT> {
      */
     public FlussSourceBuilder<OUT> setBounded() {
         this.bounded = true;
+        return this;
+    }
+
+    /**
+     * Builds a bounded source that stops once it reaches the given stopping offsets and then
+     * finishes, even in streaming execution mode (a bounded streaming read). Typical usages are
+     * replaying a bounded time range of the log, backfilling and archiving.
+     *
+     * <p>Supported stopping offsets initializers are {@link OffsetsInitializer#latest()} and {@link
+     * OffsetsInitializer#timestamp(long)}.
+     *
+     * @param stoppingOffsetsInitializer the strategy for determining the stopping offsets
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setBounded(OffsetsInitializer stoppingOffsetsInitializer) {
+        this.stoppingOffsetsInitializer =
+                checkNotNull(
+                        stoppingOffsetsInitializer, "stoppingOffsetsInitializer must not be null");
         return this;
     }
 
@@ -362,6 +381,35 @@ public class FlussSourceBuilder<OUT> {
                             tablePath, fullStartup));
         }
 
+        // Bounded streaming read support (user-supplied stopping offsets):
+        //  - Log tables and the changelog of primary key tables (earliest/latest/timestamp
+        //    startup mode) are supported.
+        //  - The full startup mode of primary key tables is not supported, because the snapshot
+        //    reading phase has no bounded end.
+        //  - The datalake union read (full startup mode on a datalake-enabled table) is not
+        //    supported, because lake splits have no bounded end.
+        if (stoppingOffsetsInitializer != null) {
+            if (hasPrimaryKey && fullStartup) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Bounded read with stopping offsets on primary key table '%s' is "
+                                        + "not supported in full startup mode, because the "
+                                        + "snapshot reading phase has no bounded end. Use "
+                                        + "earliest/latest/timestamp starting offsets to read the "
+                                        + "changelog with a bounded end.",
+                                tablePath));
+            }
+            if (lakeEnabled && fullStartup) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Bounded read with stopping offsets on datalake-enabled table '%s' "
+                                        + "is not supported in full startup mode (datalake union "
+                                        + "read). Use earliest/latest/timestamp starting offsets "
+                                        + "to read only the Fluss log with a bounded end.",
+                                tablePath));
+            }
+        }
+
         LakeSource<LakeSplit> lakeSource = null;
         if (lakeEnabled && fullStartup) {
             lakeSource =
@@ -393,6 +441,7 @@ public class FlussSourceBuilder<OUT> {
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
+                stoppingOffsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,

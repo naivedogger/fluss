@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.utils;
 
+import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.FlinkConnectorOptions.ScanBoundedMode;
@@ -125,6 +126,25 @@ public class FlinkConnectorOptionsUtils {
                             timeZone);
         }
         return options;
+    }
+
+    /**
+     * Creates the stopping offsets initializer from the given bounded options, or returns null for
+     * the unbounded mode.
+     */
+    @Nullable
+    public static OffsetsInitializer toStoppingOffsetsInitializer(BoundedOptions boundedOptions) {
+        switch (boundedOptions.boundedMode) {
+            case UNBOUNDED:
+                return null;
+            case LATEST_OFFSET:
+                return OffsetsInitializer.latest();
+            case TIMESTAMP:
+                return OffsetsInitializer.timestamp(boundedOptions.boundedTimestampMs);
+            default:
+                throw new IllegalArgumentException(
+                        "Unsupported bounded mode: " + boundedOptions.boundedMode);
+        }
     }
 
     public static List<String> getBucketKeys(ReadableConfig tableOptions) {

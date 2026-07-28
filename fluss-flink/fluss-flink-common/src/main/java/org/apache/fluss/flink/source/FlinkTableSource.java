@@ -512,27 +512,43 @@ public class FlinkTableSource
      */
     @Nullable
     private OffsetsInitializer createStoppingOffsetsInitializer() {
-        switch (boundedOptions.boundedMode) {
-            case UNBOUNDED:
-                return null;
-            case LATEST_OFFSET:
-                validateBoundedModeSupported();
-                return OffsetsInitializer.latest();
-            case TIMESTAMP:
-                validateBoundedModeSupported();
-                return OffsetsInitializer.timestamp(boundedOptions.boundedTimestampMs);
-            default:
-                throw new IllegalArgumentException(
-                        "Unsupported bounded mode: " + boundedOptions.boundedMode);
+        OffsetsInitializer stoppingOffsetsInitializer =
+                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions);
+        if (stoppingOffsetsInitializer != null) {
+            validateBoundedModeSupported();
         }
+        return stoppingOffsetsInitializer;
     }
 
     private void validateBoundedModeSupported() {
         if (hasPrimaryKey()) {
+            if (!streaming) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "'%s' is not supported for primary key tables in batch execution mode.",
+                                FlinkConnectorOptions.SCAN_BOUNDED_MODE.key()));
+            }
+            if (startupOptions.startupMode == FlinkConnectorOptions.ScanStartupMode.FULL) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "'%s' is not supported for primary key tables in '%s' startup mode, "
+                                        + "because the snapshot reading phase has no bounded end. "
+                                        + "Use 'earliest', 'latest' or 'timestamp' startup mode to "
+                                        + "read the changelog of a primary key table with a bounded end.",
+                                FlinkConnectorOptions.SCAN_BOUNDED_MODE.key(),
+                                FlinkConnectorOptions.ScanStartupMode.FULL));
+            }
+        }
+        if (isDataLakeEnabled
+                && startupOptions.startupMode == FlinkConnectorOptions.ScanStartupMode.FULL) {
             throw new UnsupportedOperationException(
                     String.format(
-                            "'%s' is currently only supported for log tables.",
-                            FlinkConnectorOptions.SCAN_BOUNDED_MODE.key()));
+                            "'%s' is not supported for the datalake union read, i.e. '%s' startup "
+                                    + "mode on a datalake-enabled table. Use 'earliest', 'latest' "
+                                    + "or 'timestamp' startup mode to read only the Fluss log with "
+                                    + "a bounded end.",
+                            FlinkConnectorOptions.SCAN_BOUNDED_MODE.key(),
+                            FlinkConnectorOptions.ScanStartupMode.FULL));
         }
     }
 

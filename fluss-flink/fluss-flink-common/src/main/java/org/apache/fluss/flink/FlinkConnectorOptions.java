@@ -146,11 +146,19 @@ public class FlinkConnectorOptions {
                                     "Bounded mode for the Fluss source. Default is '%s'. In batch "
                                             + "execution mode, '%s' behaves the same as '%s': the "
                                             + "source reads up to the latest log offsets captured "
-                                            + "at startup. Currently, bounded modes other than '%s' "
-                                            + "are only supported for log tables.",
+                                            + "at startup. In streaming execution mode, a bounded "
+                                            + "mode other than '%s' makes the source stop at the "
+                                            + "given stopping offsets and then the job finishes "
+                                            + "(a bounded streaming read). Bounded modes other "
+                                            + "than '%s' are supported for log tables and the "
+                                            + "changelog of primary key tables (earliest/latest/"
+                                            + "timestamp startup mode), but not for the full "
+                                            + "startup mode of primary key tables or the datalake "
+                                            + "union read.",
                                     ScanBoundedMode.UNBOUNDED.value,
                                     ScanBoundedMode.UNBOUNDED.value,
                                     ScanBoundedMode.LATEST_OFFSET.value,
+                                    ScanBoundedMode.UNBOUNDED.value,
                                     ScanBoundedMode.UNBOUNDED.value));
 
     public static final ConfigOption<String> SCAN_BOUNDED_TIMESTAMP =

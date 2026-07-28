@@ -106,6 +106,38 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
             FlussDeserializationSchema<OUT> deserializationSchema,
             boolean streaming,
             @Nullable LakeSource<LakeSplit> lakeSource) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                null,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                deserializationSchema,
+                streaming,
+                lakeSource);
+    }
+
+    FlussSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable LakeSource<LakeSplit> lakeSource) {
         // TODO: Support partition pushDown in datastream
         super(
                 flussConf,
@@ -116,9 +148,11 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 projectedFields,
                 logRecordBatchFilter,
                 validateBatchStartupMode(offsetsInitializer, hasPrimaryKey, streaming, tablePath),
+                stoppingOffsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
+                null,
                 streaming,
                 null,
                 lakeSource,

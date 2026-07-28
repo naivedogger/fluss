@@ -296,7 +296,12 @@ public class FlinkSource<OUT>
 
     @Override
     public Boundedness getBoundedness() {
-        return streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED;
+        // User-supplied stopping offsets make the source bounded even in streaming execution
+        // mode (bounded streaming read), so that the job finishes once all splits reach their
+        // stopping offsets.
+        return (streaming && stoppingOffsetsInitializer == null)
+                ? Boundedness.CONTINUOUS_UNBOUNDED
+                : Boundedness.BOUNDED;
     }
 
     @Override
@@ -341,6 +346,7 @@ public class FlinkSource<OUT>
                 sourceEnumeratorState.getAssignedPartitions(),
                 remainingHybridLakeFlussSplits,
                 offsetsInitializer,
+                stoppingOffsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,

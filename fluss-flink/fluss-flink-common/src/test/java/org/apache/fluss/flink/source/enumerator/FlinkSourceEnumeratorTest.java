@@ -1255,6 +1255,81 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     }
 
     @Test
+    void testBoundedStreamingReadSignalsNoMoreSplits() throws Throwable {
+        int numSubtasks = 3;
+        createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
+        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        Map<Long, String> partitionNameByIds =
+                waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
+        List<InternalRow> rows = new ArrayList<>();
+        for (String partitionName : partitionNameByIds.values()) {
+            for (int i = 0; i < 5; i++) {
+                rows.add(row(i, partitionName));
+            }
+        }
+        writeRows(conn, DEFAULT_TABLE_PATH, rows, true);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(numSubtasks)) {
+            // a streaming read with user-supplied stopping offsets is a bounded read
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            false,
+                            true,
+                            context,
+                            OffsetsInitializer.earliest(),
+                            OffsetsInitializer.latest(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
+                            true,
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false);
+
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+            }
+
+            // a bounded streaming read only performs a one-time partition discovery, even though
+            // the partition discovery interval is positive
+            assertThat(context.getPeriodicCallables()).isEmpty();
+            // discover the partitions and then initialize the splits
+            context.runNextOneTimeCallable();
+            context.runNextOneTimeCallable();
+
+            List<SourceSplitBase> assignedSplits =
+                    getReadersAssignments(context).values().stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits)
+                    .hasSize(partitionNameByIds.size() * DEFAULT_BUCKET_NUM)
+                    .allSatisfy(
+                            split -> {
+                                LogSplit logSplit = split.asLogSplit();
+                                assertThat(logSplit.getStartingOffset()).isEqualTo(EARLIEST_OFFSET);
+                                assertThat(logSplit.getStoppingOffset()).isPresent();
+                            });
+            // the stopping offsets are the latest offsets captured at startup, which sum up to
+            // the total number of written records
+            long totalStoppingOffset =
+                    assignedSplits.stream()
+                            .mapToLong(split -> split.asLogSplit().getStoppingOffset().get())
+                            .sum();
+            assertThat(totalStoppingOffset).isEqualTo(rows.size());
+
+            // all splits are added at once for a bounded read, so all readers have been signaled
+            // that no more splits will come, which lets the job finish eventually
+            for (int i = 0; i < numSubtasks; i++) {
+                assertThat(context.hasNoMoreSplits(i)).isTrue();
+            }
+        }
+    }
+
+    @Test
     void testGetSplitOwner() throws Exception {
         int numSubtasks = 3;
         long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_PK_TABLE_DESCRIPTOR);

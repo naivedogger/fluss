@@ -155,6 +155,13 @@ public class FlinkSourceEnumerator
     private final OffsetsInitializer stoppingOffsetsInitializer;
 
     /**
+     * Whether this read is bounded, i.e. batch execution mode or a bounded streaming read with
+     * user-supplied stopping offsets. A bounded read only performs a one-time partition discovery,
+     * since partitions created after startup are outside the bounded range captured at startup.
+     */
+    private final boolean bounded;
+
+    /**
      * The offsets initializer used for partitions discovered after the initial startup. Following
      * <a
      * href="https://cwiki.apache.org/confluence/spaces/FLINK/pages/240881147/FLIP-288+Enable+Dynamic+Partition+Discovery+by+Default+in+Kafka+Source">FLIP-288</a>)
@@ -428,6 +435,49 @@ public class FlinkSourceEnumerator
                 unassignedSplits);
     }
 
+    public FlinkSourceEnumerator(
+            TablePath tablePath,
+            Configuration flussConf,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            SplitEnumeratorContext<SourceSplitBase> context,
+            Set<TableBucket> assignedTableBuckets,
+            Map<Long, String> assignedPartitions,
+            List<SourceSplitBase> pendingHybridLakeFlussSplits,
+            OffsetsInitializer startingOffsetsInitializer,
+            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext,
+            boolean checkpointTriggeredBefore,
+            boolean initialDiscoveryFinished,
+            Collection<SourceSplitBase> unassignedSplits) {
+        this(
+                tablePath,
+                flussConf,
+                hasPrimaryKey,
+                isPartitioned,
+                context,
+                assignedTableBuckets,
+                assignedPartitions,
+                pendingHybridLakeFlussSplits,
+                startingOffsetsInitializer,
+                stoppingOffsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                new WorkerExecutor(context),
+                leaseContext,
+                checkpointTriggeredBefore,
+                initialDiscoveryFinished,
+                unassignedSplits);
+    }
+
     FlinkSourceEnumerator(
             TablePath tablePath,
             Configuration flussConf,
@@ -553,11 +603,14 @@ public class FlinkSourceEnumerator
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
         this.streaming = streaming;
         this.partitionFilters = partitionFilters;
+        // The read is bounded if it runs in batch execution mode, or if the user supplied
+        // stopping offsets for a bounded streaming read.
+        this.bounded = !streaming || stoppingOffsetsInitializer != null;
         this.stoppingOffsetsInitializer =
-                streaming
-                        ? new NoStoppingOffsetsInitializer()
-                        : (stoppingOffsetsInitializer != null
-                                ? stoppingOffsetsInitializer
+                stoppingOffsetsInitializer != null
+                        ? stoppingOffsetsInitializer
+                        : (streaming
+                                ? new NoStoppingOffsetsInitializer()
                                 : OffsetsInitializer.latest());
         this.lakeSource = lakeSource;
         this.workerExecutor = workerExecutor;
@@ -626,7 +679,7 @@ public class FlinkSourceEnumerator
                     }
                 }
 
-                if (scanPartitionDiscoveryIntervalMs > 0) {
+                if (scanPartitionDiscoveryIntervalMs > 0 && !bounded) {
                     // should do partition discovery
                     LOG.info(
                             "Starting the FlussSourceEnumerator for table {} "
@@ -640,7 +693,9 @@ public class FlinkSourceEnumerator
                             0,
                             scanPartitionDiscoveryIntervalMs);
                 } else {
-                    // just call once
+                    // Call once for a bounded read or when partition discovery is disabled. For
+                    // a bounded read, partitions created after startup are outside the bounded
+                    // range captured at startup, so continuous discovery is not needed.
                     LOG.info(
                             "Starting the FlussSourceEnumerator for table {} without partition discovery.",
                             tablePath);
@@ -1246,7 +1301,7 @@ public class FlinkSourceEnumerator
 
     private void handleSplitsAdd(List<SourceSplitBase> splits, Throwable t) {
         if (t != null) {
-            if (isPartitioned && streaming && scanPartitionDiscoveryIntervalMs > 0) {
+            if (isPartitioned && streaming && !bounded && scanPartitionDiscoveryIntervalMs > 0) {
                 // it means continuously read new partition splits, not throw exception, temporally
                 // warn it to avoid job fail. TODO: fix me in #288
                 LOG.warn("Failed to list splits for {}.", tablePath, t);
@@ -1278,9 +1333,10 @@ public class FlinkSourceEnumerator
                         : pendingHybridLakeFlussSplits.size());
 
         if (isPartitioned) {
-            if (!streaming || scanPartitionDiscoveryIntervalMs <= 0) {
-                // if not streaming or partition discovery is disabled
-                // should only add splits only once, no more new splits
+            if (bounded || scanPartitionDiscoveryIntervalMs <= 0) {
+                // For a bounded read (batch execution mode or a bounded streaming read) or when
+                // partition discovery is disabled, splits are only added once, so readers can be
+                // signaled that no more splits will come and finish eventually.
                 noMoreNewSplits = true;
             }
         } else {
