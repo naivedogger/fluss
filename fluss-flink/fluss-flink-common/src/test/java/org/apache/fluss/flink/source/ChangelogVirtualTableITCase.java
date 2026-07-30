@@ -641,10 +641,11 @@ abstract class ChangelogVirtualTableITCase {
         String query = "SELECT _change_type, id, name, region FROM partitioned_test$changelog";
         CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
 
-        // Collect initial inserts
+        // Collect initial inserts. Records from different partitions may arrive in any order,
+        // so the assertion must be order-insensitive.
         List<String> results = collectRowsWithTimeout(rowIter, 3, false);
         assertThat(results)
-                .containsExactly(
+                .containsExactlyInAnyOrder(
                         "+I[insert, 1, Item-1, us]",
                         "+I[insert, 2, Item-2, us]",
                         "+I[insert, 3, Item-3, eu]");
