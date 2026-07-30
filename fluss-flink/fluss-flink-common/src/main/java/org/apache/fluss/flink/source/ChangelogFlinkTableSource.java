@@ -217,7 +217,9 @@ public class ChangelogFlinkTableSource
                         offsetsInitializer,
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
-                        new ChangelogDeserializationSchema(baseRowProjection),
+                        new ChangelogDeserializationSchema(
+                                baseRowProjection,
+                                (org.apache.flink.table.types.logical.RowType) producedDataType),
                         streaming,
                         partitionFilters,
                         LeaseContext.DEFAULT); // Lake source not supported

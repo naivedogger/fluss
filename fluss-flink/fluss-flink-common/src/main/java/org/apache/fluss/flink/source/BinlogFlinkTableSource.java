@@ -161,7 +161,9 @@ public class BinlogFlinkTableSource
                         offsetsInitializer,
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
-                        new BinlogDeserializationSchema(projectedTopLevel),
+                        new BinlogDeserializationSchema(
+                                projectedTopLevel,
+                                (org.apache.flink.table.types.logical.RowType) producedDataType),
                         streaming,
                         // $binlog data/partition columns are nested inside before/after ROWs, so no
                         // top-level partition filter is pushable; always scan without one.
