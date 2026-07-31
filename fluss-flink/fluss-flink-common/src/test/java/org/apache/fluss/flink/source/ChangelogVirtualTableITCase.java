@@ -360,10 +360,9 @@ abstract class ChangelogVirtualTableITCase {
         TablePath tablePath = TablePath.of(DEFAULT_DB, "reordered_projection_test");
 
         String query = "SELECT amount, _change_type, id FROM reordered_projection_test$changelog";
-        // The exact pushed projection digest may vary across planner versions (the reorder may be
-        // pushed into the scan or kept in a Calc), so assert result correctness rather than the
-        // exact plan digest.
-        assertThat(tEnv.explainSql(query)).contains("project=[");
+        // The planner pushes the reordered projection into the scan as-is (no Calc reorder), so
+        // the source receives the out-of-order indices end to end.
+        assertThat(tEnv.explainSql(query)).contains("project=[amount, _change_type, id]");
 
         CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
 
