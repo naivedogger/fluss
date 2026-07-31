@@ -345,6 +345,41 @@ abstract class ChangelogVirtualTableITCase {
     }
 
     @Test
+    public void testReorderedProjectionOnChangelogTable() throws Exception {
+        // Reordered projection: data columns out of their original order with a metadata column
+        // in between. This exercises the dataProjection/baseRowProjection coordinate translation
+        // (applyProjection -> ChangelogRowConverter) end to end through the real planner.
+        tEnv.executeSql(
+                "CREATE TABLE reordered_projection_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "reordered_projection_test");
+
+        String query = "SELECT amount, _change_type, id FROM reordered_projection_test$changelog";
+        // The exact pushed projection digest may vary across planner versions (the reorder may be
+        // pushed into the scan or kept in a Calc), so assert result correctness rather than the
+        // exact plan digest.
+        assertThat(tEnv.explainSql(query)).contains("project=[");
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect();
+
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Item-1", 100L)), false);
+        List<String> insertResult = collectRowsWithTimeout(rowIter, 1, false);
+        assertThat(insertResult).containsExactly("+I[100, insert, 1]");
+
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Item-1", 250L)), false);
+        List<String> updateResults = collectRowsWithTimeout(rowIter, 2, true);
+        assertThat(updateResults)
+                .containsExactly("+I[100, update_before, 1]", "+I[250, update_after, 1]");
+    }
+
+    @Test
     public void testChangelogDataColumnFilterAndProjectionPushdown() throws Exception {
         // Statistics columns are only supported on log tables (not PK tables), so use a log table.
         // A log table's changelog is append-only, which is sufficient to exercise pushdown.
