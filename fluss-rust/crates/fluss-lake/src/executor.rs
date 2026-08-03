@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::pk_overlay::{PkOverlay, merged_stream};
 use crate::task::{
     AppendLogTaskDescriptor, LakeSplitTaskDescriptor, PkHybridTaskDescriptor, TaskDescriptor,
 };
@@ -23,13 +24,21 @@ use crate::{
     UnionReadResult, UnionReadTask,
 };
 use arrow::record_batch::RecordBatch;
-use fluss::client::{FlussConnection, RecordBatchLogReader};
+use fluss::client::{FlussConnection, FlussTable, RecordBatchLogReader};
 use fluss::error::Error as ClientError;
+use fluss::metadata::{RowType, TableBucket};
+use fluss::record::ChangeType;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Poll timeout used while folding a bounded changelog tail.
+///
+/// Short polls keep the idle-progress check responsive; the bounded read's
+/// real deadline is the context idle timeout, not this interval.
+const TAIL_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Default Fluss-Rust executor for opaque UnionRead tasks.
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,17 +62,406 @@ impl UnionReadExecutor for FlussUnionReadExecutor {
 
 /// Merges one primary-key bucket's lake baseline with its bounded log tail.
 ///
-/// The hash-overlay merge executor is not implemented yet; the task kind is
-/// dispatched here so that a plan produced by a newer planner fails with a
-/// clear capability error instead of an unknown-kind decode error.
+/// The tail is folded first, in its entirety, because a lake row can only be
+/// passed through once it is known that no later changelog record supersedes
+/// it. The fold enforces its own idle-progress deadline, so wrapping the
+/// returned stream again would charge the same budget twice.
 fn execute_pk_hybrid(
     descriptor: PkHybridTaskDescriptor,
-    _context: UnionReadExecutionContext,
+    context: UnionReadExecutionContext,
 ) -> UnionReadResult<SendableRecordBatchStream> {
+    if descriptor.is_empty() {
+        return Ok(Box::pin(futures::stream::empty::<
+            UnionReadResult<RecordBatch>,
+        >()));
+    }
+
+    let connection = context.fluss_connection().cloned().ok_or_else(|| {
+        UnionReadError::Execution(
+            "pk-hybrid task requires a Fluss connection in the execution context".to_string(),
+        )
+    })?;
+    Ok(lazy_stream(open_pk_hybrid_stream(
+        connection, descriptor, context,
+    )))
+}
+
+async fn open_pk_hybrid_stream(
+    connection: Arc<FlussConnection>,
+    descriptor: PkHybridTaskDescriptor,
+    context: UnionReadExecutionContext,
+) -> UnionReadResult<SendableRecordBatchStream> {
+    let table = connection
+        .get_table(descriptor.table_path())
+        .await
+        .map_err(|error| execution_client_error("open Fluss table", error))?;
+    validate_frozen_identity(
+        &table,
+        descriptor.table_path(),
+        descriptor.table_bucket(),
+        descriptor.schema_id(),
+    )?;
+    if !table.has_primary_key() {
+        return Err(UnionReadError::InvalidTask(format!(
+            "pk-hybrid task cannot execute against non-primary-key table {}",
+            descriptor.table_path()
+        )));
+    }
+
+    let table_info = table.get_table_info();
+    let physical = PhysicalPkProjection::resolve(
+        table_info.row_type(),
+        descriptor.output_projection(),
+        descriptor.pk_indexes(),
+    )?;
+    let mut overlay = PkOverlay::try_new(
+        physical.arrow_schema(table_info.row_type())?,
+        physical.key_positions.clone(),
+        context.memory_limit_bytes(),
+    )?;
+    fold_changelog_tail(&table, &descriptor, &physical, &mut overlay, &context).await?;
+
+    let lake_stream = open_pk_lake_stream(
+        &descriptor,
+        &context,
+        table_info.row_type(),
+        &physical,
+        context.idle_timeout(),
+    )
+    .await?;
+    Ok(merged_stream(
+        overlay,
+        lake_stream,
+        physical.output_column_count,
+    ))
+}
+
+/// Opens the lake half of a primary-key task.
+///
+/// All of the bucket's splits go through a single Paimon reader: since
+/// apache/paimon-rust#374 that is what guarantees each key appears exactly
+/// once on the lake side, which the overlay presumes.
+#[cfg(feature = "paimon")]
+async fn open_pk_lake_stream(
+    descriptor: &PkHybridTaskDescriptor,
+    context: &UnionReadExecutionContext,
+    row_type: &RowType,
+    physical: &PhysicalPkProjection,
+    idle_timeout: Duration,
+) -> UnionReadResult<SendableRecordBatchStream> {
+    if descriptor.lake_splits().is_empty() {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    let snapshot_id = descriptor.snapshot_id().ok_or_else(|| {
+        UnionReadError::InvalidTask(format!(
+            "pk-hybrid task for {} carries lake splits without a pinned snapshot id",
+            descriptor.table_path()
+        ))
+    })?;
+
+    let catalog_options = crate::paimon::PaimonCatalogOptions::from_map(
+        descriptor
+            .catalog_options()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+    .with_runtime_credentials(context.lake_credentials());
+    let projected_fields =
+        crate::paimon::projected_field_names(row_type, Some(&physical.field_indexes))?;
+    let mut splits = Vec::with_capacity(descriptor.lake_splits().len());
+    for encoded_split in descriptor.lake_splits() {
+        splits.push(crate::paimon::decode_split(encoded_split)?);
+    }
+
+    let stream = crate::paimon::read_snapshot_splits(
+        descriptor.table_path(),
+        &catalog_options,
+        snapshot_id,
+        Some(&projected_fields),
+        splits,
+    )
+    .await?;
+    Ok(with_idle_timeout(stream, idle_timeout))
+}
+
+#[cfg(not(feature = "paimon"))]
+async fn open_pk_lake_stream(
+    descriptor: &PkHybridTaskDescriptor,
+    _context: &UnionReadExecutionContext,
+    _row_type: &RowType,
+    _physical: &PhysicalPkProjection,
+    _idle_timeout: Duration,
+) -> UnionReadResult<SendableRecordBatchStream> {
+    if descriptor.lake_splits().is_empty() {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
     Err(UnionReadError::Execution(format!(
-        "pk-hybrid task for {} cannot be executed: the primary-key merge executor is not implemented yet",
+        "pk-hybrid task for {} carries lake splits, but this build has no lake format feature enabled",
         descriptor.table_path()
     )))
+}
+
+/// Folds the task's bounded changelog range into the overlay.
+///
+/// The tail is read row-wise on purpose: the Arrow batch path drops change
+/// types, and without them a delete is indistinguishable from an insert. The
+/// loop exits only at the frozen stop offset or with a typed error, and a
+/// stretch without progress longer than the context idle timeout is an
+/// operational failure rather than a reason to wait forever.
+async fn fold_changelog_tail(
+    table: &FlussTable<'_>,
+    descriptor: &PkHybridTaskDescriptor,
+    physical: &PhysicalPkProjection,
+    overlay: &mut PkOverlay,
+    context: &UnionReadExecutionContext,
+) -> UnionReadResult<()> {
+    if descriptor.start_offset() == descriptor.stop_offset() {
+        return Ok(());
+    }
+
+    let scanner = table
+        .new_scan()
+        .project(&physical.field_indexes)
+        .map_err(|error| execution_client_error("apply changelog projection", error))?
+        .create_log_scanner()
+        .map_err(|error| execution_client_error("create changelog scanner", error))?;
+    let table_bucket = descriptor.table_bucket().clone();
+    match table_bucket.partition_id() {
+        Some(partition_id) => scanner
+            .subscribe_partition(
+                partition_id,
+                table_bucket.bucket_id(),
+                descriptor.start_offset(),
+            )
+            .await
+            .map_err(|error| execution_client_error("subscribe partition bucket", error))?,
+        None => scanner
+            .subscribe(table_bucket.bucket_id(), descriptor.start_offset())
+            .await
+            .map_err(|error| execution_client_error("subscribe table bucket", error))?,
+    }
+
+    let idle_timeout = context.idle_timeout();
+    let mut next_offset = descriptor.start_offset();
+    let mut last_progress = Instant::now();
+    while next_offset < descriptor.stop_offset() {
+        let records = scanner
+            .poll(TAIL_POLL_TIMEOUT)
+            .await
+            .map_err(|error| execution_client_error("poll bounded changelog tail", error))?;
+        let bucket_records = records.records(&table_bucket);
+        if bucket_records.is_empty() {
+            if last_progress.elapsed() > idle_timeout {
+                return Err(UnionReadError::Execution(format!(
+                    "changelog tail of {table_bucket} made no progress within the {idle_timeout:?} idle timeout at offset {next_offset} of the frozen range [{}, {}); the stop offset existed at plan time, so a stalled fetch is an operational failure",
+                    descriptor.start_offset(),
+                    descriptor.stop_offset()
+                )));
+            }
+            continue;
+        }
+
+        next_offset = fold_tail_records(
+            bucket_records,
+            next_offset,
+            descriptor.stop_offset(),
+            overlay,
+        )?;
+        last_progress = Instant::now();
+    }
+    Ok(())
+}
+
+/// Folds one poll's records, returning the next unread offset.
+///
+/// Records are grouped into runs sharing an Arrow batch so that keys are
+/// encoded per batch rather than per row. Records at or beyond the frozen
+/// stop offset are discarded: the boundary belongs to the plan, and a server
+/// that returns more must not widen the result.
+fn fold_tail_records(
+    records: &[fluss::record::ScanRecord],
+    next_offset: i64,
+    stop_offset: i64,
+    overlay: &mut PkOverlay,
+) -> UnionReadResult<i64> {
+    let mut next_offset = next_offset;
+    // Records of one poll arrive grouped by their backing Arrow batch, so
+    // runs are detected by batch identity (address comparison only — the
+    // records keep every batch alive for the whole loop).
+    let mut run_source: Option<*const RecordBatch> = None;
+    let mut run_batch: Option<RecordBatch> = None;
+    let mut run_rows: Vec<usize> = Vec::new();
+    let mut run_change_types: Vec<ChangeType> = Vec::new();
+
+    for record in records {
+        if record.offset() < next_offset || record.offset() >= stop_offset {
+            continue;
+        }
+        let row = record.row();
+        let batch = row.get_record_batch().ok_or_else(|| {
+            UnionReadError::Execution(
+                "changelog record has no backing Arrow batch; the ARROW log format is required to merge a primary-key table"
+                    .to_string(),
+            )
+        })?;
+        let batch_address = batch as *const RecordBatch;
+        if run_source != Some(batch_address) {
+            flush_tail_run(
+                &mut run_batch,
+                &mut run_rows,
+                &mut run_change_types,
+                overlay,
+            )?;
+            run_source = Some(batch_address);
+            run_batch = Some(batch.clone());
+        }
+        run_rows.push(row.get_row_id());
+        run_change_types.push(*record.change_type());
+        next_offset = record.offset() + 1;
+    }
+    flush_tail_run(
+        &mut run_batch,
+        &mut run_rows,
+        &mut run_change_types,
+        overlay,
+    )?;
+    Ok(next_offset)
+}
+
+fn flush_tail_run(
+    run_batch: &mut Option<RecordBatch>,
+    run_rows: &mut Vec<usize>,
+    run_change_types: &mut Vec<ChangeType>,
+    overlay: &mut PkOverlay,
+) -> UnionReadResult<()> {
+    let Some(batch) = run_batch.take() else {
+        return Ok(());
+    };
+    if run_rows.is_empty() {
+        return Ok(());
+    }
+    // The polled batch may cover offsets outside the frozen range, so only
+    // the selected rows are folded, in offset order.
+    let selected = take_rows(&batch, run_rows)?;
+    overlay.fold_tail_batch(selected, run_change_types)?;
+    run_rows.clear();
+    run_change_types.clear();
+    Ok(())
+}
+
+fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> UnionReadResult<RecordBatch> {
+    // The common case is a run covering the whole batch in order, which needs
+    // no copy at all.
+    if row_indexes.len() == batch.num_rows()
+        && row_indexes
+            .iter()
+            .enumerate()
+            .all(|(position, row)| position == *row)
+    {
+        return Ok(batch.clone());
+    }
+    let indices: Vec<(usize, usize)> = row_indexes.iter().map(|row| (0, *row)).collect();
+    arrow::compute::interleave_record_batch(&[batch], &indices).map_err(|error| {
+        UnionReadError::Execution(format!("failed to select changelog tail rows: {error}"))
+    })
+}
+
+/// The physical read of a primary-key task, widened to carry its key columns.
+///
+/// The engine's requested columns come first and the missing key columns are
+/// appended, so the engine-visible output is exactly the leading prefix and
+/// the added columns are stripped before emission.
+struct PhysicalPkProjection {
+    field_indexes: Vec<usize>,
+    key_positions: Vec<usize>,
+    output_column_count: usize,
+}
+
+impl PhysicalPkProjection {
+    fn resolve(
+        row_type: &RowType,
+        output_projection: Option<&[usize]>,
+        pk_indexes: &[usize],
+    ) -> UnionReadResult<Self> {
+        let field_count = row_type.fields().len();
+        for pk_index in pk_indexes {
+            if *pk_index >= field_count {
+                return Err(UnionReadError::InvalidTask(format!(
+                    "primary-key field index {pk_index} exceeds the resolved table width {field_count}"
+                )));
+            }
+        }
+
+        let mut field_indexes = match output_projection {
+            Some(projection) => projection.to_vec(),
+            None => (0..field_count).collect(),
+        };
+        let output_column_count = field_indexes.len();
+        for pk_index in pk_indexes {
+            if !field_indexes.contains(pk_index) {
+                field_indexes.push(*pk_index);
+            }
+        }
+        let key_positions = pk_indexes
+            .iter()
+            .map(|pk_index| {
+                field_indexes
+                    .iter()
+                    .position(|index| index == pk_index)
+                    .expect("every key column was just ensured to be in the physical projection")
+            })
+            .collect();
+
+        Ok(Self {
+            field_indexes,
+            key_positions,
+            output_column_count,
+        })
+    }
+
+    fn arrow_schema(&self, row_type: &RowType) -> UnionReadResult<arrow::datatypes::SchemaRef> {
+        let schema = fluss::record::to_arrow_schema(row_type).map_err(|error| {
+            UnionReadError::Execution(format!(
+                "failed to convert the read schema to Arrow: {error}"
+            ))
+        })?;
+        schema
+            .project(&self.field_indexes)
+            .map(Arc::new)
+            .map_err(|error| {
+                UnionReadError::Execution(format!(
+                    "failed to project the physical primary-key read schema: {error}"
+                ))
+            })
+    }
+}
+
+/// Rejects a task whose frozen identity no longer matches the live table.
+///
+/// The schema is frozen at plan time, so executing against a drifted schema
+/// would silently reinterpret data.
+fn validate_frozen_identity(
+    table: &FlussTable<'_>,
+    table_path: &fluss::metadata::TablePath,
+    table_bucket: &TableBucket,
+    schema_id: i32,
+) -> UnionReadResult<()> {
+    let table_info = table.get_table_info();
+    if table_info.table_id != table_bucket.table_id() {
+        return Err(UnionReadError::Execution(format!(
+            "task table id {} no longer matches resolved table id {} for {table_path}",
+            table_bucket.table_id(),
+            table_info.table_id
+        )));
+    }
+    if table_info.schema_id != schema_id {
+        return Err(UnionReadError::Execution(format!(
+            "task schema id {schema_id} no longer matches current schema id {} for {table_path}; execution against a historical schema is not implemented",
+            table_info.schema_id
+        )));
+    }
+    Ok(())
 }
 
 /// Defers an asynchronous stream setup until the stream's first poll.
@@ -181,23 +579,12 @@ async fn open_append_log_stream(
         .get_table(descriptor.table_path())
         .await
         .map_err(|error| execution_client_error("open Fluss table", error))?;
-    let table_info = table.get_table_info();
-    if table_info.table_id != descriptor.table_bucket().table_id() {
-        return Err(UnionReadError::Execution(format!(
-            "task table id {} no longer matches resolved table id {} for {}",
-            descriptor.table_bucket().table_id(),
-            table_info.table_id,
-            descriptor.table_path()
-        )));
-    }
-    if table_info.schema_id != descriptor.schema_id() {
-        return Err(UnionReadError::Execution(format!(
-            "task schema id {} no longer matches current schema id {} for {}; execution against a historical schema is not implemented",
-            descriptor.schema_id(),
-            table_info.schema_id,
-            descriptor.table_path()
-        )));
-    }
+    validate_frozen_identity(
+        &table,
+        descriptor.table_path(),
+        descriptor.table_bucket(),
+        descriptor.schema_id(),
+    )?;
     if table.has_primary_key() {
         return Err(UnionReadError::InvalidTask(format!(
             "append-log task cannot execute against primary-key table {}",
@@ -446,5 +833,127 @@ mod tests {
             Err(other) => panic!("expected an execution error, got: {other}"),
             Ok(_) => panic!("a lake split task must not execute without a lake format feature"),
         }
+    }
+
+    fn pk_row_type() -> RowType {
+        use fluss::metadata::{DataField, DataTypes};
+
+        RowType::new(vec![
+            DataField::new("id", DataTypes::int(), None),
+            DataField::new("region", DataTypes::string(), None),
+            DataField::new("amount", DataTypes::bigint(), None),
+        ])
+    }
+
+    /// A request that omits key columns must still read them physically, with
+    /// the engine-visible columns kept as the leading prefix so the widening
+    /// can be stripped again before emission.
+    #[test]
+    fn physical_projection_appends_missing_key_columns_after_requested_ones() {
+        let physical = PhysicalPkProjection::resolve(&pk_row_type(), Some(&[2]), &[0, 1]).unwrap();
+
+        assert_eq!(physical.field_indexes, vec![2, 0, 1]);
+        assert_eq!(physical.key_positions, vec![1, 2]);
+        assert_eq!(physical.output_column_count, 1);
+    }
+
+    /// A request that already covers the key columns must not widen the read,
+    /// and must not reorder the engine's columns.
+    #[test]
+    fn physical_projection_keeps_requested_projection_when_keys_are_covered() {
+        let physical =
+            PhysicalPkProjection::resolve(&pk_row_type(), Some(&[1, 0]), &[0, 1]).unwrap();
+
+        assert_eq!(physical.field_indexes, vec![1, 0]);
+        assert_eq!(physical.key_positions, vec![1, 0]);
+        assert_eq!(physical.output_column_count, 2);
+    }
+
+    #[test]
+    fn physical_projection_defaults_to_every_column() {
+        let physical = PhysicalPkProjection::resolve(&pk_row_type(), None, &[0]).unwrap();
+
+        assert_eq!(physical.field_indexes, vec![0, 1, 2]);
+        assert_eq!(physical.key_positions, vec![0]);
+        assert_eq!(physical.output_column_count, 3);
+    }
+
+    #[test]
+    fn physical_projection_rejects_key_indexes_beyond_the_table() {
+        assert!(matches!(
+            PhysicalPkProjection::resolve(&pk_row_type(), None, &[3]),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+    }
+
+    fn pk_hybrid_task(start_offset: i64, stop_offset: i64) -> UnionReadTask {
+        use crate::task::PkHybridTaskDescriptor;
+        use std::collections::BTreeMap;
+
+        let descriptor = TaskDescriptor::PkHybrid(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "pk_orders"),
+                1,
+                TableBucket::new(5, 0),
+                start_offset,
+                stop_offset,
+                None,
+                BTreeMap::new(),
+                Vec::new(),
+                vec![0],
+                None,
+            )
+            .unwrap(),
+        );
+        UnionReadTask::try_new(
+            "pk-hybrid/5/root/0".to_string(),
+            CURRENT_UNION_READ_TASK_VERSION,
+            descriptor.encode().unwrap(),
+            UnionReadStatistics::default(),
+        )
+        .unwrap()
+    }
+
+    /// A bucket with neither lake splits nor a log tail contributes nothing,
+    /// so it must finish without touching the environment.
+    #[test]
+    fn empty_pk_hybrid_task_finishes_without_runtime_connection() {
+        let mut stream = FlussUnionReadExecutor
+            .execute(pk_hybrid_task(10, 10), UnionReadExecutionContext::default())
+            .unwrap();
+
+        assert!(futures::executor::block_on(stream.next()).is_none());
+    }
+
+    #[test]
+    fn non_empty_pk_hybrid_task_requires_runtime_connection() {
+        let result = FlussUnionReadExecutor
+            .execute(pk_hybrid_task(10, 11), UnionReadExecutionContext::default());
+
+        assert!(matches!(result, Err(UnionReadError::Execution(_))));
+    }
+
+    #[test]
+    fn take_rows_avoids_copying_a_run_covering_the_whole_batch() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+
+        let whole = take_rows(&batch, &[0, 1, 2]).unwrap();
+        let subset = take_rows(&batch, &[2, 0]).unwrap();
+
+        assert_eq!(whole.num_rows(), 3);
+        assert_eq!(subset.num_rows(), 2);
+        let ids = subset
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[3, 1]);
     }
 }

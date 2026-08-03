@@ -82,6 +82,9 @@ pub(crate) struct LakeSplitTaskDescriptor {
     encoded_split: String,
 }
 
+// Some accessors only feed a lake reader, so a build without any lake format
+// feature legitimately leaves them unused.
+#[cfg_attr(not(feature = "paimon"), allow(dead_code))]
 impl LakeSplitTaskDescriptor {
     pub(crate) fn try_new(
         table_path: TablePath,
@@ -297,6 +300,7 @@ pub(crate) struct PkHybridTaskDescriptor {
     output_projection: Option<Vec<usize>>,
 }
 
+#[cfg_attr(not(feature = "paimon"), allow(dead_code))]
 impl PkHybridTaskDescriptor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(

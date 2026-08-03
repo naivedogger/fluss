@@ -228,10 +228,7 @@ pub(crate) async fn plan_snapshot_splits(
         .await
         .map_err(|error| paimon_error("plan Paimon snapshot splits", error))?;
 
-    plan.splits()
-        .iter()
-        .map(|split| encode_split(split))
-        .collect()
+    plan.splits().iter().map(encode_split).collect()
 }
 
 /// Rejects Paimon merge engines whose current view v1 cannot reproduce.
@@ -313,9 +310,30 @@ pub(crate) async fn read_snapshot_split(
     projected_fields: Option<&[String]>,
     encoded_split: &str,
 ) -> UnionReadResult<SendableRecordBatchStream> {
-    let split: DataSplit = serde_json::from_str(encoded_split).map_err(|error| {
-        UnionReadError::InvalidTask(format!("failed to decode Paimon split: {error}"))
-    })?;
+    read_snapshot_splits(
+        table_path,
+        catalog_options,
+        snapshot_id,
+        projected_fields,
+        vec![decode_split(encoded_split)?],
+    )
+    .await
+}
+
+/// Reads several frozen Paimon splits as one finite Arrow batch stream.
+///
+/// All splits must come from the same pinned snapshot. Reading them through
+/// one Paimon reader matters for primary-key tables: since
+/// apache/paimon-rust#374 the reader deduplicates keys across the splits it
+/// is given, which is exactly the per-bucket exactly-once guarantee the
+/// primary-key merge presumes.
+pub(crate) async fn read_snapshot_splits(
+    table_path: &TablePath,
+    catalog_options: &PaimonCatalogOptions,
+    snapshot_id: i64,
+    projected_fields: Option<&[String]>,
+    splits: Vec<DataSplit>,
+) -> UnionReadResult<SendableRecordBatchStream> {
     let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
     let mut read_builder = table.new_read_builder();
     if let Some(field_names) = projected_fields {
@@ -327,12 +345,18 @@ pub(crate) async fn read_snapshot_split(
     let stream = read_builder
         .new_read()
         .map_err(|error| paimon_error("create Paimon reader", error))?
-        .to_arrow(&[split])
-        .map_err(|error| paimon_error("read Paimon split", error))?;
+        .to_arrow(&splits)
+        .map_err(|error| paimon_error("read Paimon splits", error))?;
 
     Ok(Box::pin(stream.map(|result| {
         result.map_err(|error| paimon_error("read Paimon split batch", error))
     })))
+}
+
+pub(crate) fn decode_split(encoded_split: &str) -> UnionReadResult<DataSplit> {
+    serde_json::from_str(encoded_split).map_err(|error| {
+        UnionReadError::InvalidTask(format!("failed to decode Paimon split: {error}"))
+    })
 }
 
 fn paimon_error(action: &str, error: paimon::Error) -> UnionReadError {

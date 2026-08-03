@@ -122,6 +122,7 @@ pub fn create_append_log_task(
 ///
 /// `split_index` only makes the task id unique and readable for scheduling; the
 /// executor never derives read semantics from it.
+#[cfg_attr(not(feature = "paimon"), allow(dead_code))]
 pub(crate) fn create_lake_split_task(
     table_path: &TablePath,
     snapshot_id: i64,

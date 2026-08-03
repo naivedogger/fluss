@@ -22,6 +22,7 @@
 mod executor;
 #[cfg(feature = "paimon")]
 mod paimon;
+mod pk_overlay;
 mod planner;
 #[doc(hidden)]
 pub mod planning;
