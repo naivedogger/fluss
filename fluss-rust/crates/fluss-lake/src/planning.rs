@@ -20,7 +20,7 @@
 //! Upstream engines should use [`crate::UnionReadPlanner`] and treat its tasks
 //! as opaque rather than depending on the types in this module.
 
-use crate::task::{AppendLogTaskDescriptor, TaskDescriptor};
+use crate::task::{AppendLogTaskDescriptor, LakeSplitTaskDescriptor, TaskDescriptor};
 use crate::{
     CURRENT_UNION_READ_TASK_VERSION, UnionReadError, UnionReadResult, UnionReadStatistics,
     UnionReadTask,
@@ -30,7 +30,7 @@ use fluss::client::FlussAdmin;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{LakeSnapshotInfo, PartitionInfo, TableBucket, TableInfo, TablePath};
 use fluss::rpc::message::OffsetSpec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// One immutable `[start_offset, stop_offset)` Fluss log boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +108,35 @@ pub fn create_append_log_task(
         bucket_range.start_offset,
         bucket_range.stop_offset
     );
+    UnionReadTask::try_new(
+        task_id,
+        CURRENT_UNION_READ_TASK_VERSION,
+        descriptor.encode()?,
+        statistics,
+    )
+}
+
+/// Creates one opaque lake-split task from a frozen lake snapshot split.
+///
+/// `split_index` only makes the task id unique and readable for scheduling; the
+/// executor never derives read semantics from it.
+pub(crate) fn create_lake_split_task(
+    table_path: &TablePath,
+    snapshot_id: i64,
+    catalog_options: BTreeMap<String, String>,
+    projected_fields: Option<Vec<String>>,
+    encoded_split: String,
+    split_index: usize,
+    statistics: UnionReadStatistics,
+) -> UnionReadResult<UnionReadTask> {
+    let descriptor = TaskDescriptor::LakeSplit(LakeSplitTaskDescriptor::try_new(
+        table_path.clone(),
+        snapshot_id,
+        catalog_options,
+        projected_fields,
+        encoded_split,
+    )?);
+    let task_id = format!("lake-split/{table_path}/{snapshot_id}/{split_index}");
     UnionReadTask::try_new(
         task_id,
         CURRENT_UNION_READ_TASK_VERSION,

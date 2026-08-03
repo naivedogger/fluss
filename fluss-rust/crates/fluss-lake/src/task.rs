@@ -17,23 +17,27 @@
 
 use crate::{UnionReadError, UnionReadResult};
 use fluss::metadata::{TableBucket, TablePath};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 const TASK_DESCRIPTOR_MAGIC: [u8; 4] = *b"URD1";
 const APPEND_LOG_TASK_KIND: u8 = 1;
+const LAKE_SPLIT_TASK_KIND: u8 = 2;
 const PARTITION_PRESENT: u8 = 1;
 const PROJECTION_PRESENT: u8 = 1 << 1;
 const APPEND_LOG_HEADER_SIZE: usize = 58;
+const LAKE_SPLIT_HEADER_SIZE: usize = 34;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TaskDescriptor {
     AppendLog(AppendLogTaskDescriptor),
+    LakeSplit(LakeSplitTaskDescriptor),
 }
 
 impl TaskDescriptor {
     pub(crate) fn encode(&self) -> UnionReadResult<Vec<u8>> {
         match self {
             Self::AppendLog(descriptor) => descriptor.encode(),
+            Self::LakeSplit(descriptor) => descriptor.encode(),
         }
     }
 
@@ -47,10 +51,217 @@ impl TaskDescriptor {
 
         match encoded[TASK_DESCRIPTOR_MAGIC.len()] {
             APPEND_LOG_TASK_KIND => AppendLogTaskDescriptor::decode(encoded).map(Self::AppendLog),
+            LAKE_SPLIT_TASK_KIND => LakeSplitTaskDescriptor::decode(encoded).map(Self::LakeSplit),
             kind => Err(invalid_descriptor(format!(
                 "descriptor contains unknown task kind {kind}"
             ))),
         }
+    }
+}
+
+/// One immutable lake split of a frozen readable lake snapshot.
+///
+/// The descriptor carries everything an executor needs to reopen the lake
+/// table on its own: the catalog options, the pinned snapshot id, the engine
+/// scan projection resolved to lake field names, and the opaque split payload
+/// produced by the lake format. It is decodable regardless of which lake
+/// format features are compiled in, so an executor built without the matching
+/// format reports a clear error instead of failing to parse the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LakeSplitTaskDescriptor {
+    table_path: TablePath,
+    snapshot_id: i64,
+    catalog_options: BTreeMap<String, String>,
+    projected_fields: Option<Vec<String>>,
+    encoded_split: String,
+}
+
+impl LakeSplitTaskDescriptor {
+    pub(crate) fn try_new(
+        table_path: TablePath,
+        snapshot_id: i64,
+        catalog_options: BTreeMap<String, String>,
+        projected_fields: Option<Vec<String>>,
+        encoded_split: String,
+    ) -> UnionReadResult<Self> {
+        if table_path.database().is_empty() || table_path.table().is_empty() {
+            return Err(invalid_descriptor(
+                "database and table names must not be empty",
+            ));
+        }
+        if snapshot_id < 0 {
+            return Err(invalid_descriptor(format!(
+                "lake snapshot id must be non-negative, got {snapshot_id}"
+            )));
+        }
+        if encoded_split.is_empty() {
+            return Err(invalid_descriptor("lake split payload must not be empty"));
+        }
+        if let Some(fields) = &projected_fields {
+            if fields.is_empty() {
+                return Err(invalid_descriptor(
+                    "projected fields must not be empty when present",
+                ));
+            }
+            if fields.iter().any(String::is_empty) {
+                return Err(invalid_descriptor(
+                    "projected field names must not be empty",
+                ));
+            }
+        }
+
+        Ok(Self {
+            table_path,
+            snapshot_id,
+            catalog_options,
+            projected_fields,
+            encoded_split,
+        })
+    }
+
+    pub(crate) fn table_path(&self) -> &TablePath {
+        &self.table_path
+    }
+
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub(crate) fn catalog_options(&self) -> &BTreeMap<String, String> {
+        &self.catalog_options
+    }
+
+    pub(crate) fn projected_fields(&self) -> Option<&[String]> {
+        self.projected_fields.as_deref()
+    }
+
+    pub(crate) fn encoded_split(&self) -> &str {
+        &self.encoded_split
+    }
+
+    fn encode(&self) -> UnionReadResult<Vec<u8>> {
+        let database = self.table_path.database().as_bytes();
+        let table = self.table_path.table().as_bytes();
+        let split = self.encoded_split.as_bytes();
+        let database_len = wire_len(database.len(), "database name")?;
+        let table_len = wire_len(table.len(), "table name")?;
+        let split_len = wire_len(split.len(), "lake split payload")?;
+        let projection_count = match &self.projected_fields {
+            Some(fields) => wire_len(fields.len(), "projected fields")?,
+            None => 0,
+        };
+        let option_count = wire_len(self.catalog_options.len(), "catalog options")?;
+
+        let mut flags = 0;
+        if self.projected_fields.is_some() {
+            flags |= PROJECTION_PRESENT;
+        }
+
+        let mut encoded = Vec::with_capacity(LAKE_SPLIT_HEADER_SIZE + database.len() + table.len());
+        encoded.extend_from_slice(&TASK_DESCRIPTOR_MAGIC);
+        encoded.push(LAKE_SPLIT_TASK_KIND);
+        encoded.push(flags);
+        encoded.extend_from_slice(&self.snapshot_id.to_le_bytes());
+        encoded.extend_from_slice(&database_len.to_le_bytes());
+        encoded.extend_from_slice(&table_len.to_le_bytes());
+        encoded.extend_from_slice(&split_len.to_le_bytes());
+        encoded.extend_from_slice(&projection_count.to_le_bytes());
+        encoded.extend_from_slice(&option_count.to_le_bytes());
+        encoded.extend_from_slice(database);
+        encoded.extend_from_slice(table);
+        encoded.extend_from_slice(split);
+        if let Some(fields) = &self.projected_fields {
+            for field in fields {
+                encoded.extend_from_slice(
+                    &wire_len(field.len(), "projected field name")?.to_le_bytes(),
+                );
+                encoded.extend_from_slice(field.as_bytes());
+            }
+        }
+        // A BTreeMap keeps the encoding deterministic: the same plan always
+        // produces the same task bytes.
+        for (key, value) in &self.catalog_options {
+            encoded.extend_from_slice(&wire_len(key.len(), "catalog option key")?.to_le_bytes());
+            encoded
+                .extend_from_slice(&wire_len(value.len(), "catalog option value")?.to_le_bytes());
+            encoded.extend_from_slice(key.as_bytes());
+            encoded.extend_from_slice(value.as_bytes());
+        }
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> UnionReadResult<Self> {
+        if encoded.len() < LAKE_SPLIT_HEADER_SIZE {
+            return Err(invalid_descriptor(format!(
+                "lake split descriptor is truncated: expected at least {LAKE_SPLIT_HEADER_SIZE} bytes, got {}",
+                encoded.len()
+            )));
+        }
+
+        let mut reader = DescriptorReader::new(encoded);
+        reader.expect_bytes(&TASK_DESCRIPTOR_MAGIC, "task descriptor magic")?;
+        let kind = reader.read_u8("task kind")?;
+        if kind != LAKE_SPLIT_TASK_KIND {
+            return Err(invalid_descriptor(format!(
+                "expected lake split task kind {LAKE_SPLIT_TASK_KIND}, got {kind}"
+            )));
+        }
+        let flags = reader.read_u8("task flags")?;
+        if flags & !PROJECTION_PRESENT != 0 {
+            return Err(invalid_descriptor(format!(
+                "lake split descriptor contains unknown flags 0x{flags:02x}"
+            )));
+        }
+
+        let snapshot_id = reader.read_i64("lake snapshot id")?;
+        let database_len = reader.read_u32("database name length")? as usize;
+        let table_len = reader.read_u32("table name length")? as usize;
+        let split_len = reader.read_u32("lake split payload length")? as usize;
+        let projection_count = reader.read_u32("projected field count")? as usize;
+        let option_count = reader.read_u32("catalog option count")? as usize;
+
+        let database = reader.read_string(database_len, "database name")?;
+        let table = reader.read_string(table_len, "table name")?;
+        let encoded_split = reader.read_string(split_len, "lake split payload")?;
+
+        let projection_present = flags & PROJECTION_PRESENT != 0;
+        if projection_present != (projection_count > 0) {
+            return Err(invalid_descriptor(
+                "projection flag and projected field count are inconsistent",
+            ));
+        }
+        let projected_fields = if projection_present {
+            let mut fields = Vec::new();
+            for _ in 0..projection_count {
+                let field_len = reader.read_u32("projected field name length")? as usize;
+                fields.push(reader.read_string(field_len, "projected field name")?);
+            }
+            Some(fields)
+        } else {
+            None
+        };
+
+        let mut catalog_options = BTreeMap::new();
+        for _ in 0..option_count {
+            let key_len = reader.read_u32("catalog option key length")? as usize;
+            let value_len = reader.read_u32("catalog option value length")? as usize;
+            let key = reader.read_string(key_len, "catalog option key")?;
+            let value = reader.read_string(value_len, "catalog option value")?;
+            if catalog_options.insert(key, value).is_some() {
+                return Err(invalid_descriptor(
+                    "lake split descriptor contains a duplicate catalog option key",
+                ));
+            }
+        }
+        reader.finish()?;
+
+        Self::try_new(
+            TablePath::new(database, table),
+            snapshot_id,
+            catalog_options,
+            projected_fields,
+            encoded_split,
+        )
     }
 }
 
@@ -504,6 +715,136 @@ mod tests {
 
         assert!(matches!(
             TaskDescriptor::decode(&encoded),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+    }
+
+    fn catalog_options() -> BTreeMap<String, String> {
+        let mut options = BTreeMap::new();
+        options.insert("warehouse".to_string(), "s3://bucket/warehouse".to_string());
+        options.insert("s3.region".to_string(), "us-east-1".to_string());
+        options
+    }
+
+    fn lake_split_descriptor(projected_fields: Option<Vec<String>>) -> LakeSplitTaskDescriptor {
+        LakeSplitTaskDescriptor::try_new(
+            TablePath::new("fluss", "orders"),
+            42,
+            catalog_options(),
+            projected_fields,
+            "{\"snapshotId\":42}".to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lake_split_descriptor_round_trips() {
+        let descriptor = TaskDescriptor::LakeSplit(lake_split_descriptor(Some(vec![
+            "amount".to_string(),
+            "id".to_string(),
+        ])));
+
+        assert_eq!(
+            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn lake_split_descriptor_round_trips_without_projection() {
+        let descriptor = TaskDescriptor::LakeSplit(lake_split_descriptor(None));
+
+        assert_eq!(
+            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn lake_split_encoding_is_deterministic() {
+        let descriptor = TaskDescriptor::LakeSplit(lake_split_descriptor(None));
+
+        assert_eq!(
+            descriptor.encode().unwrap(),
+            descriptor.encode().unwrap(),
+            "the same plan must always produce the same task bytes"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_lake_split_identity_and_payload() {
+        assert!(matches!(
+            LakeSplitTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                -1,
+                catalog_options(),
+                None,
+                "{}".to_string(),
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        assert!(matches!(
+            LakeSplitTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                1,
+                catalog_options(),
+                None,
+                String::new(),
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        assert!(matches!(
+            LakeSplitTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                1,
+                catalog_options(),
+                Some(Vec::new()),
+                "{}".to_string(),
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        assert!(matches!(
+            LakeSplitTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                1,
+                catalog_options(),
+                Some(vec![String::new()]),
+                "{}".to_string(),
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_lake_split_envelopes() {
+        let encoded = TaskDescriptor::LakeSplit(lake_split_descriptor(None))
+            .encode()
+            .unwrap();
+
+        let mut unknown_flags = encoded.clone();
+        unknown_flags[5] = 1 << 7;
+        assert!(matches!(
+            TaskDescriptor::decode(&unknown_flags),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            TaskDescriptor::decode(&trailing),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+
+        assert!(matches!(
+            TaskDescriptor::decode(&encoded[..encoded.len() - 1]),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+
+        // A projection flag without any projected field name must not decode.
+        let mut inconsistent_projection = encoded;
+        inconsistent_projection[5] = PROJECTION_PRESENT;
+        assert!(matches!(
+            TaskDescriptor::decode(&inconsistent_projection),
             Err(UnionReadError::InvalidTask(_))
         ));
     }

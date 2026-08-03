@@ -20,6 +20,8 @@
 //! finite stream of Arrow record batches.
 
 mod executor;
+#[cfg(feature = "paimon")]
+mod paimon;
 mod planner;
 #[doc(hidden)]
 pub mod planning;

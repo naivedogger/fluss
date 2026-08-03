@@ -22,7 +22,7 @@ edition = "2024"
 homepage = "https://fluss.apache.org/docs/apis/"
 license = "Apache-2.0"
 repository = "https://github.com/apache/fluss"
-rust-version = "1.85"
+rust-version = "1.88"
 version = "1.0.0"
 keywords = ["fluss", "streaming-storage", "datalake"]
 

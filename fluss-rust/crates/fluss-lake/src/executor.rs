@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::task::{AppendLogTaskDescriptor, TaskDescriptor};
+use crate::task::{AppendLogTaskDescriptor, LakeSplitTaskDescriptor, TaskDescriptor};
 use crate::{
     SendableRecordBatchStream, UnionReadError, UnionReadExecutionContext, UnionReadExecutionFuture,
     UnionReadExecutor, UnionReadResult, UnionReadTask,
@@ -46,7 +46,43 @@ async fn execute_task(
 ) -> UnionReadResult<SendableRecordBatchStream> {
     match TaskDescriptor::decode(task.execution_descriptor())? {
         TaskDescriptor::AppendLog(descriptor) => execute_append_log(descriptor, context).await,
+        TaskDescriptor::LakeSplit(descriptor) => execute_lake_split(descriptor).await,
     }
+}
+
+/// Reads one frozen lake split.
+///
+/// Lake splits are decodable in every build so that a task planned elsewhere
+/// reports a clear error here instead of failing to parse. Reading requires the
+/// matching lake format feature to be compiled in.
+#[cfg(feature = "paimon")]
+async fn execute_lake_split(
+    descriptor: LakeSplitTaskDescriptor,
+) -> UnionReadResult<SendableRecordBatchStream> {
+    crate::paimon::read_snapshot_split(
+        descriptor.table_path(),
+        &crate::paimon::PaimonCatalogOptions::from_map(
+            descriptor
+                .catalog_options()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        descriptor.snapshot_id(),
+        descriptor.projected_fields(),
+        descriptor.encoded_split(),
+    )
+    .await
+}
+
+#[cfg(not(feature = "paimon"))]
+async fn execute_lake_split(
+    descriptor: LakeSplitTaskDescriptor,
+) -> UnionReadResult<SendableRecordBatchStream> {
+    Err(UnionReadError::Execution(format!(
+        "lake split task for {} cannot be executed: this build has no lake format feature enabled",
+        descriptor.table_path()
+    )))
 }
 
 async fn execute_append_log(
@@ -187,5 +223,49 @@ mod tests {
         ));
 
         assert!(matches!(result, Err(UnionReadError::Execution(_))));
+    }
+
+    /// A lake split task planned elsewhere must stay decodable here, so that a
+    /// build without any lake format reports why it cannot run it.
+    #[test]
+    #[cfg(not(feature = "paimon"))]
+    fn lake_split_task_without_lake_feature_reports_a_clear_error() {
+        use crate::task::LakeSplitTaskDescriptor;
+        use std::collections::BTreeMap;
+
+        let mut catalog_options = BTreeMap::new();
+        catalog_options.insert("warehouse".to_string(), "/tmp/warehouse".to_string());
+        let descriptor = TaskDescriptor::LakeSplit(
+            LakeSplitTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                7,
+                catalog_options,
+                None,
+                "{}".to_string(),
+            )
+            .unwrap(),
+        );
+        let task = UnionReadTask::try_new(
+            "lake-split/fluss.orders/7/0".to_string(),
+            CURRENT_UNION_READ_TASK_VERSION,
+            descriptor.encode().unwrap(),
+            UnionReadStatistics::default(),
+        )
+        .unwrap();
+
+        let result = futures::executor::block_on(
+            FlussUnionReadExecutor.execute(task, UnionReadExecutionContext::default()),
+        );
+
+        match result {
+            Err(UnionReadError::Execution(message)) => {
+                assert!(
+                    message.contains("no lake format feature"),
+                    "unexpected error: {message}"
+                );
+            }
+            Err(other) => panic!("expected an execution error, got: {other}"),
+            Ok(_) => panic!("a lake split task must not execute without a lake format feature"),
+        }
     }
 }

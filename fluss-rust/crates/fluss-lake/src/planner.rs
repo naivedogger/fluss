@@ -94,23 +94,24 @@ async fn plan_union_read(
         Some(&partition_filter),
     )
     .await?;
+
+    // A readable lake snapshot contributes the bulk of the data; the frozen
+    // bucket ranges already start at the snapshot's log offsets, so the log
+    // tail below covers exactly what the snapshot does not.
+    let mut tasks = Vec::new();
     if let Some(snapshot_id) = boundary.readable_lake_snapshot_id() {
-        return Err(UnionReadError::Planning(format!(
-            "readable lake snapshot {snapshot_id} exists for {}, but lake split planning is not implemented",
-            request.table_path()
-        )));
+        tasks.extend(plan_lake_split_tasks(&request, &table_info, snapshot_id).await?);
     }
 
     if request.read_mode() == UnionReadMode::LakeOnly {
         return Ok(UnionReadPlan::new(
             output_schema,
-            Vec::new(),
+            tasks,
             UnionReadStatistics::default(),
             predicate_decisions,
         ));
     }
 
-    let mut tasks = Vec::new();
     for bucket_range in boundary.bucket_ranges() {
         if bucket_range.is_empty() {
             continue;
@@ -130,6 +131,87 @@ async fn plan_union_read(
         UnionReadStatistics::default(),
         predicate_decisions,
     ))
+}
+
+/// Plans the immutable tasks covering one readable lake snapshot.
+///
+/// Splits are resolved and frozen here so that executors never re-plan the lake
+/// snapshot and never observe a later lake commit.
+#[cfg(feature = "paimon")]
+async fn plan_lake_split_tasks(
+    request: &UnionReadRequest,
+    table_info: &fluss::metadata::TableInfo,
+    snapshot_id: i64,
+) -> UnionReadResult<Vec<crate::UnionReadTask>> {
+    use crate::paimon::{PaimonCatalogOptions, plan_snapshot_splits, projected_field_names};
+    use crate::planning::create_lake_split_task;
+    use fluss::metadata::DataLakeFormat;
+
+    let lake_format = table_info
+        .table_config
+        .get_datalake_format()
+        .map_err(|error| {
+            UnionReadError::Planning(format!(
+                "failed to resolve the lake format of {}: {error}",
+                request.table_path()
+            ))
+        })?
+        .ok_or_else(|| {
+            UnionReadError::Planning(format!(
+                "table {} has readable lake snapshot {snapshot_id} but no configured lake format",
+                request.table_path()
+            ))
+        })?;
+    if lake_format != DataLakeFormat::Paimon {
+        return Err(UnionReadError::Planning(format!(
+            "lake split planning is not implemented for the {lake_format} format of {}",
+            request.table_path()
+        )));
+    }
+
+    let catalog_options = PaimonCatalogOptions::from_table_info(table_info)?;
+    let projected_fields =
+        projected_field_names(table_info.row_type(), request.output_projection())?;
+    let encoded_splits = plan_snapshot_splits(
+        request.table_path(),
+        &catalog_options,
+        snapshot_id,
+        projected_fields.as_deref(),
+    )
+    .await?;
+
+    let ordered_options: std::collections::BTreeMap<String, String> = catalog_options
+        .as_map()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    encoded_splits
+        .into_iter()
+        .enumerate()
+        .map(|(split_index, encoded_split)| {
+            create_lake_split_task(
+                request.table_path(),
+                snapshot_id,
+                ordered_options.clone(),
+                projected_fields.clone(),
+                encoded_split,
+                split_index,
+                UnionReadStatistics::default(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "paimon"))]
+async fn plan_lake_split_tasks(
+    request: &UnionReadRequest,
+    _table_info: &fluss::metadata::TableInfo,
+    snapshot_id: i64,
+) -> UnionReadResult<Vec<crate::UnionReadTask>> {
+    Err(UnionReadError::Planning(format!(
+        "table {} has readable lake snapshot {snapshot_id}, but this build has no lake format feature enabled",
+        request.table_path()
+    )))
 }
 
 fn validate_request_shape(request: &UnionReadRequest) -> UnionReadResult<()> {
