@@ -19,11 +19,16 @@
 //! Union read is a bounded batch query. Results are delivered lazily as a
 //! finite stream of Arrow record batches.
 
+mod executor;
+mod planner;
 #[doc(hidden)]
 pub mod planning;
+mod pruning;
 mod task;
 mod union_read;
 
+pub use executor::FlussUnionReadExecutor;
+pub use planner::FlussUnionReadPlanner;
 pub use union_read::{
     CURRENT_UNION_READ_TASK_VERSION, PredicateId, PredicateInput, PredicatePushdownDecision,
     PredicatePushdownLevel, SendableRecordBatchStream, UnionReadError, UnionReadExecutionContext,
