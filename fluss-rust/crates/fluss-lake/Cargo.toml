@@ -43,6 +43,9 @@ futures = "0.3"
 paimon = { git = "https://github.com/naivedogger/paimon-rust.git", rev = "e4402d2f4d63f91fe6970d983623735552bfbc79", default-features = false, features = ["storage-memory", "storage-fs", "storage-oss", "storage-s3"], optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror = "1.0"
+# Only the `time` machinery is used (idle-timeout enforcement); the Fluss
+# client already requires a Tokio runtime, so this adds no new constraint.
+tokio = { workspace = true }
 
 [dev-dependencies]
 fluss-test-cluster = { path = "../fluss-test-cluster" }

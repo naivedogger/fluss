@@ -148,8 +148,10 @@ pub(crate) fn create_lake_split_task(
 /// Freezes the mutable table state needed by a bounded UnionRead plan.
 ///
 /// The readable lake snapshot supplies per-bucket start offsets. Buckets not
-/// represented in the snapshot start at the server-issued earliest offset.
-/// Stop offsets always come from a server `Latest` list-offsets response. The
+/// represented in the snapshot — including every bucket when no readable
+/// snapshot exists at all — start at the server-issued earliest offset,
+/// matching the Java connector's fallback in all no-snapshot cases. Stop
+/// offsets always come from a server `Latest` list-offsets response. The
 /// returned values are copied into task descriptions and never recomputed by
 /// executors.
 pub async fn freeze_read_boundary(
@@ -370,8 +372,12 @@ fn freeze_bucket_range(
 
     let start_offset = snapshot_offset.unwrap_or(earliest_offset);
     if start_offset < earliest_offset {
-        return Err(UnionReadError::Planning(format!(
-            "readable snapshot offset {start_offset} for {table_bucket} is older than the server earliest offset {earliest_offset}"
+        // Log retention has removed data between the snapshot boundary and
+        // the server's earliest offset. The Java connector fails too, at
+        // fetch time (offset-out-of-range); surfacing it at plan time gives
+        // a clearer, typed error before any work is scheduled.
+        return Err(UnionReadError::DataUnavailable(format!(
+            "readable snapshot offset {start_offset} for {table_bucket} is older than the server earliest offset {earliest_offset}: the log tail needed to complete the result has been removed by retention; re-plan to freeze currently-valid boundaries"
         )));
     }
     if start_offset > stop_offset {
@@ -414,10 +420,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_snapshot_gap_caused_by_log_retention() {
+    fn snapshot_gap_caused_by_log_retention_is_data_unavailable() {
         let result = freeze_bucket_range(TableBucket::new(5, 2), None, Some(7), 8, 20);
 
-        assert!(matches!(result, Err(UnionReadError::Planning(_))));
+        // Re-executing a task frozen on this boundary can never succeed, so
+        // the error must be the typed, re-plan-recoverable kind rather than
+        // a generic planning failure.
+        assert!(matches!(result, Err(UnionReadError::DataUnavailable(_))));
     }
 
     #[test]

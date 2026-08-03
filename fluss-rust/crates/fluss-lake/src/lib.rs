@@ -32,8 +32,9 @@ mod union_read;
 pub use executor::FlussUnionReadExecutor;
 pub use planner::FlussUnionReadPlanner;
 pub use union_read::{
-    CURRENT_UNION_READ_TASK_VERSION, PredicateId, PredicateInput, PredicatePushdownDecision,
-    PredicatePushdownLevel, SendableRecordBatchStream, UnionReadError, UnionReadExecutionContext,
-    UnionReadExecutionFuture, UnionReadExecutor, UnionReadMode, UnionReadPlan, UnionReadPlanFuture,
-    UnionReadPlanner, UnionReadRequest, UnionReadResult, UnionReadStatistics, UnionReadTask,
+    CURRENT_UNION_READ_TASK_VERSION, DEFAULT_UNION_READ_IDLE_TIMEOUT, PredicateId, PredicateInput,
+    PredicatePushdownDecision, PredicatePushdownLevel, SendableRecordBatchStream, UnionReadError,
+    UnionReadExecutionContext, UnionReadExecutor, UnionReadMode, UnionReadPlan,
+    UnionReadPlanFuture, UnionReadPlanner, UnionReadRequest, UnionReadResult, UnionReadStatistics,
+    UnionReadTask,
 };

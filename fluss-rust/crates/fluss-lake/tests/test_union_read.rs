@@ -137,7 +137,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             transported_task,
             UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
         )
-        .await
         .expect("Failed to execute append-log UnionRead task");
     let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
         .await
@@ -259,7 +258,6 @@ async fn partitioned_plan_prunes_partitions_and_executes_matching_buckets() {
                 transported_task,
                 UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
             )
-            .await
             .expect("Failed to execute partitioned UnionRead task");
         let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
             .await
@@ -342,12 +340,17 @@ async fn stale_schema_task_is_rejected_after_alter_table() {
         .await
         .expect("Failed to alter UnionRead integration test table");
 
-    let result = FlussUnionReadExecutor
+    // `execute` is synchronous and lazy: schema drift is an environment
+    // failure, so it surfaces as the first item of the returned stream.
+    let stream = FlussUnionReadExecutor
         .execute(
             stale_task,
             UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
         )
-        .await;
+        .expect("Opening a stale-schema task stream must not fail structurally");
+    let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
+        .await
+        .expect("Timed out waiting for the stale-schema task to fail");
     match result {
         Err(UnionReadError::Execution(message)) => {
             assert!(

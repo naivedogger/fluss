@@ -41,10 +41,37 @@ const PAIMON_PROPERTY_PREFIX: &str = "table.datalake.paimon.";
 /// Paimon table option that pins a scan to one snapshot id.
 const PAIMON_SCAN_VERSION_OPTION: &str = "scan.version";
 
+/// Substrings marking a catalog option as a secret.
+///
+/// Object-store credentials arrive mixed into the same property namespace as
+/// warehouse locations, so they are classified by key rather than by an
+/// allowlist: a new secret-bearing option is then withheld by default instead
+/// of leaking until someone notices it.
+const SENSITIVE_OPTION_MARKERS: [&str; 9] = [
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "credential",
+    "access-key",
+    "access_key",
+    "private-key",
+    "private_key",
+];
+
+/// Returns whether a catalog option key carries a secret.
+pub(crate) fn is_sensitive_catalog_option(key: &str) -> bool {
+    let lowercase = key.to_ascii_lowercase();
+    SENSITIVE_OPTION_MARKERS
+        .iter()
+        .any(|marker| lowercase.contains(marker))
+}
+
 /// Catalog configuration needed to reopen one Paimon table.
 ///
 /// This is planner output that travels inside a task descriptor, so it must
-/// stay a plain serializable map rather than a live catalog handle.
+/// stay a plain serializable map rather than a live catalog handle. Secrets are
+/// deliberately not part of it: see [`PaimonCatalogOptions::non_sensitive`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaimonCatalogOptions {
     options: HashMap<String, String>,
@@ -81,6 +108,33 @@ impl PaimonCatalogOptions {
     pub(crate) fn from_map(options: HashMap<String, String>) -> Self {
         Self { options }
     }
+
+    /// Returns the options that may be embedded in a task descriptor.
+    ///
+    /// Tasks are cached, logged and persisted by engines, so secrets must never
+    /// be serialized into them. An executor re-supplies the withheld options
+    /// through its execution context.
+    pub(crate) fn non_sensitive(&self) -> HashMap<String, String> {
+        self.options
+            .iter()
+            .filter(|(key, _)| !is_sensitive_catalog_option(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Merges runtime-supplied credentials over the task-carried options.
+    ///
+    /// Runtime values win: a credential rotated after planning must take
+    /// effect without re-planning.
+    pub(crate) fn with_runtime_credentials(
+        mut self,
+        credentials: &HashMap<String, String>,
+    ) -> Self {
+        for (key, value) in credentials {
+            self.options.insert(key.clone(), value.clone());
+        }
+        self
+    }
 }
 
 /// Opens one Paimon table pinned to a single lake snapshot.
@@ -114,16 +168,28 @@ async fn open_pinned_table(
     Ok(table.copy_with_options(pinned))
 }
 
-/// Resolves a scan output projection into Paimon field names.
+/// Resolves a scan output projection into explicit Paimon field names.
 ///
 /// Paimon projects by name while UnionRead requests project by Fluss field
 /// index, so the planner resolves indexes once against the frozen schema.
+///
+/// The resolved projection is explicit even when the request carries none:
+/// Fluss tiering appends the `__bucket`, `__offset` and `__timestamp` system
+/// columns to the Paimon table, so an unprojected Paimon read would leak
+/// columns that are not part of the plan's output schema. Enumerating the
+/// Fluss columns strips them by construction (the Java connector's
+/// `PaimonRecordReader` applies the same rule with a positional
+/// `ProjectedRow`).
 pub(crate) fn projected_field_names(
     row_type: &RowType,
     output_projection: Option<&[usize]>,
-) -> UnionReadResult<Option<Vec<String>>> {
+) -> UnionReadResult<Vec<String>> {
     let Some(projection) = output_projection else {
-        return Ok(None);
+        return Ok(row_type
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect());
     };
     let mut names = Vec::with_capacity(projection.len());
     for field_index in projection {
@@ -135,7 +201,7 @@ pub(crate) fn projected_field_names(
         })?;
         names.push(field.name().to_string());
     }
-    Ok(Some(names))
+    Ok(names)
 }
 
 /// Plans the immutable Paimon splits of one readable lake snapshot.
@@ -152,7 +218,9 @@ pub(crate) async fn plan_snapshot_splits(
     let mut read_builder = table.new_read_builder();
     if let Some(field_names) = projected_fields {
         let borrowed: Vec<&str> = field_names.iter().map(String::as_str).collect();
-        read_builder.with_projection(&borrowed);
+        read_builder
+            .with_projection(&borrowed)
+            .map_err(|error| paimon_error("apply Paimon planning projection", error))?;
     }
     let plan = read_builder
         .new_scan()
@@ -185,7 +253,9 @@ pub(crate) async fn read_snapshot_split(
     let mut read_builder = table.new_read_builder();
     if let Some(field_names) = projected_fields {
         let borrowed: Vec<&str> = field_names.iter().map(String::as_str).collect();
-        read_builder.with_projection(&borrowed);
+        read_builder
+            .with_projection(&borrowed)
+            .map_err(|error| paimon_error("apply Paimon read projection", error))?;
     }
     let stream = read_builder
         .new_read()
@@ -221,10 +291,67 @@ mod tests {
 
         assert_eq!(
             names,
-            Some(vec!["amount".to_string(), "id".to_string()]),
+            vec!["amount".to_string(), "id".to_string()],
             "projection order must be preserved for the engine's scan output"
         );
-        assert_eq!(projected_field_names(&row_type(), None).unwrap(), None);
+    }
+
+    /// A request without a projection must still freeze an explicit column
+    /// list, or the tiering-appended Paimon system columns would leak into
+    /// the output schema.
+    #[test]
+    fn unprojected_requests_freeze_all_fluss_columns_explicitly() {
+        let names = projected_field_names(&row_type(), None).unwrap();
+
+        assert_eq!(
+            names,
+            vec!["id".to_string(), "name".to_string(), "amount".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_sensitive_withholds_secret_catalog_options() {
+        let mut options = HashMap::new();
+        options.insert("warehouse".to_string(), "s3://bucket/warehouse".to_string());
+        options.insert("s3.endpoint".to_string(), "http://minio:9000".to_string());
+        options.insert("s3.access-key-id".to_string(), "AKID".to_string());
+        options.insert("s3.secret-key".to_string(), "TOP-SECRET".to_string());
+        options.insert("fs.oss.sts.token".to_string(), "STS-TOKEN".to_string());
+        let catalog_options = PaimonCatalogOptions::from_map(options);
+
+        let non_sensitive = catalog_options.non_sensitive();
+
+        let mut expected = HashMap::new();
+        expected.insert("warehouse".to_string(), "s3://bucket/warehouse".to_string());
+        expected.insert("s3.endpoint".to_string(), "http://minio:9000".to_string());
+        assert_eq!(non_sensitive, expected);
+    }
+
+    #[test]
+    fn runtime_credentials_override_task_carried_options() {
+        let mut task_options = HashMap::new();
+        task_options.insert("warehouse".to_string(), "/tmp/warehouse".to_string());
+        task_options.insert("s3.endpoint".to_string(), "http://stale:9000".to_string());
+        let mut credentials = HashMap::new();
+        credentials.insert("s3.secret-key".to_string(), "ROTATED".to_string());
+        credentials.insert("s3.endpoint".to_string(), "http://fresh:9000".to_string());
+
+        let merged =
+            PaimonCatalogOptions::from_map(task_options).with_runtime_credentials(&credentials);
+
+        assert_eq!(
+            merged.as_map().get("s3.secret-key"),
+            Some(&"ROTATED".to_string())
+        );
+        assert_eq!(
+            merged.as_map().get("s3.endpoint"),
+            Some(&"http://fresh:9000".to_string()),
+            "a credential rotated after planning must win over the task value"
+        );
+        assert_eq!(
+            merged.as_map().get("warehouse"),
+            Some(&"/tmp/warehouse".to_string())
+        );
     }
 
     #[test]

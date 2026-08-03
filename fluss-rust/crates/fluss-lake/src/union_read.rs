@@ -21,10 +21,12 @@ use fluss::client::FlussConnection;
 use fluss::metadata::TablePath;
 use fluss::predicate::PruningPredicate;
 use futures::Stream;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 const UNION_READ_TASK_MAGIC: [u8; 4] = *b"FLUR";
@@ -34,6 +36,15 @@ const STATISTICS_BYTES_PRESENT: u8 = 1 << 1;
 
 /// Current version of the serialized UnionRead task descriptor envelope.
 pub const CURRENT_UNION_READ_TASK_VERSION: u32 = 1;
+
+/// Default idle timeout applied to bounded read execution.
+///
+/// A bounded read has exactly two exits: reaching its frozen stop boundary,
+/// or a typed error. The stop boundary existed at plan time, so a fetch that
+/// makes no progress for this long is an operational failure, not a reason
+/// to wait forever. Override per execution with
+/// [`UnionReadExecutionContext::with_idle_timeout`].
+pub const DEFAULT_UNION_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Result type returned by UnionRead planning and execution APIs.
 pub type UnionReadResult<T> = std::result::Result<T, UnionReadError>;
@@ -48,10 +59,6 @@ pub type SendableRecordBatchStream =
 /// Future returned while constructing a frozen UnionRead plan.
 pub type UnionReadPlanFuture<'a> =
     Pin<Box<dyn Future<Output = UnionReadResult<UnionReadPlan>> + Send + 'a>>;
-
-/// Future returned while opening a finite stream for one frozen task.
-pub type UnionReadExecutionFuture<'a> =
-    Pin<Box<dyn Future<Output = UnionReadResult<SendableRecordBatchStream>> + Send + 'a>>;
 
 /// Errors surfaced by the UnionRead planning and execution contract.
 #[derive(Debug, Error)]
@@ -70,6 +77,20 @@ pub enum UnionReadError {
 
     #[error("UnionRead execution failed: {0}")]
     Execution(String),
+
+    /// The data behind a frozen read boundary no longer exists.
+    ///
+    /// Raised when a frozen start offset lies before the server's earliest
+    /// offset: log retention has removed data the result depends on, so a
+    /// silent read would be silently incomplete. This error is **not
+    /// retryable at task level** — the frozen offsets are gone and
+    /// re-executing the same task can never succeed. The documented recovery
+    /// is re-planning: a fresh [`UnionReadPlanner::plan`] freezes
+    /// currently-valid boundaries, and the truncated range has typically been
+    /// tiered into the lake by then, so the same rows are served from the
+    /// lake side instead.
+    #[error("UnionRead data unavailable: {0}")]
+    DataUnavailable(String),
 }
 
 /// Bounded read mode requested by an upstream engine.
@@ -517,13 +538,17 @@ impl UnionReadPlan {
 
 /// Runtime-only resources supplied while executing a frozen task.
 ///
-/// Credentials, connections, cancellation and metrics hooks will be added
-/// here as execution backends are introduced. They intentionally do not belong
-/// to the serializable task descriptor.
+/// Cancellation and metrics hooks will be added here as execution backends
+/// are introduced. These resources intentionally do not belong to the
+/// serializable task descriptor: tasks are cached, logged and persisted by
+/// engines, so anything secret or environment-bound must arrive through this
+/// context instead.
 #[derive(Clone, Default)]
 pub struct UnionReadExecutionContext {
     fluss_connection: Option<Arc<FlussConnection>>,
+    lake_credentials: HashMap<String, String>,
     memory_limit_bytes: Option<usize>,
+    idle_timeout: Option<Duration>,
 }
 
 impl UnionReadExecutionContext {
@@ -532,8 +557,30 @@ impl UnionReadExecutionContext {
         self
     }
 
+    /// Sets the secret lake catalog options withheld from task descriptors.
+    ///
+    /// Keys use the same names as the lake catalog options (for Paimon, the
+    /// `table.datalake.paimon.` property suffixes such as `s3.secret-key`).
+    /// At execution time these values override any equally-named option
+    /// carried by the task, so credentials rotated after planning take
+    /// effect without re-planning.
+    pub fn with_lake_credentials(mut self, lake_credentials: HashMap<String, String>) -> Self {
+        self.lake_credentials = lake_credentials;
+        self
+    }
+
     pub fn with_memory_limit_bytes(mut self, memory_limit_bytes: usize) -> Self {
         self.memory_limit_bytes = Some(memory_limit_bytes);
+        self
+    }
+
+    /// Overrides [`DEFAULT_UNION_READ_IDLE_TIMEOUT`] for this execution.
+    ///
+    /// The timeout bounds the wait for the *next* progress, not the total
+    /// read: it resets whenever data arrives. It must be long enough to
+    /// cover normal fetch latency, or healthy reads will be failed.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = Some(idle_timeout);
         self
     }
 
@@ -541,17 +588,30 @@ impl UnionReadExecutionContext {
         self.fluss_connection.as_ref()
     }
 
+    pub fn lake_credentials(&self) -> &HashMap<String, String> {
+        &self.lake_credentials
+    }
+
     pub fn memory_limit_bytes(&self) -> Option<usize> {
         self.memory_limit_bytes
+    }
+
+    /// Returns the effective idle timeout for bounded read execution.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout.unwrap_or(DEFAULT_UNION_READ_IDLE_TIMEOUT)
     }
 }
 
 impl Debug for UnionReadExecutionContext {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        // Credential keys and values must never reach logs; only the count
+        // is safe to expose.
         formatter
             .debug_struct("UnionReadExecutionContext")
             .field("has_fluss_connection", &self.fluss_connection.is_some())
+            .field("lake_credential_count", &self.lake_credentials.len())
             .field("memory_limit_bytes", &self.memory_limit_bytes)
+            .field("idle_timeout", &self.idle_timeout())
             .finish()
     }
 }
@@ -567,7 +627,19 @@ pub trait UnionReadPlanner: Send + Sync {
 
 /// Executes one immutable UnionRead task as a finite Arrow batch stream.
 ///
-/// The returned stream is bounded even though it is consumed asynchronously.
+/// `execute` returns synchronously with a lazy stream: structural problems
+/// (undecodable descriptors, unknown kinds, missing required context) fail
+/// fast in the call itself, while environment work — opening connections,
+/// files and subscriptions — happens on first poll, so environment failures
+/// surface as the first stream item. This adapts directly to synchronous
+/// engine interfaces such as DataFusion's `ExecutionPlan::execute`.
+///
+/// The returned stream is bounded even though it is consumed asynchronously,
+/// and it has exactly two exits: reaching the frozen task boundary, or a
+/// typed error. A read that stops making progress for longer than the
+/// context's idle timeout fails instead of waiting forever, and never
+/// returns a silent partial result.
+///
 /// Execution may use runtime resources from the context, but task semantics
 /// must come entirely from the frozen task descriptor.
 pub trait UnionReadExecutor: Send + Sync {
@@ -575,7 +647,7 @@ pub trait UnionReadExecutor: Send + Sync {
         &self,
         task: UnionReadTask,
         context: UnionReadExecutionContext,
-    ) -> UnionReadExecutionFuture<'_>;
+    ) -> UnionReadResult<SendableRecordBatchStream>;
 }
 
 #[cfg(test)]
@@ -781,12 +853,10 @@ mod tests {
                 &self,
                 _task: UnionReadTask,
                 _context: UnionReadExecutionContext,
-            ) -> UnionReadExecutionFuture<'_> {
-                Box::pin(async {
-                    let batches =
-                        stream::iter(vec![Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))]);
-                    Ok(Box::pin(batches) as SendableRecordBatchStream)
-                })
+            ) -> UnionReadResult<SendableRecordBatchStream> {
+                let batches =
+                    stream::iter(vec![Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))]);
+                Ok(Box::pin(batches) as SendableRecordBatchStream)
             }
         }
 
@@ -797,23 +867,32 @@ mod tests {
             planner.plan(UnionReadRequest::new(TablePath::new("fluss", "orders"))),
         )
         .unwrap();
-        let mut batches = futures::executor::block_on(executor.execute(
-            plan.tasks()[0].clone(),
-            UnionReadExecutionContext::default(),
-        ))
-        .unwrap();
+        let mut batches = executor
+            .execute(
+                plan.tasks()[0].clone(),
+                UnionReadExecutionContext::default(),
+            )
+            .unwrap();
 
         assert!(futures::executor::block_on(batches.next()).unwrap().is_ok());
         assert!(futures::executor::block_on(batches.next()).is_none());
     }
 
     #[test]
-    fn execution_context_debug_does_not_expose_connection_details() {
-        let context = UnionReadExecutionContext::default().with_memory_limit_bytes(1024);
+    fn execution_context_debug_does_not_expose_credentials() {
+        let mut credentials = HashMap::new();
+        credentials.insert("s3.secret-key".to_string(), "TOP-SECRET".to_string());
+        let context = UnionReadExecutionContext::default()
+            .with_lake_credentials(credentials)
+            .with_memory_limit_bytes(1024);
+
+        let debug = format!("{context:?}");
 
         assert_eq!(
-            format!("{context:?}"),
-            "UnionReadExecutionContext { has_fluss_connection: false, memory_limit_bytes: Some(1024) }"
+            debug,
+            "UnionReadExecutionContext { has_fluss_connection: false, lake_credential_count: 1, memory_limit_bytes: Some(1024), idle_timeout: 60s }"
         );
+        assert!(!debug.contains("TOP-SECRET"));
+        assert!(!debug.contains("secret-key"));
     }
 }

@@ -176,15 +176,15 @@ async fn plan_lake_split_tasks(
         request.table_path(),
         &catalog_options,
         snapshot_id,
-        projected_fields.as_deref(),
+        Some(&projected_fields),
     )
     .await?;
 
-    let ordered_options: std::collections::BTreeMap<String, String> = catalog_options
-        .as_map()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    // Only the non-sensitive options may travel inside tasks; secrets are
+    // re-supplied at execution time through the execution context. The
+    // BTreeMap keeps task encoding deterministic.
+    let task_options: std::collections::BTreeMap<String, String> =
+        catalog_options.non_sensitive().into_iter().collect();
     encoded_splits
         .into_iter()
         .enumerate()
@@ -192,8 +192,8 @@ async fn plan_lake_split_tasks(
             create_lake_split_task(
                 request.table_path(),
                 snapshot_id,
-                ordered_options.clone(),
-                projected_fields.clone(),
+                task_options.clone(),
+                Some(projected_fields.clone()),
                 encoded_split,
                 split_index,
                 UnionReadStatistics::default(),
@@ -406,5 +406,55 @@ mod tests {
             crate::PredicatePushdownLevel::Unsupported
         );
         assert!(decisions[0].level().requires_residual_evaluation());
+    }
+
+    /// Tasks are cached, logged and persisted by engines, so secret catalog
+    /// options must not appear anywhere in the encoded task bytes.
+    #[test]
+    #[cfg(feature = "paimon")]
+    fn secret_catalog_options_never_reach_encoded_task_bytes() {
+        use crate::paimon::PaimonCatalogOptions;
+        use crate::planning::create_lake_split_task;
+        use std::collections::HashMap;
+
+        let mut options = HashMap::new();
+        options.insert("warehouse".to_string(), "s3://bucket/warehouse".to_string());
+        options.insert("s3.access-key-id".to_string(), "AKID-VALUE".to_string());
+        options.insert("s3.secret-key".to_string(), "TOP-SECRET-VALUE".to_string());
+        let catalog_options = PaimonCatalogOptions::from_map(options);
+
+        // Mirror the planner's task construction path.
+        let task_options: std::collections::BTreeMap<String, String> =
+            catalog_options.non_sensitive().into_iter().collect();
+        let task = create_lake_split_task(
+            &fluss::metadata::TablePath::new("fluss", "orders"),
+            42,
+            task_options,
+            Some(vec!["id".to_string(), "name".to_string()]),
+            "{\"snapshotId\":42}".to_string(),
+            0,
+            crate::UnionReadStatistics::default(),
+        )
+        .unwrap();
+
+        let encoded = task.encode().unwrap();
+        for needle in [
+            b"s3.secret-key".as_slice(),
+            b"TOP-SECRET-VALUE".as_slice(),
+            b"s3.access-key-id".as_slice(),
+            b"AKID-VALUE".as_slice(),
+        ] {
+            assert!(
+                !encoded.windows(needle.len()).any(|window| window == needle),
+                "encoded task bytes must not contain {:?}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        assert!(
+            encoded
+                .windows(b"warehouse".len())
+                .any(|window| window == b"warehouse"),
+            "non-sensitive options must still travel in the task"
+        );
     }
 }
