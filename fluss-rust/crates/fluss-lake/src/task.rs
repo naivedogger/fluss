@@ -22,15 +22,19 @@ use std::collections::{BTreeMap, HashSet};
 const TASK_DESCRIPTOR_MAGIC: [u8; 4] = *b"URD1";
 const APPEND_LOG_TASK_KIND: u8 = 1;
 const LAKE_SPLIT_TASK_KIND: u8 = 2;
+const PK_HYBRID_TASK_KIND: u8 = 3;
 const PARTITION_PRESENT: u8 = 1;
 const PROJECTION_PRESENT: u8 = 1 << 1;
+const SNAPSHOT_PRESENT: u8 = 1 << 2;
 const APPEND_LOG_HEADER_SIZE: usize = 58;
 const LAKE_SPLIT_HEADER_SIZE: usize = 34;
+const PK_HYBRID_HEADER_SIZE: usize = 78;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TaskDescriptor {
     AppendLog(AppendLogTaskDescriptor),
     LakeSplit(LakeSplitTaskDescriptor),
+    PkHybrid(PkHybridTaskDescriptor),
 }
 
 impl TaskDescriptor {
@@ -38,6 +42,7 @@ impl TaskDescriptor {
         match self {
             Self::AppendLog(descriptor) => descriptor.encode(),
             Self::LakeSplit(descriptor) => descriptor.encode(),
+            Self::PkHybrid(descriptor) => descriptor.encode(),
         }
     }
 
@@ -52,6 +57,7 @@ impl TaskDescriptor {
         match encoded[TASK_DESCRIPTOR_MAGIC.len()] {
             APPEND_LOG_TASK_KIND => AppendLogTaskDescriptor::decode(encoded).map(Self::AppendLog),
             LAKE_SPLIT_TASK_KIND => LakeSplitTaskDescriptor::decode(encoded).map(Self::LakeSplit),
+            PK_HYBRID_TASK_KIND => PkHybridTaskDescriptor::decode(encoded).map(Self::PkHybrid),
             kind => Err(invalid_descriptor(format!(
                 "descriptor contains unknown task kind {kind}"
             ))),
@@ -261,6 +267,379 @@ impl LakeSplitTaskDescriptor {
             catalog_options,
             projected_fields,
             encoded_split,
+        )
+    }
+}
+
+/// One primary-key bucket's frozen lake baseline plus its bounded log tail.
+///
+/// Primary-key merge completes independently per `(partition, bucket)`, so a
+/// PK task must carry **all** lake splits of its bucket together with the
+/// bucket's log range: the merge overlays the tail onto the lake baseline,
+/// and a task split by lake file boundaries could not partition the tail
+/// consistently with arbitrary file subsets. This mirrors the Java
+/// connector's combined `LakeSnapshotAndFlussLogSplit`.
+///
+/// `pk_indexes` are frozen here rather than re-derived by executors: the
+/// merge is correctness-critical, so the key definition must come from the
+/// plan, not from whatever schema the executor happens to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PkHybridTaskDescriptor {
+    table_path: TablePath,
+    schema_id: i32,
+    table_bucket: TableBucket,
+    start_offset: i64,
+    stop_offset: i64,
+    snapshot_id: Option<i64>,
+    catalog_options: BTreeMap<String, String>,
+    lake_splits: Vec<String>,
+    pk_indexes: Vec<usize>,
+    output_projection: Option<Vec<usize>>,
+}
+
+impl PkHybridTaskDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        table_path: TablePath,
+        schema_id: i32,
+        table_bucket: TableBucket,
+        start_offset: i64,
+        stop_offset: i64,
+        snapshot_id: Option<i64>,
+        catalog_options: BTreeMap<String, String>,
+        lake_splits: Vec<String>,
+        pk_indexes: Vec<usize>,
+        output_projection: Option<Vec<usize>>,
+    ) -> UnionReadResult<Self> {
+        if table_path.database().is_empty() || table_path.table().is_empty() {
+            return Err(invalid_descriptor(
+                "database and table names must not be empty",
+            ));
+        }
+        if schema_id < 0 {
+            return Err(invalid_descriptor(format!(
+                "schema id must be non-negative, got {schema_id}"
+            )));
+        }
+        if table_bucket.table_id() < 0 {
+            return Err(invalid_descriptor(format!(
+                "table id must be non-negative, got {}",
+                table_bucket.table_id()
+            )));
+        }
+        if let Some(partition_id) = table_bucket.partition_id()
+            && partition_id < 0
+        {
+            return Err(invalid_descriptor(format!(
+                "partition id must be non-negative, got {partition_id}"
+            )));
+        }
+        if table_bucket.bucket_id() < 0 {
+            return Err(invalid_descriptor(format!(
+                "bucket id must be non-negative, got {}",
+                table_bucket.bucket_id()
+            )));
+        }
+        if start_offset < 0 || stop_offset < 0 {
+            return Err(invalid_descriptor(format!(
+                "changelog range must be non-negative, got [{start_offset}, {stop_offset})"
+            )));
+        }
+        if start_offset > stop_offset {
+            return Err(invalid_descriptor(format!(
+                "changelog start offset {start_offset} exceeds stop offset {stop_offset}"
+            )));
+        }
+        if let Some(snapshot_id) = snapshot_id
+            && snapshot_id < 0
+        {
+            return Err(invalid_descriptor(format!(
+                "lake snapshot id must be non-negative, got {snapshot_id}"
+            )));
+        }
+        if !lake_splits.is_empty() && snapshot_id.is_none() {
+            return Err(invalid_descriptor(
+                "lake splits require the pinned lake snapshot id they were planned against",
+            ));
+        }
+        if lake_splits.iter().any(String::is_empty) {
+            return Err(invalid_descriptor("lake split payloads must not be empty"));
+        }
+        if pk_indexes.is_empty() {
+            return Err(invalid_descriptor(
+                "primary-key field indexes must not be empty",
+            ));
+        }
+        let mut seen_pk = HashSet::with_capacity(pk_indexes.len());
+        if pk_indexes.iter().any(|index| !seen_pk.insert(*index)) {
+            return Err(invalid_descriptor(
+                "primary-key field indexes must not contain duplicates",
+            ));
+        }
+        if let Some(projection) = &output_projection {
+            if projection.is_empty() {
+                return Err(invalid_descriptor(
+                    "output projection must not be empty when present",
+                ));
+            }
+            let mut seen = HashSet::with_capacity(projection.len());
+            if projection.iter().any(|index| !seen.insert(*index)) {
+                return Err(invalid_descriptor(
+                    "output projection must not contain duplicate field indexes",
+                ));
+            }
+        }
+
+        Ok(Self {
+            table_path,
+            schema_id,
+            table_bucket,
+            start_offset,
+            stop_offset,
+            snapshot_id,
+            catalog_options,
+            lake_splits,
+            pk_indexes,
+            output_projection,
+        })
+    }
+
+    pub(crate) fn table_path(&self) -> &TablePath {
+        &self.table_path
+    }
+
+    pub(crate) fn schema_id(&self) -> i32 {
+        self.schema_id
+    }
+
+    pub(crate) fn table_bucket(&self) -> &TableBucket {
+        &self.table_bucket
+    }
+
+    pub(crate) fn start_offset(&self) -> i64 {
+        self.start_offset
+    }
+
+    pub(crate) fn stop_offset(&self) -> i64 {
+        self.stop_offset
+    }
+
+    pub(crate) fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+
+    pub(crate) fn catalog_options(&self) -> &BTreeMap<String, String> {
+        &self.catalog_options
+    }
+
+    pub(crate) fn lake_splits(&self) -> &[String] {
+        &self.lake_splits
+    }
+
+    pub(crate) fn pk_indexes(&self) -> &[usize] {
+        &self.pk_indexes
+    }
+
+    pub(crate) fn output_projection(&self) -> Option<&[usize]> {
+        self.output_projection.as_deref()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start_offset == self.stop_offset && self.lake_splits.is_empty()
+    }
+
+    fn encode(&self) -> UnionReadResult<Vec<u8>> {
+        let database = self.table_path.database().as_bytes();
+        let table = self.table_path.table().as_bytes();
+        let database_len = wire_len(database.len(), "database name")?;
+        let table_len = wire_len(table.len(), "table name")?;
+        let split_count = wire_len(self.lake_splits.len(), "lake splits")?;
+        let pk_count = wire_len(self.pk_indexes.len(), "primary-key indexes")?;
+        let projection_count = match &self.output_projection {
+            Some(projection) => wire_len(projection.len(), "output projection")?,
+            None => 0,
+        };
+        let option_count = wire_len(self.catalog_options.len(), "catalog options")?;
+
+        let mut flags = 0;
+        if self.table_bucket.partition_id().is_some() {
+            flags |= PARTITION_PRESENT;
+        }
+        if self.output_projection.is_some() {
+            flags |= PROJECTION_PRESENT;
+        }
+        if self.snapshot_id.is_some() {
+            flags |= SNAPSHOT_PRESENT;
+        }
+
+        let mut encoded = Vec::with_capacity(PK_HYBRID_HEADER_SIZE + database.len() + table.len());
+        encoded.extend_from_slice(&TASK_DESCRIPTOR_MAGIC);
+        encoded.push(PK_HYBRID_TASK_KIND);
+        encoded.push(flags);
+        encoded.extend_from_slice(&self.table_bucket.table_id().to_le_bytes());
+        encoded.extend_from_slice(&self.schema_id.to_le_bytes());
+        encoded.extend_from_slice(
+            &self
+                .table_bucket
+                .partition_id()
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&self.table_bucket.bucket_id().to_le_bytes());
+        encoded.extend_from_slice(&self.start_offset.to_le_bytes());
+        encoded.extend_from_slice(&self.stop_offset.to_le_bytes());
+        encoded.extend_from_slice(&self.snapshot_id.unwrap_or_default().to_le_bytes());
+        encoded.extend_from_slice(&database_len.to_le_bytes());
+        encoded.extend_from_slice(&table_len.to_le_bytes());
+        encoded.extend_from_slice(&split_count.to_le_bytes());
+        encoded.extend_from_slice(&pk_count.to_le_bytes());
+        encoded.extend_from_slice(&projection_count.to_le_bytes());
+        encoded.extend_from_slice(&option_count.to_le_bytes());
+        encoded.extend_from_slice(database);
+        encoded.extend_from_slice(table);
+        for split in &self.lake_splits {
+            encoded.extend_from_slice(&wire_len(split.len(), "lake split payload")?.to_le_bytes());
+            encoded.extend_from_slice(split.as_bytes());
+        }
+        for pk_index in &self.pk_indexes {
+            let pk_index = u32::try_from(*pk_index).map_err(|_| {
+                invalid_descriptor(format!(
+                    "primary-key index {pk_index} exceeds the task wire format limit"
+                ))
+            })?;
+            encoded.extend_from_slice(&pk_index.to_le_bytes());
+        }
+        if let Some(projection) = &self.output_projection {
+            for field_index in projection {
+                let field_index = u32::try_from(*field_index).map_err(|_| {
+                    invalid_descriptor(format!(
+                        "field index {field_index} exceeds the task wire format limit"
+                    ))
+                })?;
+                encoded.extend_from_slice(&field_index.to_le_bytes());
+            }
+        }
+        // A BTreeMap keeps the encoding deterministic: the same plan always
+        // produces the same task bytes.
+        for (key, value) in &self.catalog_options {
+            encoded.extend_from_slice(&wire_len(key.len(), "catalog option key")?.to_le_bytes());
+            encoded
+                .extend_from_slice(&wire_len(value.len(), "catalog option value")?.to_le_bytes());
+            encoded.extend_from_slice(key.as_bytes());
+            encoded.extend_from_slice(value.as_bytes());
+        }
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> UnionReadResult<Self> {
+        if encoded.len() < PK_HYBRID_HEADER_SIZE {
+            return Err(invalid_descriptor(format!(
+                "pk-hybrid descriptor is truncated: expected at least {PK_HYBRID_HEADER_SIZE} bytes, got {}",
+                encoded.len()
+            )));
+        }
+
+        let mut reader = DescriptorReader::new(encoded);
+        reader.expect_bytes(&TASK_DESCRIPTOR_MAGIC, "task descriptor magic")?;
+        let kind = reader.read_u8("task kind")?;
+        if kind != PK_HYBRID_TASK_KIND {
+            return Err(invalid_descriptor(format!(
+                "expected pk-hybrid task kind {PK_HYBRID_TASK_KIND}, got {kind}"
+            )));
+        }
+        let flags = reader.read_u8("task flags")?;
+        let known_flags = PARTITION_PRESENT | PROJECTION_PRESENT | SNAPSHOT_PRESENT;
+        if flags & !known_flags != 0 {
+            return Err(invalid_descriptor(format!(
+                "pk-hybrid descriptor contains unknown flags 0x{flags:02x}"
+            )));
+        }
+
+        let table_id = reader.read_i64("table id")?;
+        let schema_id = reader.read_i32("schema id")?;
+        let encoded_partition_id = reader.read_i64("partition id")?;
+        let bucket_id = reader.read_i32("bucket id")?;
+        let start_offset = reader.read_i64("start offset")?;
+        let stop_offset = reader.read_i64("stop offset")?;
+        let encoded_snapshot_id = reader.read_i64("lake snapshot id")?;
+        let database_len = reader.read_u32("database name length")? as usize;
+        let table_len = reader.read_u32("table name length")? as usize;
+        let split_count = reader.read_u32("lake split count")? as usize;
+        let pk_count = reader.read_u32("primary-key index count")? as usize;
+        let projection_count = reader.read_u32("projection count")? as usize;
+        let option_count = reader.read_u32("catalog option count")? as usize;
+
+        let database = reader.read_string(database_len, "database name")?;
+        let table = reader.read_string(table_len, "table name")?;
+        let mut lake_splits = Vec::new();
+        for _ in 0..split_count {
+            let split_len = reader.read_u32("lake split payload length")? as usize;
+            lake_splits.push(reader.read_string(split_len, "lake split payload")?);
+        }
+        let mut pk_indexes = Vec::new();
+        for _ in 0..pk_count {
+            pk_indexes.push(reader.read_u32("primary-key field index")? as usize);
+        }
+        let projection_present = flags & PROJECTION_PRESENT != 0;
+        if projection_present != (projection_count > 0) {
+            return Err(invalid_descriptor(
+                "projection flag and projection count are inconsistent",
+            ));
+        }
+        let output_projection = if projection_present {
+            let mut projection = Vec::new();
+            for _ in 0..projection_count {
+                projection.push(reader.read_u32("projection field index")? as usize);
+            }
+            Some(projection)
+        } else {
+            None
+        };
+        let mut catalog_options = BTreeMap::new();
+        for _ in 0..option_count {
+            let key_len = reader.read_u32("catalog option key length")? as usize;
+            let value_len = reader.read_u32("catalog option value length")? as usize;
+            let key = reader.read_string(key_len, "catalog option key")?;
+            let value = reader.read_string(value_len, "catalog option value")?;
+            if catalog_options.insert(key, value).is_some() {
+                return Err(invalid_descriptor(
+                    "pk-hybrid descriptor contains a duplicate catalog option key",
+                ));
+            }
+        }
+        reader.finish()?;
+
+        let partition_id = if flags & PARTITION_PRESENT != 0 {
+            Some(encoded_partition_id)
+        } else {
+            if encoded_partition_id != 0 {
+                return Err(invalid_descriptor(
+                    "partition id must be zero when the partition flag is absent",
+                ));
+            }
+            None
+        };
+        let snapshot_id = if flags & SNAPSHOT_PRESENT != 0 {
+            Some(encoded_snapshot_id)
+        } else {
+            if encoded_snapshot_id != 0 {
+                return Err(invalid_descriptor(
+                    "lake snapshot id must be zero when the snapshot flag is absent",
+                ));
+            }
+            None
+        };
+        Self::try_new(
+            TablePath::new(database, table),
+            schema_id,
+            TableBucket::new_with_partition(table_id, partition_id, bucket_id),
+            start_offset,
+            stop_offset,
+            snapshot_id,
+            catalog_options,
+            lake_splits,
+            pk_indexes,
+            output_projection,
         )
     }
 }
@@ -845,6 +1224,191 @@ mod tests {
         inconsistent_projection[5] = PROJECTION_PRESENT;
         assert!(matches!(
             TaskDescriptor::decode(&inconsistent_projection),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+    }
+
+    fn pk_hybrid_descriptor() -> PkHybridTaskDescriptor {
+        PkHybridTaskDescriptor::try_new(
+            TablePath::new("fluss", "orders"),
+            3,
+            TableBucket::new_with_partition(7, Some(11), 2),
+            12,
+            20,
+            Some(42),
+            catalog_options(),
+            vec![
+                "{\"bucket\":2}".to_string(),
+                "{\"bucket\":2,\"b\":1}".to_string(),
+            ],
+            vec![0, 1],
+            Some(vec![2, 0]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pk_hybrid_descriptor_round_trips() {
+        let descriptor = TaskDescriptor::PkHybrid(pk_hybrid_descriptor());
+
+        assert_eq!(
+            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            descriptor
+        );
+    }
+
+    /// A PK table without a readable snapshot folds the changelog only: no
+    /// partition, no snapshot, no lake splits, no projection.
+    #[test]
+    fn pk_hybrid_descriptor_round_trips_in_log_only_form() {
+        let descriptor = TaskDescriptor::PkHybrid(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                3,
+                TableBucket::new(7, 2),
+                0,
+                20,
+                None,
+                BTreeMap::new(),
+                Vec::new(),
+                vec![0],
+                None,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn pk_hybrid_encoding_is_deterministic() {
+        let descriptor = TaskDescriptor::PkHybrid(pk_hybrid_descriptor());
+
+        assert_eq!(
+            descriptor.encode().unwrap(),
+            descriptor.encode().unwrap(),
+            "the same plan must always produce the same task bytes"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_pk_hybrid_shapes() {
+        // Lake splits without the snapshot they were planned against.
+        assert!(matches!(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                3,
+                TableBucket::new(7, 2),
+                0,
+                20,
+                None,
+                catalog_options(),
+                vec!["{}".to_string()],
+                vec![0],
+                None,
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        // A primary-key task without key indexes cannot merge anything.
+        assert!(matches!(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                3,
+                TableBucket::new(7, 2),
+                0,
+                20,
+                Some(42),
+                catalog_options(),
+                vec!["{}".to_string()],
+                Vec::new(),
+                None,
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        // Duplicate key indexes.
+        assert!(matches!(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                3,
+                TableBucket::new(7, 2),
+                0,
+                20,
+                Some(42),
+                catalog_options(),
+                vec!["{}".to_string()],
+                vec![0, 0],
+                None,
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        // Inverted changelog range.
+        assert!(matches!(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                3,
+                TableBucket::new(7, 2),
+                21,
+                20,
+                Some(42),
+                catalog_options(),
+                vec!["{}".to_string()],
+                vec![0],
+                None,
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+        // Empty split payload.
+        assert!(matches!(
+            PkHybridTaskDescriptor::try_new(
+                TablePath::new("fluss", "orders"),
+                3,
+                TableBucket::new(7, 2),
+                0,
+                20,
+                Some(42),
+                catalog_options(),
+                vec![String::new()],
+                vec![0],
+                None,
+            ),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_pk_hybrid_envelopes() {
+        let encoded = TaskDescriptor::PkHybrid(pk_hybrid_descriptor())
+            .encode()
+            .unwrap();
+
+        let mut unknown_flags = encoded.clone();
+        unknown_flags[5] |= 1 << 7;
+        assert!(matches!(
+            TaskDescriptor::decode(&unknown_flags),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            TaskDescriptor::decode(&trailing),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+
+        assert!(matches!(
+            TaskDescriptor::decode(&encoded[..encoded.len() - 1]),
+            Err(UnionReadError::InvalidTask(_))
+        ));
+
+        // Clearing the snapshot flag while its value remains set must not
+        // decode into a different-but-valid descriptor.
+        let mut inconsistent_snapshot = encoded;
+        inconsistent_snapshot[5] &= !SNAPSHOT_PRESENT;
+        assert!(matches!(
+            TaskDescriptor::decode(&inconsistent_snapshot),
             Err(UnionReadError::InvalidTask(_))
         ));
     }

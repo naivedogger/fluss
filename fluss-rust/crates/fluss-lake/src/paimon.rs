@@ -230,12 +230,79 @@ pub(crate) async fn plan_snapshot_splits(
 
     plan.splits()
         .iter()
-        .map(|split| {
-            serde_json::to_string(split).map_err(|error| {
-                UnionReadError::Planning(format!("failed to serialize Paimon split: {error}"))
-            })
-        })
+        .map(|split| encode_split(split))
         .collect()
+}
+
+/// Rejects Paimon merge engines whose current view v1 cannot reproduce.
+///
+/// The hash-overlay merge presumes that overlaying a deduplicate changelog
+/// tail onto the lake current state yields the table's current view. Under
+/// any other merge engine that overlay silently produces a wrong view, so
+/// everything else must fail at planning: `partial-update` until paimon-rust
+/// gains write-time flush merges (apache/paimon-rust#380), `first-row` and
+/// `aggregation` as out of scope. Deduplicate is also what Fluss tiering
+/// writes, and Paimon's default when the option is absent.
+pub(crate) fn ensure_deduplicate_merge_engine(
+    table_options: &HashMap<String, String>,
+    table_path: &TablePath,
+) -> UnionReadResult<()> {
+    let merge_engine = paimon::spec::CoreOptions::new(table_options)
+        .merge_engine()
+        .map_err(|error| {
+            UnionReadError::Planning(format!(
+                "failed to resolve the Paimon merge engine of {table_path}: {error}"
+            ))
+        })?;
+    if merge_engine != paimon::spec::MergeEngine::Deduplicate {
+        return Err(UnionReadError::Planning(format!(
+            "primary-key UnionRead only supports the deduplicate merge engine, but the Paimon table for {table_path} uses {merge_engine:?}; refusing to plan a read that would silently produce an incorrect current view"
+        )));
+    }
+    Ok(())
+}
+
+/// Plans the Paimon splits of a primary-key snapshot, grouped by bucket.
+///
+/// A PK bucket's lake baseline and its log tail must land in the same task,
+/// so splits are keyed by their Paimon bucket id — which Fluss tiering keeps
+/// aligned with the Fluss bucket id. Planning is rejected up front for merge
+/// engines other than deduplicate.
+pub(crate) async fn plan_pk_snapshot_splits(
+    table_path: &TablePath,
+    catalog_options: &PaimonCatalogOptions,
+    snapshot_id: i64,
+) -> UnionReadResult<HashMap<i32, Vec<String>>> {
+    let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
+    ensure_deduplicate_merge_engine(table.schema().options(), table_path)?;
+
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .map_err(|error| paimon_error("plan Paimon snapshot splits", error))?;
+
+    let mut splits_by_bucket: HashMap<i32, Vec<String>> = HashMap::new();
+    for split in plan.splits() {
+        if split.bucket() < 0 {
+            return Err(UnionReadError::Planning(format!(
+                "Paimon snapshot {snapshot_id} of {table_path} produced a split with negative bucket {}",
+                split.bucket()
+            )));
+        }
+        splits_by_bucket
+            .entry(split.bucket())
+            .or_default()
+            .push(encode_split(split)?);
+    }
+    Ok(splits_by_bucket)
+}
+
+fn encode_split(split: &DataSplit) -> UnionReadResult<String> {
+    serde_json::to_string(split).map_err(|error| {
+        UnionReadError::Planning(format!("failed to serialize Paimon split: {error}"))
+    })
 }
 
 /// Reads one frozen Paimon split as a finite Arrow batch stream.
@@ -369,5 +436,38 @@ mod tests {
         let catalog_options = PaimonCatalogOptions::from_map(options.clone());
 
         assert_eq!(catalog_options.as_map(), &options);
+    }
+
+    fn merge_engine_options(value: Option<&str>) -> HashMap<String, String> {
+        let mut options = HashMap::new();
+        if let Some(value) = value {
+            options.insert("merge-engine".to_string(), value.to_string());
+        }
+        options
+    }
+
+    /// v1 admits merge engine `deduplicate` only — which is what Fluss
+    /// tiering writes and what Paimon defaults to when the option is absent.
+    /// Everything else must fail at planning rather than silently misread.
+    #[test]
+    fn merge_engine_gate_admits_deduplicate_only() {
+        let table_path = TablePath::new("fluss", "pk_orders");
+
+        ensure_deduplicate_merge_engine(&merge_engine_options(None), &table_path).unwrap();
+        ensure_deduplicate_merge_engine(&merge_engine_options(Some("deduplicate")), &table_path)
+            .unwrap();
+
+        for rejected in ["partial-update", "first-row", "aggregation", "unknown"] {
+            assert!(
+                matches!(
+                    ensure_deduplicate_merge_engine(
+                        &merge_engine_options(Some(rejected)),
+                        &table_path
+                    ),
+                    Err(UnionReadError::Planning(_))
+                ),
+                "merge engine {rejected} must be rejected at planning"
+            );
+        }
     }
 }

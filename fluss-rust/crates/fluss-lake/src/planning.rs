@@ -20,7 +20,9 @@
 //! Upstream engines should use [`crate::UnionReadPlanner`] and treat its tasks
 //! as opaque rather than depending on the types in this module.
 
-use crate::task::{AppendLogTaskDescriptor, LakeSplitTaskDescriptor, TaskDescriptor};
+use crate::task::{
+    AppendLogTaskDescriptor, LakeSplitTaskDescriptor, PkHybridTaskDescriptor, TaskDescriptor,
+};
 use crate::{
     CURRENT_UNION_READ_TASK_VERSION, UnionReadError, UnionReadResult, UnionReadStatistics,
     UnionReadTask,
@@ -137,6 +139,55 @@ pub(crate) fn create_lake_split_task(
         encoded_split,
     )?);
     let task_id = format!("lake-split/{table_path}/{snapshot_id}/{split_index}");
+    UnionReadTask::try_new(
+        task_id,
+        CURRENT_UNION_READ_TASK_VERSION,
+        descriptor.encode()?,
+        statistics,
+    )
+}
+
+/// Creates one opaque primary-key hybrid task from a frozen bucket boundary.
+///
+/// All lake splits of the bucket travel in this single task: a PK merge
+/// completes independently per bucket, and its lake baseline and log tail
+/// must meet inside one executor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_pk_hybrid_task(
+    table_path: &TablePath,
+    schema_id: i32,
+    bucket_range: &FrozenBucketRange,
+    snapshot_id: Option<i64>,
+    catalog_options: BTreeMap<String, String>,
+    lake_splits: Vec<String>,
+    pk_indexes: Vec<usize>,
+    output_projection: Option<&[usize]>,
+    statistics: UnionReadStatistics,
+) -> UnionReadResult<UnionReadTask> {
+    let descriptor = TaskDescriptor::PkHybrid(PkHybridTaskDescriptor::try_new(
+        table_path.clone(),
+        schema_id,
+        bucket_range.table_bucket.clone(),
+        bucket_range.start_offset,
+        bucket_range.stop_offset,
+        snapshot_id,
+        catalog_options,
+        lake_splits,
+        pk_indexes,
+        output_projection.map(<[usize]>::to_vec),
+    )?);
+    let partition = bucket_range
+        .table_bucket
+        .partition_id()
+        .map_or_else(|| "root".to_string(), |id| id.to_string());
+    let task_id = format!(
+        "pk-hybrid/{}/{}/{}/{}-{}",
+        bucket_range.table_bucket.table_id(),
+        partition,
+        bucket_range.table_bucket.bucket_id(),
+        bucket_range.start_offset,
+        bucket_range.stop_offset
+    );
     UnionReadTask::try_new(
         task_id,
         CURRENT_UNION_READ_TASK_VERSION,

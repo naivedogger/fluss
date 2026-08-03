@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::task::{AppendLogTaskDescriptor, LakeSplitTaskDescriptor, TaskDescriptor};
+use crate::task::{
+    AppendLogTaskDescriptor, LakeSplitTaskDescriptor, PkHybridTaskDescriptor, TaskDescriptor,
+};
 use crate::{
     SendableRecordBatchStream, UnionReadError, UnionReadExecutionContext, UnionReadExecutor,
     UnionReadResult, UnionReadTask,
@@ -44,8 +46,24 @@ impl UnionReadExecutor for FlussUnionReadExecutor {
         match TaskDescriptor::decode(task.execution_descriptor())? {
             TaskDescriptor::AppendLog(descriptor) => execute_append_log(descriptor, context),
             TaskDescriptor::LakeSplit(descriptor) => execute_lake_split(descriptor, context),
+            TaskDescriptor::PkHybrid(descriptor) => execute_pk_hybrid(descriptor, context),
         }
     }
+}
+
+/// Merges one primary-key bucket's lake baseline with its bounded log tail.
+///
+/// The hash-overlay merge executor is not implemented yet; the task kind is
+/// dispatched here so that a plan produced by a newer planner fails with a
+/// clear capability error instead of an unknown-kind decode error.
+fn execute_pk_hybrid(
+    descriptor: PkHybridTaskDescriptor,
+    _context: UnionReadExecutionContext,
+) -> UnionReadResult<SendableRecordBatchStream> {
+    Err(UnionReadError::Execution(format!(
+        "pk-hybrid task for {} cannot be executed: the primary-key merge executor is not implemented yet",
+        descriptor.table_path()
+    )))
 }
 
 /// Defers an asynchronous stream setup until the stream's first poll.

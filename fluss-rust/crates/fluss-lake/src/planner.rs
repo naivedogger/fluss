@@ -14,25 +14,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::planning::{create_append_log_task, freeze_read_boundary_for_table};
+use crate::planning::{
+    create_append_log_task, create_pk_hybrid_task, freeze_read_boundary_for_table,
+};
 use crate::pruning::PartitionPruner;
 use crate::{
     UnionReadError, UnionReadMode, UnionReadPlan, UnionReadPlanFuture, UnionReadPlanner,
     UnionReadRequest, UnionReadResult, UnionReadStatistics,
 };
 use fluss::client::FlussConnection;
-use fluss::metadata::RowType;
+use fluss::metadata::{RowType, TableInfo};
 use fluss::predicate::{FieldRef, PruningPredicate};
 use fluss::record::to_arrow_schema;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// Fluss table property selecting a non-default primary-key merge engine.
+const FLUSS_MERGE_ENGINE_PROPERTY: &str = "table.merge-engine";
+
 /// Default Fluss-Rust planner for bounded UnionRead requests.
 ///
-/// The initial implementation plans append-table log tasks when no readable
-/// lake snapshot exists. Planning a readable lake snapshot or a primary-key
-/// table remains unsupported until the corresponding Paimon and merge
-/// executors are available.
+/// Append tables plan lake-split plus append-log tasks; primary-key tables
+/// plan one hybrid task per bucket that merges the lake baseline with the
+/// bounded changelog tail. Configurations whose current view cannot be
+/// reproduced correctly — non-deduplicate merge engines and partitioned
+/// primary-key tables — are rejected explicitly at planning.
 #[derive(Clone)]
 pub struct FlussUnionReadPlanner {
     connection: Arc<FlussConnection>,
@@ -70,14 +76,12 @@ async fn plan_union_read(
         })?;
     validate_request_schema(&request, table_info.row_type())?;
 
+    let output_schema = projected_arrow_schema(&request, table_info.row_type())?;
+
     if table_info.has_primary_key() {
-        return Err(UnionReadError::Planning(format!(
-            "primary-key UnionRead planning is not implemented for {}",
-            request.table_path()
-        )));
+        return plan_pk_union_read(&admin, &request, &table_info, output_schema).await;
     }
 
-    let output_schema = projected_arrow_schema(&request, table_info.row_type())?;
     let pruner = PartitionPruner::new(
         table_info.row_type(),
         &table_info.partition_keys,
@@ -214,6 +218,247 @@ async fn plan_lake_split_tasks(
     )))
 }
 
+/// Plans a bounded primary-key read as one hybrid task per bucket.
+///
+/// Each task carries the bucket's complete lake baseline (all of its splits)
+/// together with its frozen changelog range: the merge is per-bucket, and
+/// splitting by lake file boundaries would leave the tail without a
+/// consistent partner. Lake-only mode instead exposes the splits directly —
+/// Paimon's current view as of the frozen snapshot, a legitimately stale
+/// view by documented semantics.
+async fn plan_pk_union_read(
+    admin: &fluss::client::FlussAdmin,
+    request: &UnionReadRequest,
+    table_info: &TableInfo,
+    output_schema: arrow::datatypes::SchemaRef,
+) -> UnionReadResult<UnionReadPlan> {
+    validate_pk_table_shape(table_info)?;
+
+    // Without partitions there is nothing to prune, so every predicate stays
+    // an engine residual; for PK tables data-column filters must be applied
+    // after the merge anyway (a filtered-out UPDATE_AFTER must still
+    // suppress its older lake row).
+    let pruner = PartitionPruner::new(table_info.row_type(), &[], request.predicates());
+    let predicate_decisions = pruner.decisions(request.predicates());
+
+    let pk_indexes = table_info.schema.primary_key_indexes();
+    if pk_indexes.is_empty() {
+        return Err(UnionReadError::Planning(format!(
+            "table {} reports a primary key but resolves no key field indexes",
+            request.table_path()
+        )));
+    }
+
+    let boundary =
+        freeze_read_boundary_for_table(admin, request.table_path(), table_info, None).await?;
+    let lake_side = match boundary.readable_lake_snapshot_id() {
+        Some(snapshot_id) => Some(plan_pk_lake_side(request, table_info, snapshot_id).await?),
+        None => None,
+    };
+
+    if request.read_mode() == UnionReadMode::LakeOnly {
+        let tasks = match lake_side {
+            Some(lake_side) => lake_side.into_lake_only_tasks(request)?,
+            None => Vec::new(),
+        };
+        return Ok(UnionReadPlan::new(
+            output_schema,
+            tasks,
+            UnionReadStatistics::default(),
+            predicate_decisions,
+        ));
+    }
+
+    let (snapshot_id, mut splits_by_bucket, task_options) = match lake_side {
+        Some(lake_side) => (
+            Some(lake_side.snapshot_id),
+            lake_side.splits_by_bucket,
+            lake_side.task_options,
+        ),
+        None => (
+            None,
+            std::collections::HashMap::new(),
+            std::collections::BTreeMap::new(),
+        ),
+    };
+
+    let mut tasks = Vec::new();
+    for bucket_range in boundary.bucket_ranges() {
+        let lake_splits = splits_by_bucket
+            .remove(&bucket_range.table_bucket().bucket_id())
+            .unwrap_or_default();
+        if bucket_range.is_empty() && lake_splits.is_empty() {
+            continue;
+        }
+        tasks.push(create_pk_hybrid_task(
+            request.table_path(),
+            table_info.schema_id,
+            bucket_range,
+            snapshot_id,
+            task_options.clone(),
+            lake_splits,
+            pk_indexes.clone(),
+            request.output_projection(),
+            UnionReadStatistics::default(),
+        )?);
+    }
+    if !splits_by_bucket.is_empty() {
+        // A lake bucket outside the server's bucket set has no log partner;
+        // dropping it would silently lose rows.
+        let mut orphaned: Vec<i32> = splits_by_bucket.keys().copied().collect();
+        orphaned.sort_unstable();
+        return Err(UnionReadError::Planning(format!(
+            "lake snapshot of {} contains splits for buckets {orphaned:?} that the server bucket set does not cover",
+            request.table_path()
+        )));
+    }
+
+    Ok(UnionReadPlan::new(
+        output_schema,
+        tasks,
+        UnionReadStatistics::default(),
+        predicate_decisions,
+    ))
+}
+
+/// Rejects primary-key configurations whose current view v1 cannot rebuild.
+///
+/// These are correctness gates, not capability gaps to work around: planning
+/// must fail explicitly rather than silently produce a wrong view.
+fn validate_pk_table_shape(table_info: &TableInfo) -> UnionReadResult<()> {
+    if !table_info.partition_keys.is_empty() {
+        return Err(UnionReadError::Planning(format!(
+            "partitioned primary-key table {} is not supported: per-partition lake split filtering is not implemented, and merging a partial lake view would silently produce an incorrect result",
+            table_info.table_path
+        )));
+    }
+    if let Some(merge_engine) = table_info.properties.get(FLUSS_MERGE_ENGINE_PROPERTY) {
+        return Err(UnionReadError::Planning(format!(
+            "primary-key UnionRead only supports default deduplicate semantics, but table {} sets {FLUSS_MERGE_ENGINE_PROPERTY}={merge_engine}; its changelog cannot be folded last-writer-wins without producing an incorrect view",
+            table_info.table_path
+        )));
+    }
+    Ok(())
+}
+
+/// The frozen lake half of a primary-key plan.
+#[cfg(feature = "paimon")]
+struct PkLakeSide {
+    snapshot_id: i64,
+    splits_by_bucket: std::collections::HashMap<i32, Vec<String>>,
+    task_options: std::collections::BTreeMap<String, String>,
+    projected_fields: Vec<String>,
+}
+
+#[cfg(feature = "paimon")]
+impl PkLakeSide {
+    /// Converts the lake side into standalone lake-split tasks.
+    ///
+    /// Only valid for lake-only mode: with no tail to merge, splits are
+    /// independently correct (key-disjoint since apache/paimon-rust#374) and
+    /// can be scheduled individually.
+    fn into_lake_only_tasks(
+        self,
+        request: &UnionReadRequest,
+    ) -> UnionReadResult<Vec<crate::UnionReadTask>> {
+        use crate::planning::create_lake_split_task;
+
+        let mut buckets: Vec<i32> = self.splits_by_bucket.keys().copied().collect();
+        buckets.sort_unstable();
+        let mut tasks = Vec::new();
+        let mut split_index = 0;
+        for bucket in buckets {
+            for encoded_split in &self.splits_by_bucket[&bucket] {
+                tasks.push(create_lake_split_task(
+                    request.table_path(),
+                    self.snapshot_id,
+                    self.task_options.clone(),
+                    Some(self.projected_fields.clone()),
+                    encoded_split.clone(),
+                    split_index,
+                    UnionReadStatistics::default(),
+                )?);
+                split_index += 1;
+            }
+        }
+        Ok(tasks)
+    }
+}
+
+/// Plans and freezes the Paimon side of a primary-key read.
+#[cfg(feature = "paimon")]
+async fn plan_pk_lake_side(
+    request: &UnionReadRequest,
+    table_info: &TableInfo,
+    snapshot_id: i64,
+) -> UnionReadResult<PkLakeSide> {
+    use crate::paimon::{PaimonCatalogOptions, plan_pk_snapshot_splits, projected_field_names};
+    use fluss::metadata::DataLakeFormat;
+
+    let lake_format = table_info
+        .table_config
+        .get_datalake_format()
+        .map_err(|error| {
+            UnionReadError::Planning(format!(
+                "failed to resolve the lake format of {}: {error}",
+                request.table_path()
+            ))
+        })?
+        .ok_or_else(|| {
+            UnionReadError::Planning(format!(
+                "table {} has readable lake snapshot {snapshot_id} but no configured lake format",
+                request.table_path()
+            ))
+        })?;
+    if lake_format != DataLakeFormat::Paimon {
+        return Err(UnionReadError::Planning(format!(
+            "lake split planning is not implemented for the {lake_format} format of {}",
+            request.table_path()
+        )));
+    }
+
+    let catalog_options = PaimonCatalogOptions::from_table_info(table_info)?;
+    let splits_by_bucket =
+        plan_pk_snapshot_splits(request.table_path(), &catalog_options, snapshot_id).await?;
+    let projected_fields =
+        projected_field_names(table_info.row_type(), request.output_projection())?;
+    Ok(PkLakeSide {
+        snapshot_id,
+        splits_by_bucket,
+        task_options: catalog_options.non_sensitive().into_iter().collect(),
+        projected_fields,
+    })
+}
+
+#[cfg(not(feature = "paimon"))]
+struct PkLakeSide {
+    snapshot_id: i64,
+    splits_by_bucket: std::collections::HashMap<i32, Vec<String>>,
+    task_options: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(not(feature = "paimon"))]
+impl PkLakeSide {
+    fn into_lake_only_tasks(
+        self,
+        _request: &UnionReadRequest,
+    ) -> UnionReadResult<Vec<crate::UnionReadTask>> {
+        unreachable!("a PkLakeSide is never constructed without a lake format feature")
+    }
+}
+
+#[cfg(not(feature = "paimon"))]
+async fn plan_pk_lake_side(
+    request: &UnionReadRequest,
+    _table_info: &TableInfo,
+    snapshot_id: i64,
+) -> UnionReadResult<PkLakeSide> {
+    Err(UnionReadError::Planning(format!(
+        "table {} has readable lake snapshot {snapshot_id}, but this build has no lake format feature enabled",
+        request.table_path()
+    )))
+}
+
 fn validate_request_shape(request: &UnionReadRequest) -> UnionReadResult<()> {
     if request.table_path().database().is_empty() || request.table_path().table().is_empty() {
         return Err(UnionReadError::InvalidRequest(
@@ -329,8 +574,9 @@ fn projected_arrow_schema(
 mod tests {
     use super::*;
     use crate::{PredicateId, PredicateInput};
-    use fluss::metadata::{DataField, DataTypes};
+    use fluss::metadata::{DataField, DataTypes, Schema, TablePath};
     use fluss::predicate::{ComparisonOperator, FieldRef};
+    use std::collections::HashMap;
 
     fn row_type() -> RowType {
         RowType::new(vec![
@@ -456,5 +702,63 @@ mod tests {
                 .any(|window| window == b"warehouse"),
             "non-sensitive options must still travel in the task"
         );
+    }
+
+    fn pk_table_info(
+        partition_keys: Vec<String>,
+        properties: HashMap<String, String>,
+    ) -> TableInfo {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("region", DataTypes::string())
+            .column("amount", DataTypes::bigint())
+            .primary_key(["id", "region"])
+            .build()
+            .unwrap();
+        TableInfo::new(
+            TablePath::new("fluss", "pk_orders"),
+            7,
+            1,
+            schema,
+            vec!["id".to_string()],
+            partition_keys.into(),
+            4,
+            properties,
+            HashMap::new(),
+            None,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn accepts_default_primary_key_table_shape() {
+        validate_pk_table_shape(&pk_table_info(Vec::new(), HashMap::new())).unwrap();
+    }
+
+    /// Merging a partial lake view against a per-partition log tail would
+    /// silently drop rows; partitioned PK tables must fail at planning.
+    #[test]
+    fn rejects_partitioned_primary_key_tables() {
+        let table_info = pk_table_info(vec!["region".to_string()], HashMap::new());
+
+        assert!(matches!(
+            validate_pk_table_shape(&table_info),
+            Err(UnionReadError::Planning(_))
+        ));
+    }
+
+    /// A non-default Fluss merge engine changes changelog semantics, so a
+    /// last-writer-wins fold would produce an incorrect current view.
+    #[test]
+    fn rejects_fluss_merge_engine_tables() {
+        let mut properties = HashMap::new();
+        properties.insert("table.merge-engine".to_string(), "first_row".to_string());
+        let table_info = pk_table_info(Vec::new(), properties);
+
+        assert!(matches!(
+            validate_pk_table_shape(&table_info),
+            Err(UnionReadError::Planning(_))
+        ));
     }
 }
