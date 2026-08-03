@@ -332,47 +332,40 @@ public class WriterClient {
         writerMetricGroup.close();
 
         if (sender != null) {
-            if (timeoutMs > 0) {
-                // graceful close: stop accepting new records, but keep the sender running to
-                // send out the pending records.
-                sender.initiateClose();
-            } else {
-                // immediate close: abandon all unsent and in-flight requests right away so
-                // that close never blocks (e.g. during Flink task failover/cancellation).
-                sender.forceClose();
-            }
+            sender.initiateClose();
         }
 
         if (ioThreadPool != null) {
             ioThreadPool.shutdown();
 
-            try {
-                if (!ioThreadPool.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)) {
-                    // the graceful close didn't finish within the timeout (or an immediate
-                    // close was requested): abandon the pending requests so that the sender
-                    // thread can exit its drain loop, and interrupt it to break any blocking
-                    // waits.
-                    if (sender != null) {
-                        sender.forceClose();
+            if (timeoutMs > 0) {
+                try {
+                    if (!ioThreadPool.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)) {
+                        LOG.warn("Writer graceful close timed out after {} ms.", timeoutMs);
                     }
-                    ioThreadPool.shutdownNow();
-
-                    if (!ioThreadPool.awaitTermination(
-                            FORCE_CLOSE_TERMINATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                        LOG.error("Failed to shutdown writer.");
-                    }
+                } catch (InterruptedException e) {
+                    LOG.error("Interrupted while waiting for writer sender thread.", e);
+                    Thread.currentThread().interrupt();
                 }
-            } catch (InterruptedException e) {
-                if (sender != null) {
-                    sender.forceClose();
-                }
-                ioThreadPool.shutdownNow();
-                Thread.currentThread().interrupt();
             }
         }
 
-        if (sender != null) {
+        if (sender != null && ioThreadPool != null && !ioThreadPool.isTerminated()) {
+            LOG.info(
+                    "Proceeding to force close the writer since pending requests could not be completed "
+                            + "within timeout {} ms.",
+                    timeoutMs);
             sender.forceClose();
+            ioThreadPool.shutdownNow();
+            try {
+                if (!ioThreadPool.awaitTermination(
+                        FORCE_CLOSE_TERMINATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    LOG.error("Failed to shutdown writer.");
+                }
+            } catch (InterruptedException e) {
+                LOG.error("Interrupted while force closing writer sender thread.", e);
+                Thread.currentThread().interrupt();
+            }
         }
 
         LOG.info("Writer closed.");
