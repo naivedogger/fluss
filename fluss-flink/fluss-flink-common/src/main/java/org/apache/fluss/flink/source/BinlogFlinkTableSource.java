@@ -37,11 +37,7 @@ import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushD
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.table.types.logical.LogicalType;
 
-import javax.annotation.Nullable;
-
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -63,11 +59,8 @@ public class BinlogFlinkTableSource
     private final int splitPerAssignmentBatchSize;
     private final Map<String, String> tableOptions;
 
-    // Projection pushdown. Top-level projection over the binlog row [_change_type, _log_offset,
-    // _commit_timestamp, before, after]; the underlying data scan stays full because before/after
-    // are whole nested ROWs (nested pruning is out of scope).
-    @Nullable private int[] projectedTopLevel;
-    private LogicalType producedDataType;
+    // Projection pushdown.
+    private org.apache.flink.table.types.logical.RowType producedDataType;
 
     public BinlogFlinkTableSource(
             TablePath tablePath,
@@ -161,9 +154,8 @@ public class BinlogFlinkTableSource
                         offsetsInitializer,
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
-                        new BinlogDeserializationSchema(
-                                projectedTopLevel,
-                                (org.apache.flink.table.types.logical.RowType) producedDataType),
+                        new BinlogDeserializationSchema(),
+                        FlinkConversions.toFlussRowType(producedDataType),
                         streaming,
                         // $binlog data/partition columns are nested inside before/after ROWs, so no
                         // top-level partition filter is pushable; always scan without one.
@@ -187,7 +179,6 @@ public class BinlogFlinkTableSource
                         splitPerAssignmentBatchSize,
                         tableOptions);
         copy.producedDataType = producedDataType;
-        copy.projectedTopLevel = projectedTopLevel;
         return copy;
     }
 
@@ -203,12 +194,8 @@ public class BinlogFlinkTableSource
 
     @Override
     public void applyProjection(int[][] projectedFields, DataType producedDataType) {
-        // Top-level projection over [_change_type, _log_offset, _commit_timestamp, before, after].
-        // The data scan stays full (before/after are whole nested ROWs); the deserialization schema
-        // emits only the projected top-level columns.
-        this.projectedTopLevel =
-                Arrays.stream(projectedFields).mapToInt(value -> value[0]).toArray();
-        this.producedDataType = producedDataType.getLogicalType();
+        this.producedDataType =
+                (org.apache.flink.table.types.logical.RowType) producedDataType.getLogicalType();
     }
 
     @Override
@@ -222,13 +209,7 @@ public class BinlogFlinkTableSource
     }
 
     @VisibleForTesting
-    @Nullable
-    int[] getProjectedTopLevel() {
-        return projectedTopLevel;
-    }
-
-    @VisibleForTesting
-    LogicalType getProducedDataType() {
+    org.apache.flink.table.types.logical.RowType getProducedDataType() {
         return producedDataType;
     }
 }

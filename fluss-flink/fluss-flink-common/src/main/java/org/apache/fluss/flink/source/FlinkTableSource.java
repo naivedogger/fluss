@@ -413,6 +413,8 @@ public class FlinkTableSource
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
                         new RowDataDeserializationSchema(),
+                        FlinkConversions.toFlussRowType(
+                                (org.apache.flink.table.types.logical.RowType) producedDataType),
                         streaming,
                         partitionFilters,
                         enableLakeSource ? lakeSource : null,

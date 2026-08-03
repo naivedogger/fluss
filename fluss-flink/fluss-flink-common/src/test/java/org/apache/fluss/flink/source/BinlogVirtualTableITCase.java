@@ -381,9 +381,8 @@ abstract class BinlogVirtualTableITCase {
     @Test
     public void testBinlogReorderedTopLevelProjection() throws Exception {
         // Reordered top-level projection: after before _change_type, i.e. not in the declared
-        // order of the binlog row. This exercises the projectedTopLevel handling
-        // (applyProjection -> BinlogRowConverter/ProjectedRowData) end to end through the real
-        // planner, which no ascending-order projection test covers.
+        // order of the binlog row. This exercises FlinkSource output projection end to end through
+        // the real planner, which no ascending-order projection test covers.
         tEnv.executeSql(
                 "CREATE TABLE binlog_reordered_projection_test ("
                         + "  id INT NOT NULL,"

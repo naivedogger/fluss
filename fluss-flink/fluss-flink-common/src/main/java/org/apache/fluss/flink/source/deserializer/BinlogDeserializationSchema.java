@@ -27,6 +27,8 @@ import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 
 import javax.annotation.Nullable;
 
+import static org.apache.fluss.flink.utils.FlinkConversions.toFlinkRowType;
+
 /**
  * A deserialization schema that converts {@link LogRecord} objects to Flink's {@link RowData}
  * format with nested before/after row structure for the $binlog virtual table.
@@ -44,33 +46,14 @@ public class BinlogDeserializationSchema implements FlussDeserializationSchema<R
      */
     private transient BinlogRowConverter converter;
 
-    /**
-     * Optional top-level projection over the binlog row {@code [_change_type, _log_offset,
-     * _commit_timestamp, before, after]}, or {@code null} for no projection.
-     */
-    @Nullable private final int[] projectedTopLevel;
-
-    /** The produced row type, already computed by the table source honoring the projection. */
-    private final org.apache.flink.table.types.logical.RowType producedRowType;
-
-    /**
-     * Creates a new BinlogDeserializationSchema.
-     *
-     * @param projectedTopLevel top-level projection over the binlog row, or {@code null} for none
-     * @param producedRowType the produced row type computed by the table source
-     */
-    public BinlogDeserializationSchema(
-            @Nullable int[] projectedTopLevel,
-            org.apache.flink.table.types.logical.RowType producedRowType) {
-        this.projectedTopLevel = projectedTopLevel;
-        this.producedRowType = producedRowType;
-    }
+    /** Creates a new BinlogDeserializationSchema. */
+    public BinlogDeserializationSchema() {}
 
     /** Initializes the deserialization schema. */
     @Override
     public void open(InitializationContext context) throws Exception {
         if (converter == null) {
-            this.converter = new BinlogRowConverter(context.getRowSchema(), projectedTopLevel);
+            this.converter = new BinlogRowConverter(context.getRowSchema());
         }
     }
 
@@ -94,8 +77,12 @@ public class BinlogDeserializationSchema implements FlussDeserializationSchema<R
      */
     @Override
     public TypeInformation<RowData> getProducedType(RowType rowSchema) {
-        // The produced type has already been computed by the table source (handed over by the
-        // Flink planner via applyProjection); no need to derive it again here.
-        return InternalTypeInfo.of(producedRowType);
+        return InternalTypeInfo.of(
+                BinlogRowConverter.buildBinlogRowType(toFlinkRowType(rowSchema)));
+    }
+
+    @Override
+    public TypeInformation<RowData> getProducedType(RowType scanRowType, RowType expectRowSchema) {
+        return InternalTypeInfo.of(toFlinkRowType(expectRowSchema));
     }
 }

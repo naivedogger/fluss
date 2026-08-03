@@ -25,7 +25,7 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 
-import javax.annotation.Nullable;
+import static org.apache.fluss.flink.utils.FlinkConversions.toFlinkRowType;
 
 /**
  * A deserialization schema that converts {@link LogRecord} objects to Flink's {@link RowData}
@@ -39,33 +39,14 @@ public class ChangelogDeserializationSchema implements FlussDeserializationSchem
      */
     private transient ChangelogRowConverter converter;
 
-    /**
-     * Optional projection over the base changelog row {@code [_change_type, _log_offset,
-     * _commit_timestamp, <scanned data columns>]}, or {@code null} for no projection.
-     */
-    @Nullable private final int[] baseRowProjection;
-
-    /** The produced row type, already computed by the table source honoring the projection. */
-    private final org.apache.flink.table.types.logical.RowType producedRowType;
-
-    /**
-     * Creates a new ChangelogDeserializationSchema.
-     *
-     * @param baseRowProjection projection over the base changelog row, or {@code null} for none
-     * @param producedRowType the produced row type computed by the table source
-     */
-    public ChangelogDeserializationSchema(
-            @Nullable int[] baseRowProjection,
-            org.apache.flink.table.types.logical.RowType producedRowType) {
-        this.baseRowProjection = baseRowProjection;
-        this.producedRowType = producedRowType;
-    }
+    /** Creates a new ChangelogDeserializationSchema. */
+    public ChangelogDeserializationSchema() {}
 
     /** Initializes the deserialization schema. */
     @Override
     public void open(InitializationContext context) throws Exception {
         if (converter == null) {
-            this.converter = new ChangelogRowConverter(context.getRowSchema(), baseRowProjection);
+            this.converter = new ChangelogRowConverter(context.getRowSchema());
         }
     }
 
@@ -86,8 +67,12 @@ public class ChangelogDeserializationSchema implements FlussDeserializationSchem
      */
     @Override
     public TypeInformation<RowData> getProducedType(RowType rowSchema) {
-        // The produced type has already been computed by the table source (handed over by the
-        // Flink planner via applyProjection); no need to derive it again here.
-        return InternalTypeInfo.of(producedRowType);
+        return InternalTypeInfo.of(
+                ChangelogRowConverter.buildChangelogRowType(toFlinkRowType(rowSchema)));
+    }
+
+    @Override
+    public TypeInformation<RowData> getProducedType(RowType scanRowType, RowType expectRowSchema) {
+        return InternalTypeInfo.of(toFlinkRowType(expectRowSchema));
     }
 }

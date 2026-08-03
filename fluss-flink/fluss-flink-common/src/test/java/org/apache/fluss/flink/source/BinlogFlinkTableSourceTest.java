@@ -89,12 +89,11 @@ class BinlogFlinkTableSourceTest {
     }
 
     @Test
-    void testApplyProjectionStoresTopLevel() {
+    void testApplyProjectionStoresProducedType() {
         BinlogFlinkTableSource source = createSource();
         // virtual [_change_type(0), after(4)]
         source.applyProjection(nested(0, 4), projectedType(0, 4));
 
-        assertThat(source.getProjectedTopLevel()).containsExactly(0, 4);
         assertThat(source.getProducedDataType()).isEqualTo(projectedType(0, 4).getLogicalType());
     }
 
@@ -104,7 +103,6 @@ class BinlogFlinkTableSourceTest {
         source.applyProjection(nested(3, 4), projectedType(3, 4));
 
         BinlogFlinkTableSource copy = (BinlogFlinkTableSource) source.copy();
-        assertThat(copy.getProjectedTopLevel()).containsExactly(3, 4);
         assertThat(copy.getProducedDataType()).isEqualTo(source.getProducedDataType());
     }
 

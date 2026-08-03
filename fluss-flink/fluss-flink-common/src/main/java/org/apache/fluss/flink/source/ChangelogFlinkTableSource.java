@@ -45,7 +45,6 @@ import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushD
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.table.types.logical.LogicalType;
 
 import javax.annotation.Nullable;
 
@@ -81,11 +80,9 @@ public class ChangelogFlinkTableSource
 
     // Projection pushdown
     @Nullable private int[] projectedFields;
-    private LogicalType producedDataType;
+    private org.apache.flink.table.types.logical.RowType producedDataType;
     // Data-column indices actually scanned from Fluss (derived from the virtual projection).
     @Nullable private int[] dataProjection;
-    // Projection over the base changelog row [metadata columns + scanned data columns].
-    @Nullable private int[] baseRowProjection;
 
     @Nullable private Predicate partitionFilters;
     // Filter over the scanned data columns pushed to the Fluss log scan (statistics-based).
@@ -217,9 +214,8 @@ public class ChangelogFlinkTableSource
                         offsetsInitializer,
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
-                        new ChangelogDeserializationSchema(
-                                baseRowProjection,
-                                (org.apache.flink.table.types.logical.RowType) producedDataType),
+                        new ChangelogDeserializationSchema(),
+                        FlinkConversions.toFlussRowType(producedDataType),
                         streaming,
                         partitionFilters,
                         LeaseContext.DEFAULT); // Lake source not supported
@@ -243,7 +239,6 @@ public class ChangelogFlinkTableSource
         copy.producedDataType = producedDataType;
         copy.projectedFields = projectedFields;
         copy.dataProjection = dataProjection;
-        copy.baseRowProjection = baseRowProjection;
         copy.partitionFilters = partitionFilters;
         copy.logRecordBatchFilter = logRecordBatchFilter;
         return copy;
@@ -262,10 +257,10 @@ public class ChangelogFlinkTableSource
     @Override
     public void applyProjection(int[][] projectedFields, DataType producedDataType) {
         this.projectedFields = Arrays.stream(projectedFields).mapToInt(value -> value[0]).toArray();
-        this.producedDataType = producedDataType.getLogicalType();
+        this.producedDataType =
+                (org.apache.flink.table.types.logical.RowType) producedDataType.getLogicalType();
 
-        // Derive the data-column indices actually scanned from Fluss (first-appearance order),
-        // and the projection over the base changelog row [metadata columns + scanned data columns].
+        // Derive the data-column indices actually scanned from Fluss (first-appearance order).
         Map<Integer, Integer> dataColumnPositions = new LinkedHashMap<>();
         for (int virtualIndex : this.projectedFields) {
             if (virtualIndex >= METADATA_COLUMN_COUNT) {
@@ -277,24 +272,13 @@ public class ChangelogFlinkTableSource
         // When no data column is projected (metadata-only projection, e.g. SELECT _change_type),
         // normalize the scan projection to null so Fluss reads the full data row. A zero-column
         // scan produces no records, so the metadata columns must be emitted from a full data scan
-        // and selected later during deserialization via baseRowProjection.
+        // and selected later by FlinkSource's output projection.
         this.dataProjection =
                 dataColumnPositions.isEmpty()
                         ? null
                         : dataColumnPositions.keySet().stream()
                                 .mapToInt(Integer::intValue)
                                 .toArray();
-
-        int[] base = new int[this.projectedFields.length];
-        for (int i = 0; i < this.projectedFields.length; i++) {
-            int virtualIndex = this.projectedFields[i];
-            base[i] =
-                    virtualIndex < METADATA_COLUMN_COUNT
-                            ? virtualIndex
-                            : METADATA_COLUMN_COUNT
-                                    + dataColumnPositions.get(virtualIndex - METADATA_COLUMN_COUNT);
-        }
-        this.baseRowProjection = base;
     }
 
     @Override
@@ -406,13 +390,7 @@ public class ChangelogFlinkTableSource
     }
 
     @VisibleForTesting
-    @Nullable
-    int[] getBaseRowProjection() {
-        return baseRowProjection;
-    }
-
-    @VisibleForTesting
-    LogicalType getProducedDataType() {
+    org.apache.flink.table.types.logical.RowType getProducedDataType() {
         return producedDataType;
     }
 

@@ -116,11 +116,7 @@ class ChangelogFlinkTableSourceTest {
 
     @ParameterizedTest
     @MethodSource("projectionCases")
-    void testApplyProjection(
-            String description,
-            int[] virtual,
-            int[] expectedDataProjection,
-            int[] expectedBaseProjection) {
+    void testApplyProjection(String description, int[] virtual, int[] expectedDataProjection) {
         ChangelogFlinkTableSource source = createSource(new int[0]);
         source.applyProjection(nested(virtual), projectedType(virtual));
 
@@ -133,23 +129,18 @@ class ChangelogFlinkTableSourceTest {
             assertThat(source.getDataProjection()).containsExactly(expectedDataProjection);
         }
 
-        assertThat(source.getBaseRowProjection()).containsExactly(expectedBaseProjection);
         assertThat(source.getProducedDataType()).isEqualTo(projectedType(virtual).getLogicalType());
     }
 
     private static Stream<Arguments> projectionCases() {
         return Stream.of(
-                // description, virtual, expectedDataProjection, expectedBaseProjection
+                // description, virtual, expectedDataProjection
                 // metadata only
-                Arguments.of("metadata-only", new int[] {0}, null, new int[] {0}),
+                Arguments.of("metadata-only", new int[] {0}, null),
                 // data only
-                Arguments.of("data-only", new int[] {3, 5}, new int[] {0, 2}, new int[] {3, 4}),
+                Arguments.of("data-only", new int[] {3, 5}, new int[] {0, 2}),
                 // reordered mix
-                Arguments.of(
-                        "reorderedMix",
-                        new int[] {0, 5, 3},
-                        new int[] {2, 0},
-                        new int[] {0, 3, 4}));
+                Arguments.of("reorderedMix", new int[] {0, 5, 3}, new int[] {2, 0}));
     }
 
     @Test
@@ -161,7 +152,6 @@ class ChangelogFlinkTableSourceTest {
         ChangelogFlinkTableSource copy = (ChangelogFlinkTableSource) source.copy();
         assertThat(copy.getProjectedFields()).containsExactly(0, 3);
         assertThat(copy.getDataProjection()).containsExactly(0);
-        assertThat(copy.getBaseRowProjection()).containsExactly(0, 3);
         assertThat(copy.getProducedDataType()).isEqualTo(source.getProducedDataType());
         assertThat(copy.getLogRecordBatchFilter()).isEqualTo(source.getLogRecordBatchFilter());
     }

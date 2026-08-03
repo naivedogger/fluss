@@ -347,8 +347,8 @@ abstract class ChangelogVirtualTableITCase {
     @Test
     public void testReorderedProjectionOnChangelogTable() throws Exception {
         // Reordered projection: data columns out of their original order with a metadata column
-        // in between. This exercises the dataProjection/baseRowProjection coordinate translation
-        // (applyProjection -> ChangelogRowConverter) end to end through the real planner.
+        // in between. This exercises data projection plus FlinkSource output projection end to end
+        // through the real planner.
         tEnv.executeSql(
                 "CREATE TABLE reordered_projection_test ("
                         + "  id INT NOT NULL,"
