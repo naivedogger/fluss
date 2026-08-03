@@ -67,6 +67,7 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.KvTabletTestUtils;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.log.FetchParams;
@@ -1339,6 +1340,10 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 PUT_KV_VERSION,
                 future::complete);
         assertThat(future.get()).containsOnly(new PutKvResultForBucket(tb, 4));
+
+        // flush the pre-write buffer to RocksDB so that prefix lookup can see the records
+        KvTabletTestUtils.flushAndWait(
+                replicaManager.getReplicaOrException(tb).getKvTablet(), Long.MAX_VALUE);
 
         // second prefix lookup in table, prefix key = (1, "a").
         Object[] prefixKey1 = new Object[] {1, "a"};
