@@ -28,7 +28,7 @@ keywords = { workspace = true }
 categories = { workspace = true }
 
 [features]
-integration_tests = []
+integration_tests = ["fluss/integration_tests"]
 # Paimon lake reading. Pinned to a compatibility branch of paimon-rust
 # main (contains apache/paimon-rust#374, required for PK dedup semantics)
 # upgraded to arrow 59 with ORC/mosaic reads feature-gated off; see

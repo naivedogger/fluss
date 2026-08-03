@@ -392,6 +392,12 @@ impl FlussTestingClusterBuilder {
         }
 
         coordinator_confs.insert("internal.listener.name", "INTERNAL".to_string());
+        if let Some(remote_data_dir) = &self.remote_data_dir {
+            coordinator_confs.insert(
+                "remote.data.dir",
+                remote_data_dir.to_string_lossy().to_string(),
+            );
+        }
 
         let mut image = GenericImage::new(&self.image, &self.image_tag)
             .with_container_name(self.coordinator_server_container_name())
@@ -402,6 +408,15 @@ impl FlussTestingClusterBuilder {
                 "FLUSS_PROPERTIES",
                 self.to_fluss_properties_with(coordinator_confs),
             );
+
+        if let Some(ref remote_data_dir) = self.remote_data_dir {
+            use testcontainers::core::Mount;
+            std::fs::create_dir_all(remote_data_dir)
+                .expect("Failed to create remote data directory for mount");
+            let host_path = remote_data_dir.to_string_lossy().to_string();
+            let container_path = remote_data_dir.to_string_lossy().to_string();
+            image = image.with_mount(Mount::bind_mount(host_path, container_path));
+        }
 
         if let Some(plain_port) = self.plain_client_port {
             image = image.with_mapped_port(plain_port, ContainerPort::Tcp(plain_port));
