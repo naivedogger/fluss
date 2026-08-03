@@ -648,6 +648,18 @@ impl FlussAdmin {
         Ok(LakeSnapshotInfo::from_pb(&response))
     }
 
+    /// Get the latest lake snapshot that is safe to use as a UnionRead base.
+    ///
+    /// The returned bucket offsets correspond to the readable snapshot rather
+    /// than necessarily to the absolute latest tiered snapshot. This distinction
+    /// avoids skipping data that has reached an unreadable lake layer.
+    pub async fn get_readable_lake_snapshot(
+        &self,
+        table_path: &TablePath,
+    ) -> Result<LakeSnapshotInfo> {
+        self.get_lake_snapshot(table_path, None, Some(true)).await
+    }
+
     /// Create ACLs. Returns one result per submitted ACL (success or per-ACL error).
     pub async fn create_acls(&self, acls: Vec<AclInfo>) -> Result<Vec<CreateAclResult>> {
         let response = self
