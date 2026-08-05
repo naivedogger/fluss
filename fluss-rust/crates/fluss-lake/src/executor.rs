@@ -16,12 +16,13 @@
 // under the License.
 
 use crate::pk_overlay::{PkOverlay, merged_stream};
-use crate::task::{
-    AppendLogTaskDescriptor, LakeSplitTaskDescriptor, PkHybridTaskDescriptor, TaskDescriptor,
+use crate::split_descriptor::{
+    AppendLogSplitDescriptor, LakeSplitDescriptor, PkHybridSplitDescriptor, SplitDescriptor,
 };
+use crate::union_read::FlussLakeExecutor;
 use crate::{
-    SendableRecordBatchStream, UnionReadError, UnionReadExecutionContext, UnionReadExecutor,
-    UnionReadResult, UnionReadTask,
+    FlussLakeError, FlussLakeExecutionContext, FlussLakeReadSplit, FlussLakeRecordBatchStream,
+    FlussLakeResult,
 };
 use arrow::record_batch::RecordBatch;
 use fluss::client::{FlussConnection, FlussTable, RecordBatchLogReader};
@@ -40,22 +41,22 @@ use std::time::{Duration, Instant};
 /// real deadline is the context idle timeout, not this interval.
 const TAIL_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Default Fluss-Rust executor for opaque UnionRead tasks.
+/// Default Fluss-Rust executor for opaque UnionRead splits.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FlussUnionReadExecutor;
+pub(crate) struct FlussUnionReadExecutor;
 
-impl UnionReadExecutor for FlussUnionReadExecutor {
+impl FlussLakeExecutor for FlussUnionReadExecutor {
     fn execute(
         &self,
-        task: UnionReadTask,
-        context: UnionReadExecutionContext,
-    ) -> UnionReadResult<SendableRecordBatchStream> {
+        split: FlussLakeReadSplit,
+        context: FlussLakeExecutionContext,
+    ) -> FlussLakeResult<FlussLakeRecordBatchStream> {
         // Structural validation fails fast; environment work is deferred to
         // the first poll of the returned stream.
-        match TaskDescriptor::decode(task.execution_descriptor())? {
-            TaskDescriptor::AppendLog(descriptor) => execute_append_log(descriptor, context),
-            TaskDescriptor::LakeSplit(descriptor) => execute_lake_split(descriptor, context),
-            TaskDescriptor::PkHybrid(descriptor) => execute_pk_hybrid(descriptor, context),
+        match SplitDescriptor::decode(split.execution_descriptor())? {
+            SplitDescriptor::AppendLog(descriptor) => execute_append_log(descriptor, context),
+            SplitDescriptor::LakeSplit(descriptor) => execute_lake_split(descriptor, context),
+            SplitDescriptor::PkHybrid(descriptor) => execute_pk_hybrid(descriptor, context),
         }
     }
 }
@@ -67,18 +68,18 @@ impl UnionReadExecutor for FlussUnionReadExecutor {
 /// it. The fold enforces its own idle-progress deadline, so wrapping the
 /// returned stream again would charge the same budget twice.
 fn execute_pk_hybrid(
-    descriptor: PkHybridTaskDescriptor,
-    context: UnionReadExecutionContext,
-) -> UnionReadResult<SendableRecordBatchStream> {
+    descriptor: PkHybridSplitDescriptor,
+    context: FlussLakeExecutionContext,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     if descriptor.is_empty() {
         return Ok(Box::pin(futures::stream::empty::<
-            UnionReadResult<RecordBatch>,
+            FlussLakeResult<RecordBatch>,
         >()));
     }
 
     let connection = context.fluss_connection().cloned().ok_or_else(|| {
-        UnionReadError::Execution(
-            "pk-hybrid task requires a Fluss connection in the execution context".to_string(),
+        FlussLakeError::Execution(
+            "pk-hybrid split requires a Fluss connection in the execution context".to_string(),
         )
     })?;
     Ok(lazy_stream(open_pk_hybrid_stream(
@@ -88,9 +89,9 @@ fn execute_pk_hybrid(
 
 async fn open_pk_hybrid_stream(
     connection: Arc<FlussConnection>,
-    descriptor: PkHybridTaskDescriptor,
-    context: UnionReadExecutionContext,
-) -> UnionReadResult<SendableRecordBatchStream> {
+    descriptor: PkHybridSplitDescriptor,
+    context: FlussLakeExecutionContext,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     let table = connection
         .get_table(descriptor.table_path())
         .await
@@ -102,8 +103,8 @@ async fn open_pk_hybrid_stream(
         descriptor.schema_id(),
     )?;
     if !table.has_primary_key() {
-        return Err(UnionReadError::InvalidTask(format!(
-            "pk-hybrid task cannot execute against non-primary-key table {}",
+        return Err(FlussLakeError::InvalidSplit(format!(
+            "pk-hybrid split cannot execute against non-primary-key table {}",
             descriptor.table_path()
         )));
     }
@@ -136,25 +137,25 @@ async fn open_pk_hybrid_stream(
     ))
 }
 
-/// Opens the lake half of a primary-key task.
+/// Opens the lake half of a primary-key split.
 ///
 /// All of the bucket's splits go through a single Paimon reader: since
 /// apache/paimon-rust#374 that is what guarantees each key appears exactly
 /// once on the lake side, which the overlay presumes.
 #[cfg(feature = "paimon")]
 async fn open_pk_lake_stream(
-    descriptor: &PkHybridTaskDescriptor,
-    context: &UnionReadExecutionContext,
+    descriptor: &PkHybridSplitDescriptor,
+    context: &FlussLakeExecutionContext,
     row_type: &RowType,
     physical: &PhysicalPkProjection,
     idle_timeout: Duration,
-) -> UnionReadResult<SendableRecordBatchStream> {
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     if descriptor.lake_splits().is_empty() {
         return Ok(Box::pin(futures::stream::empty()));
     }
     let snapshot_id = descriptor.snapshot_id().ok_or_else(|| {
-        UnionReadError::InvalidTask(format!(
-            "pk-hybrid task for {} carries lake splits without a pinned snapshot id",
+        FlussLakeError::InvalidSplit(format!(
+            "pk-hybrid split for {} carries lake splits without a pinned snapshot id",
             descriptor.table_path()
         ))
     })?;
@@ -187,22 +188,22 @@ async fn open_pk_lake_stream(
 
 #[cfg(not(feature = "paimon"))]
 async fn open_pk_lake_stream(
-    descriptor: &PkHybridTaskDescriptor,
-    _context: &UnionReadExecutionContext,
+    descriptor: &PkHybridSplitDescriptor,
+    _context: &FlussLakeExecutionContext,
     _row_type: &RowType,
     _physical: &PhysicalPkProjection,
     _idle_timeout: Duration,
-) -> UnionReadResult<SendableRecordBatchStream> {
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     if descriptor.lake_splits().is_empty() {
         return Ok(Box::pin(futures::stream::empty()));
     }
-    Err(UnionReadError::Execution(format!(
-        "pk-hybrid task for {} carries lake splits, but this build has no lake format feature enabled",
+    Err(FlussLakeError::Execution(format!(
+        "pk-hybrid split for {} carries lake splits, but this build has no lake format feature enabled",
         descriptor.table_path()
     )))
 }
 
-/// Folds the task's bounded changelog range into the overlay.
+/// Folds the split's bounded changelog range into the overlay.
 ///
 /// The tail is read row-wise on purpose: the Arrow batch path drops change
 /// types, and without them a delete is indistinguishable from an insert. The
@@ -211,11 +212,11 @@ async fn open_pk_lake_stream(
 /// operational failure rather than a reason to wait forever.
 async fn fold_changelog_tail(
     table: &FlussTable<'_>,
-    descriptor: &PkHybridTaskDescriptor,
+    descriptor: &PkHybridSplitDescriptor,
     physical: &PhysicalPkProjection,
     overlay: &mut PkOverlay,
-    context: &UnionReadExecutionContext,
-) -> UnionReadResult<()> {
+    context: &FlussLakeExecutionContext,
+) -> FlussLakeResult<()> {
     if descriptor.start_offset() == descriptor.stop_offset() {
         return Ok(());
     }
@@ -253,7 +254,7 @@ async fn fold_changelog_tail(
         let bucket_records = records.records(&table_bucket);
         if bucket_records.is_empty() {
             if last_progress.elapsed() > idle_timeout {
-                return Err(UnionReadError::Execution(format!(
+                return Err(FlussLakeError::Execution(format!(
                     "changelog tail of {table_bucket} made no progress within the {idle_timeout:?} idle timeout at offset {next_offset} of the frozen range [{}, {}); the stop offset existed at plan time, so a stalled fetch is an operational failure",
                     descriptor.start_offset(),
                     descriptor.stop_offset()
@@ -284,7 +285,7 @@ fn fold_tail_records(
     next_offset: i64,
     stop_offset: i64,
     overlay: &mut PkOverlay,
-) -> UnionReadResult<i64> {
+) -> FlussLakeResult<i64> {
     let mut next_offset = next_offset;
     // Records of one poll arrive grouped by their backing Arrow batch, so
     // runs are detected by batch identity (address comparison only — the
@@ -300,7 +301,7 @@ fn fold_tail_records(
         }
         let row = record.row();
         let batch = row.get_record_batch().ok_or_else(|| {
-            UnionReadError::Execution(
+            FlussLakeError::Execution(
                 "changelog record has no backing Arrow batch; the ARROW log format is required to merge a primary-key table"
                     .to_string(),
             )
@@ -334,7 +335,7 @@ fn flush_tail_run(
     run_rows: &mut Vec<usize>,
     run_change_types: &mut Vec<ChangeType>,
     overlay: &mut PkOverlay,
-) -> UnionReadResult<()> {
+) -> FlussLakeResult<()> {
     let Some(batch) = run_batch.take() else {
         return Ok(());
     };
@@ -350,7 +351,7 @@ fn flush_tail_run(
     Ok(())
 }
 
-fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> UnionReadResult<RecordBatch> {
+fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> FlussLakeResult<RecordBatch> {
     // The common case is a run covering the whole batch in order, which needs
     // no copy at all.
     if row_indexes.len() == batch.num_rows()
@@ -363,11 +364,11 @@ fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> UnionReadResult<Reco
     }
     let indices: Vec<(usize, usize)> = row_indexes.iter().map(|row| (0, *row)).collect();
     arrow::compute::interleave_record_batch(&[batch], &indices).map_err(|error| {
-        UnionReadError::Execution(format!("failed to select changelog tail rows: {error}"))
+        FlussLakeError::Execution(format!("failed to select changelog tail rows: {error}"))
     })
 }
 
-/// The physical read of a primary-key task, widened to carry its key columns.
+/// The physical read of a primary-key split, widened to carry its key columns.
 ///
 /// The engine's requested columns come first and the missing key columns are
 /// appended, so the engine-visible output is exactly the leading prefix and
@@ -383,11 +384,11 @@ impl PhysicalPkProjection {
         row_type: &RowType,
         output_projection: Option<&[usize]>,
         pk_indexes: &[usize],
-    ) -> UnionReadResult<Self> {
+    ) -> FlussLakeResult<Self> {
         let field_count = row_type.fields().len();
         for pk_index in pk_indexes {
             if *pk_index >= field_count {
-                return Err(UnionReadError::InvalidTask(format!(
+                return Err(FlussLakeError::InvalidSplit(format!(
                     "primary-key field index {pk_index} exceeds the resolved table width {field_count}"
                 )));
             }
@@ -420,9 +421,9 @@ impl PhysicalPkProjection {
         })
     }
 
-    fn arrow_schema(&self, row_type: &RowType) -> UnionReadResult<arrow::datatypes::SchemaRef> {
+    fn arrow_schema(&self, row_type: &RowType) -> FlussLakeResult<arrow::datatypes::SchemaRef> {
         let schema = fluss::record::to_arrow_schema(row_type).map_err(|error| {
-            UnionReadError::Execution(format!(
+            FlussLakeError::Execution(format!(
                 "failed to convert the read schema to Arrow: {error}"
             ))
         })?;
@@ -430,14 +431,14 @@ impl PhysicalPkProjection {
             .project(&self.field_indexes)
             .map(Arc::new)
             .map_err(|error| {
-                UnionReadError::Execution(format!(
+                FlussLakeError::Execution(format!(
                     "failed to project the physical primary-key read schema: {error}"
                 ))
             })
     }
 }
 
-/// Rejects a task whose frozen identity no longer matches the live table.
+/// Rejects a split whose frozen identity no longer matches the live table.
 ///
 /// The schema is frozen at plan time, so executing against a drifted schema
 /// would silently reinterpret data.
@@ -446,18 +447,18 @@ fn validate_frozen_identity(
     table_path: &fluss::metadata::TablePath,
     table_bucket: &TableBucket,
     schema_id: i32,
-) -> UnionReadResult<()> {
+) -> FlussLakeResult<()> {
     let table_info = table.get_table_info();
     if table_info.table_id != table_bucket.table_id() {
-        return Err(UnionReadError::Execution(format!(
-            "task table id {} no longer matches resolved table id {} for {table_path}",
+        return Err(FlussLakeError::Execution(format!(
+            "split table id {} no longer matches resolved table id {} for {table_path}",
             table_bucket.table_id(),
             table_info.table_id
         )));
     }
     if table_info.schema_id != schema_id {
-        return Err(UnionReadError::Execution(format!(
-            "task schema id {schema_id} no longer matches current schema id {} for {table_path}; execution against a historical schema is not implemented",
+        return Err(FlussLakeError::Execution(format!(
+            "split schema id {schema_id} no longer matches current schema id {} for {table_path}; execution against a historical schema is not implemented",
             table_info.schema_id
         )));
     }
@@ -468,14 +469,14 @@ fn validate_frozen_identity(
 ///
 /// Setup failures surface as the first (and only) stream item instead of
 /// failing the `execute` call, keeping `execute` synchronous and lazy.
-fn lazy_stream<F>(setup: F) -> SendableRecordBatchStream
+fn lazy_stream<F>(setup: F) -> FlussLakeRecordBatchStream
 where
-    F: Future<Output = UnionReadResult<SendableRecordBatchStream>> + Send + 'static,
+    F: Future<Output = FlussLakeResult<FlussLakeRecordBatchStream>> + Send + 'static,
 {
     Box::pin(futures::stream::once(setup).try_flatten())
 }
 
-/// Enforces the bounded-read termination contract on a task stream.
+/// Enforces the bounded-read termination contract on a split stream.
 ///
 /// A bounded read has exactly two exits: reaching its frozen stop boundary,
 /// or a typed error. The timeout bounds the wait for the *next* item and
@@ -483,9 +484,9 @@ where
 /// instead of an infinite wait — and never a silent partial result. Requires
 /// a Tokio runtime when polled, which the Fluss client needs anyway.
 fn with_idle_timeout(
-    stream: SendableRecordBatchStream,
+    stream: FlussLakeRecordBatchStream,
     idle_timeout: Duration,
-) -> SendableRecordBatchStream {
+) -> FlussLakeRecordBatchStream {
     Box::pin(futures::stream::try_unfold(
         stream,
         move |mut stream| async move {
@@ -493,7 +494,7 @@ fn with_idle_timeout(
                 Ok(Some(Ok(batch))) => Ok(Some((batch, stream))),
                 Ok(Some(Err(error))) => Err(error),
                 Ok(None) => Ok(None),
-                Err(_) => Err(UnionReadError::Execution(format!(
+                Err(_) => Err(FlussLakeError::Execution(format!(
                     "bounded read made no progress within the {idle_timeout:?} idle timeout; the frozen stop boundary existed at plan time, so a stalled fetch is an operational failure rather than a reason to wait forever"
                 ))),
             }
@@ -503,19 +504,19 @@ fn with_idle_timeout(
 
 /// Reads one frozen lake split.
 ///
-/// Lake splits are decodable in every build so that a task planned elsewhere
+/// Lake splits are decodable in every build so that a split planned elsewhere
 /// reports a clear error here instead of failing to parse. Reading requires the
 /// matching lake format feature to be compiled in.
 #[cfg(feature = "paimon")]
 fn execute_lake_split(
-    descriptor: LakeSplitTaskDescriptor,
-    context: UnionReadExecutionContext,
-) -> UnionReadResult<SendableRecordBatchStream> {
+    descriptor: LakeSplitDescriptor,
+    context: FlussLakeExecutionContext,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     let idle_timeout = context.idle_timeout();
     Ok(with_idle_timeout(
         lazy_stream(async move {
-            // The task carries only non-sensitive options; secrets arrive through
-            // the execution context and override any task-carried value.
+            // The split carries only non-sensitive options; secrets arrive through
+            // the execution context and override any split-carried value.
             let catalog_options = crate::paimon::PaimonCatalogOptions::from_map(
                 descriptor
                     .catalog_options()
@@ -539,30 +540,30 @@ fn execute_lake_split(
 
 #[cfg(not(feature = "paimon"))]
 fn execute_lake_split(
-    descriptor: LakeSplitTaskDescriptor,
-    _context: UnionReadExecutionContext,
-) -> UnionReadResult<SendableRecordBatchStream> {
-    Err(UnionReadError::Execution(format!(
-        "lake split task for {} cannot be executed: this build has no lake format feature enabled",
+    descriptor: LakeSplitDescriptor,
+    _context: FlussLakeExecutionContext,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
+    Err(FlussLakeError::Execution(format!(
+        "lake split for {} cannot be executed: this build has no lake format feature enabled",
         descriptor.table_path()
     )))
 }
 
 fn execute_append_log(
-    descriptor: AppendLogTaskDescriptor,
-    context: UnionReadExecutionContext,
-) -> UnionReadResult<SendableRecordBatchStream> {
+    descriptor: AppendLogSplitDescriptor,
+    context: FlussLakeExecutionContext,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     if descriptor.is_empty() {
         return Ok(Box::pin(futures::stream::empty::<
-            UnionReadResult<RecordBatch>,
+            FlussLakeResult<RecordBatch>,
         >()));
     }
 
     // A missing connection is a context-shape problem, not an environment
     // failure, so it still fails fast.
     let connection = context.fluss_connection().cloned().ok_or_else(|| {
-        UnionReadError::Execution(
-            "append-log task requires a Fluss connection in the execution context".to_string(),
+        FlussLakeError::Execution(
+            "append-log split requires a Fluss connection in the execution context".to_string(),
         )
     })?;
     Ok(with_idle_timeout(
@@ -573,8 +574,8 @@ fn execute_append_log(
 
 async fn open_append_log_stream(
     connection: Arc<FlussConnection>,
-    descriptor: AppendLogTaskDescriptor,
-) -> UnionReadResult<SendableRecordBatchStream> {
+    descriptor: AppendLogSplitDescriptor,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     let table = connection
         .get_table(descriptor.table_path())
         .await
@@ -586,8 +587,8 @@ async fn open_append_log_stream(
         descriptor.schema_id(),
     )?;
     if table.has_primary_key() {
-        return Err(UnionReadError::InvalidTask(format!(
-            "append-log task cannot execute against primary-key table {}",
+        return Err(FlussLakeError::InvalidSplit(format!(
+            "append-log split cannot execute against primary-key table {}",
             descriptor.table_path()
         )));
     }
@@ -628,27 +629,27 @@ async fn open_append_log_stream(
     let stream = reader.into_stream().map(|result| {
         result
             .map(|scan_batch| scan_batch.into_batch())
-            .map_err(|error| execution_client_error("read bounded append-log task", error))
+            .map_err(|error| execution_client_error("read bounded append-log split", error))
     });
     Ok(Box::pin(stream))
 }
 
-fn execution_client_error(action: &str, error: ClientError) -> UnionReadError {
-    UnionReadError::Execution(format!("failed to {action}: {error}"))
+fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    FlussLakeError::Execution(format!("failed to {action}: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::TaskDescriptor;
-    use crate::{CURRENT_UNION_READ_TASK_VERSION, UnionReadStatistics};
+    use crate::split_descriptor::SplitDescriptor;
+    use crate::{CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeReadStatistics};
     use fluss::metadata::{TableBucket, TablePath};
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn append_log_task(start_offset: i64, stop_offset: i64) -> UnionReadTask {
-        let descriptor = TaskDescriptor::AppendLog(
-            AppendLogTaskDescriptor::try_new(
+    fn append_log_split(start_offset: i64, stop_offset: i64) -> FlussLakeReadSplit {
+        let descriptor = SplitDescriptor::AppendLog(
+            AppendLogSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 1,
                 TableBucket::new(5, 0),
@@ -658,22 +659,22 @@ mod tests {
             )
             .unwrap(),
         );
-        UnionReadTask::try_new(
+        FlussLakeReadSplit::try_new(
             "append-log/5/root/0".to_string(),
-            CURRENT_UNION_READ_TASK_VERSION,
+            CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor.encode().unwrap(),
-            UnionReadStatistics::default(),
+            FlussLakeReadStatistics::default(),
         )
         .unwrap()
     }
 
     #[test]
-    fn empty_append_log_task_finishes_without_runtime_connection() {
+    fn empty_append_log_split_finishes_without_runtime_connection() {
         let executor = FlussUnionReadExecutor;
         let mut stream = executor
             .execute(
-                append_log_task(10, 10),
-                UnionReadExecutionContext::default(),
+                append_log_split(10, 10),
+                FlussLakeExecutionContext::default(),
             )
             .unwrap();
 
@@ -681,25 +682,25 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_append_log_task_requires_runtime_connection() {
+    fn non_empty_append_log_split_requires_runtime_connection() {
         let executor = FlussUnionReadExecutor;
         let result = executor.execute(
-            append_log_task(10, 11),
-            UnionReadExecutionContext::default(),
+            append_log_split(10, 11),
+            FlussLakeExecutionContext::default(),
         );
 
-        assert!(matches!(result, Err(UnionReadError::Execution(_))));
+        assert!(matches!(result, Err(FlussLakeError::Execution(_))));
     }
 
     /// `execute` must reject an undecodable descriptor synchronously, before
     /// any environment work, so engines see structural errors immediately.
     #[test]
     fn undecodable_descriptor_fails_before_the_stream_is_polled() {
-        let mut task_bytes = append_log_task(10, 11).encode().unwrap();
-        let descriptor_start = task_bytes.len() - 1;
-        task_bytes[descriptor_start] ^= 0xff;
+        let mut split_bytes = append_log_split(10, 11).encode().unwrap();
+        let descriptor_start = split_bytes.len() - 1;
+        split_bytes[descriptor_start] ^= 0xff;
 
-        assert!(UnionReadTask::decode(&task_bytes).is_err());
+        assert!(FlussLakeReadSplit::decode(&split_bytes).is_err());
     }
 
     /// Setup work must not run until the stream is polled, and its failure
@@ -710,7 +711,7 @@ mod tests {
         let flag = Arc::clone(&setup_ran);
         let mut stream = lazy_stream(async move {
             flag.store(true, Ordering::SeqCst);
-            Err(UnionReadError::Execution("deferred failure".to_string()))
+            Err(FlussLakeError::Execution("deferred failure".to_string()))
         });
 
         assert!(!setup_ran.load(Ordering::SeqCst));
@@ -718,7 +719,7 @@ mod tests {
         let first = futures::executor::block_on(stream.next());
 
         assert!(setup_ran.load(Ordering::SeqCst));
-        assert!(matches!(first, Some(Err(UnionReadError::Execution(_)))));
+        assert!(matches!(first, Some(Err(FlussLakeError::Execution(_)))));
         assert!(futures::executor::block_on(stream.next()).is_none());
     }
 
@@ -727,13 +728,13 @@ mod tests {
     /// lack of progress is an operational failure.
     #[tokio::test]
     async fn idle_timeout_fails_a_stalled_bounded_read() {
-        let stalled: SendableRecordBatchStream = Box::pin(futures::stream::pending());
+        let stalled: FlussLakeRecordBatchStream = Box::pin(futures::stream::pending());
         let mut stream = with_idle_timeout(stalled, Duration::from_millis(20));
 
         let first = stream.next().await;
 
         match first {
-            Some(Err(UnionReadError::Execution(message))) => {
+            Some(Err(FlussLakeError::Execution(message))) => {
                 assert!(
                     message.contains("idle timeout"),
                     "unexpected error: {message}"
@@ -750,10 +751,10 @@ mod tests {
     async fn idle_timeout_resets_on_progress_and_passes_bounded_streams_through() {
         use arrow::datatypes::Schema;
 
-        let batches: Vec<UnionReadResult<RecordBatch>> = (0..3)
+        let batches: Vec<FlussLakeResult<RecordBatch>> = (0..3)
             .map(|_| Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
             .collect();
-        let bounded: SendableRecordBatchStream = Box::pin(futures::stream::iter(batches));
+        let bounded: FlussLakeRecordBatchStream = Box::pin(futures::stream::iter(batches));
         let mut stream = with_idle_timeout(bounded, Duration::from_millis(20));
 
         let mut seen = 0;
@@ -776,7 +777,7 @@ mod tests {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
-            let batch: UnionReadResult<RecordBatch> =
+            let batch: FlussLakeResult<RecordBatch> =
                 Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
             Some((batch, emitted + 1))
         });
@@ -793,18 +794,18 @@ mod tests {
         assert_eq!(seen, 4);
     }
 
-    /// A lake split task planned elsewhere must stay decodable here, so that a
+    /// A lake split planned elsewhere must stay decodable here, so that a
     /// build without any lake format reports why it cannot run it.
     #[test]
     #[cfg(not(feature = "paimon"))]
-    fn lake_split_task_without_lake_feature_reports_a_clear_error() {
-        use crate::task::LakeSplitTaskDescriptor;
+    fn lake_split_without_lake_feature_reports_a_clear_error() {
+        use crate::split_descriptor::LakeSplitDescriptor;
         use std::collections::BTreeMap;
 
         let mut catalog_options = BTreeMap::new();
         catalog_options.insert("warehouse".to_string(), "/tmp/warehouse".to_string());
-        let descriptor = TaskDescriptor::LakeSplit(
-            LakeSplitTaskDescriptor::try_new(
+        let descriptor = SplitDescriptor::LakeSplit(
+            LakeSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 7,
                 catalog_options,
@@ -813,25 +814,25 @@ mod tests {
             )
             .unwrap(),
         );
-        let task = UnionReadTask::try_new(
+        let split = FlussLakeReadSplit::try_new(
             "lake-split/fluss.orders/7/0".to_string(),
-            CURRENT_UNION_READ_TASK_VERSION,
+            CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor.encode().unwrap(),
-            UnionReadStatistics::default(),
+            FlussLakeReadStatistics::default(),
         )
         .unwrap();
 
-        let result = FlussUnionReadExecutor.execute(task, UnionReadExecutionContext::default());
+        let result = FlussUnionReadExecutor.execute(split, FlussLakeExecutionContext::default());
 
         match result {
-            Err(UnionReadError::Execution(message)) => {
+            Err(FlussLakeError::Execution(message)) => {
                 assert!(
                     message.contains("no lake format feature"),
                     "unexpected error: {message}"
                 );
             }
             Err(other) => panic!("expected an execution error, got: {other}"),
-            Ok(_) => panic!("a lake split task must not execute without a lake format feature"),
+            Ok(_) => panic!("a lake split must not execute without a lake format feature"),
         }
     }
 
@@ -882,16 +883,16 @@ mod tests {
     fn physical_projection_rejects_key_indexes_beyond_the_table() {
         assert!(matches!(
             PhysicalPkProjection::resolve(&pk_row_type(), None, &[3]),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
-    fn pk_hybrid_task(start_offset: i64, stop_offset: i64) -> UnionReadTask {
-        use crate::task::PkHybridTaskDescriptor;
+    fn pk_hybrid_split(start_offset: i64, stop_offset: i64) -> FlussLakeReadSplit {
+        use crate::split_descriptor::PkHybridSplitDescriptor;
         use std::collections::BTreeMap;
 
-        let descriptor = TaskDescriptor::PkHybrid(
-            PkHybridTaskDescriptor::try_new(
+        let descriptor = SplitDescriptor::PkHybrid(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "pk_orders"),
                 1,
                 TableBucket::new(5, 0),
@@ -905,11 +906,11 @@ mod tests {
             )
             .unwrap(),
         );
-        UnionReadTask::try_new(
+        FlussLakeReadSplit::try_new(
             "pk-hybrid/5/root/0".to_string(),
-            CURRENT_UNION_READ_TASK_VERSION,
+            CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor.encode().unwrap(),
-            UnionReadStatistics::default(),
+            FlussLakeReadStatistics::default(),
         )
         .unwrap()
     }
@@ -917,20 +918,25 @@ mod tests {
     /// A bucket with neither lake splits nor a log tail contributes nothing,
     /// so it must finish without touching the environment.
     #[test]
-    fn empty_pk_hybrid_task_finishes_without_runtime_connection() {
+    fn empty_pk_hybrid_split_finishes_without_runtime_connection() {
         let mut stream = FlussUnionReadExecutor
-            .execute(pk_hybrid_task(10, 10), UnionReadExecutionContext::default())
+            .execute(
+                pk_hybrid_split(10, 10),
+                FlussLakeExecutionContext::default(),
+            )
             .unwrap();
 
         assert!(futures::executor::block_on(stream.next()).is_none());
     }
 
     #[test]
-    fn non_empty_pk_hybrid_task_requires_runtime_connection() {
-        let result = FlussUnionReadExecutor
-            .execute(pk_hybrid_task(10, 11), UnionReadExecutionContext::default());
+    fn non_empty_pk_hybrid_split_requires_runtime_connection() {
+        let result = FlussUnionReadExecutor.execute(
+            pk_hybrid_split(10, 11),
+            FlussLakeExecutionContext::default(),
+        );
 
-        assert!(matches!(result, Err(UnionReadError::Execution(_))));
+        assert!(matches!(result, Err(FlussLakeError::Execution(_))));
     }
 
     #[test]

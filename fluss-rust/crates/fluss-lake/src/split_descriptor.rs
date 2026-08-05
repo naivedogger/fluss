@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{UnionReadError, UnionReadResult};
+use crate::{FlussLakeError, FlussLakeResult};
 use fluss::metadata::{TableBucket, TablePath};
 use std::collections::{BTreeMap, HashSet};
 
-const TASK_DESCRIPTOR_MAGIC: [u8; 4] = *b"URD1";
-const APPEND_LOG_TASK_KIND: u8 = 1;
-const LAKE_SPLIT_TASK_KIND: u8 = 2;
-const PK_HYBRID_TASK_KIND: u8 = 3;
+const SPLIT_DESCRIPTOR_MAGIC: [u8; 4] = *b"URD1";
+const APPEND_LOG_SPLIT_KIND: u8 = 1;
+const LAKE_SPLIT_KIND: u8 = 2;
+const PK_HYBRID_SPLIT_KIND: u8 = 3;
 const PARTITION_PRESENT: u8 = 1;
 const PROJECTION_PRESENT: u8 = 1 << 1;
 const SNAPSHOT_PRESENT: u8 = 1 << 2;
@@ -31,14 +31,14 @@ const LAKE_SPLIT_HEADER_SIZE: usize = 34;
 const PK_HYBRID_HEADER_SIZE: usize = 78;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TaskDescriptor {
-    AppendLog(AppendLogTaskDescriptor),
-    LakeSplit(LakeSplitTaskDescriptor),
-    PkHybrid(PkHybridTaskDescriptor),
+pub(crate) enum SplitDescriptor {
+    AppendLog(AppendLogSplitDescriptor),
+    LakeSplit(LakeSplitDescriptor),
+    PkHybrid(PkHybridSplitDescriptor),
 }
 
-impl TaskDescriptor {
-    pub(crate) fn encode(&self) -> UnionReadResult<Vec<u8>> {
+impl SplitDescriptor {
+    pub(crate) fn encode(&self) -> FlussLakeResult<Vec<u8>> {
         match self {
             Self::AppendLog(descriptor) => descriptor.encode(),
             Self::LakeSplit(descriptor) => descriptor.encode(),
@@ -46,20 +46,20 @@ impl TaskDescriptor {
         }
     }
 
-    pub(crate) fn decode(encoded: &[u8]) -> UnionReadResult<Self> {
-        if encoded.len() < TASK_DESCRIPTOR_MAGIC.len() + 1 {
+    pub(crate) fn decode(encoded: &[u8]) -> FlussLakeResult<Self> {
+        if encoded.len() < SPLIT_DESCRIPTOR_MAGIC.len() + 1 {
             return Err(invalid_descriptor("descriptor is truncated"));
         }
-        if encoded[..TASK_DESCRIPTOR_MAGIC.len()] != TASK_DESCRIPTOR_MAGIC {
+        if encoded[..SPLIT_DESCRIPTOR_MAGIC.len()] != SPLIT_DESCRIPTOR_MAGIC {
             return Err(invalid_descriptor("descriptor has an invalid magic header"));
         }
 
-        match encoded[TASK_DESCRIPTOR_MAGIC.len()] {
-            APPEND_LOG_TASK_KIND => AppendLogTaskDescriptor::decode(encoded).map(Self::AppendLog),
-            LAKE_SPLIT_TASK_KIND => LakeSplitTaskDescriptor::decode(encoded).map(Self::LakeSplit),
-            PK_HYBRID_TASK_KIND => PkHybridTaskDescriptor::decode(encoded).map(Self::PkHybrid),
+        match encoded[SPLIT_DESCRIPTOR_MAGIC.len()] {
+            APPEND_LOG_SPLIT_KIND => AppendLogSplitDescriptor::decode(encoded).map(Self::AppendLog),
+            LAKE_SPLIT_KIND => LakeSplitDescriptor::decode(encoded).map(Self::LakeSplit),
+            PK_HYBRID_SPLIT_KIND => PkHybridSplitDescriptor::decode(encoded).map(Self::PkHybrid),
             kind => Err(invalid_descriptor(format!(
-                "descriptor contains unknown task kind {kind}"
+                "descriptor contains unknown split kind {kind}"
             ))),
         }
     }
@@ -72,9 +72,9 @@ impl TaskDescriptor {
 /// scan projection resolved to lake field names, and the opaque split payload
 /// produced by the lake format. It is decodable regardless of which lake
 /// format features are compiled in, so an executor built without the matching
-/// format reports a clear error instead of failing to parse the task.
+/// format reports a clear error instead of failing to parse the split.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LakeSplitTaskDescriptor {
+pub(crate) struct LakeSplitDescriptor {
     table_path: TablePath,
     snapshot_id: i64,
     catalog_options: BTreeMap<String, String>,
@@ -85,14 +85,14 @@ pub(crate) struct LakeSplitTaskDescriptor {
 // Some accessors only feed a lake reader, so a build without any lake format
 // feature legitimately leaves them unused.
 #[cfg_attr(not(feature = "paimon"), allow(dead_code))]
-impl LakeSplitTaskDescriptor {
+impl LakeSplitDescriptor {
     pub(crate) fn try_new(
         table_path: TablePath,
         snapshot_id: i64,
         catalog_options: BTreeMap<String, String>,
         projected_fields: Option<Vec<String>>,
         encoded_split: String,
-    ) -> UnionReadResult<Self> {
+    ) -> FlussLakeResult<Self> {
         if table_path.database().is_empty() || table_path.table().is_empty() {
             return Err(invalid_descriptor(
                 "database and table names must not be empty",
@@ -148,7 +148,7 @@ impl LakeSplitTaskDescriptor {
         &self.encoded_split
     }
 
-    fn encode(&self) -> UnionReadResult<Vec<u8>> {
+    fn encode(&self) -> FlussLakeResult<Vec<u8>> {
         let database = self.table_path.database().as_bytes();
         let table = self.table_path.table().as_bytes();
         let split = self.encoded_split.as_bytes();
@@ -167,8 +167,8 @@ impl LakeSplitTaskDescriptor {
         }
 
         let mut encoded = Vec::with_capacity(LAKE_SPLIT_HEADER_SIZE + database.len() + table.len());
-        encoded.extend_from_slice(&TASK_DESCRIPTOR_MAGIC);
-        encoded.push(LAKE_SPLIT_TASK_KIND);
+        encoded.extend_from_slice(&SPLIT_DESCRIPTOR_MAGIC);
+        encoded.push(LAKE_SPLIT_KIND);
         encoded.push(flags);
         encoded.extend_from_slice(&self.snapshot_id.to_le_bytes());
         encoded.extend_from_slice(&database_len.to_le_bytes());
@@ -188,7 +188,7 @@ impl LakeSplitTaskDescriptor {
             }
         }
         // A BTreeMap keeps the encoding deterministic: the same plan always
-        // produces the same task bytes.
+        // produces the same split bytes.
         for (key, value) in &self.catalog_options {
             encoded.extend_from_slice(&wire_len(key.len(), "catalog option key")?.to_le_bytes());
             encoded
@@ -199,7 +199,7 @@ impl LakeSplitTaskDescriptor {
         Ok(encoded)
     }
 
-    fn decode(encoded: &[u8]) -> UnionReadResult<Self> {
+    fn decode(encoded: &[u8]) -> FlussLakeResult<Self> {
         if encoded.len() < LAKE_SPLIT_HEADER_SIZE {
             return Err(invalid_descriptor(format!(
                 "lake split descriptor is truncated: expected at least {LAKE_SPLIT_HEADER_SIZE} bytes, got {}",
@@ -208,14 +208,14 @@ impl LakeSplitTaskDescriptor {
         }
 
         let mut reader = DescriptorReader::new(encoded);
-        reader.expect_bytes(&TASK_DESCRIPTOR_MAGIC, "task descriptor magic")?;
-        let kind = reader.read_u8("task kind")?;
-        if kind != LAKE_SPLIT_TASK_KIND {
+        reader.expect_bytes(&SPLIT_DESCRIPTOR_MAGIC, "split descriptor magic")?;
+        let kind = reader.read_u8("split kind")?;
+        if kind != LAKE_SPLIT_KIND {
             return Err(invalid_descriptor(format!(
-                "expected lake split task kind {LAKE_SPLIT_TASK_KIND}, got {kind}"
+                "expected lake split kind {LAKE_SPLIT_KIND}, got {kind}"
             )));
         }
-        let flags = reader.read_u8("task flags")?;
+        let flags = reader.read_u8("split flags")?;
         if flags & !PROJECTION_PRESENT != 0 {
             return Err(invalid_descriptor(format!(
                 "lake split descriptor contains unknown flags 0x{flags:02x}"
@@ -277,17 +277,17 @@ impl LakeSplitTaskDescriptor {
 /// One primary-key bucket's frozen lake baseline plus its bounded log tail.
 ///
 /// Primary-key merge completes independently per `(partition, bucket)`, so a
-/// PK task must carry **all** lake splits of its bucket together with the
+/// PK split must carry **all** lake splits of its bucket together with the
 /// bucket's log range: the merge overlays the tail onto the lake baseline,
-/// and a task split by lake file boundaries could not partition the tail
-/// consistently with arbitrary file subsets. This mirrors the Java
+/// and splitting by lake file boundaries could not partition the tail
+/// consistently across arbitrary file subsets. This mirrors the Java
 /// connector's combined `LakeSnapshotAndFlussLogSplit`.
 ///
 /// `pk_indexes` are frozen here rather than re-derived by executors: the
 /// merge is correctness-critical, so the key definition must come from the
 /// plan, not from whatever schema the executor happens to resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PkHybridTaskDescriptor {
+pub(crate) struct PkHybridSplitDescriptor {
     table_path: TablePath,
     schema_id: i32,
     table_bucket: TableBucket,
@@ -301,7 +301,7 @@ pub(crate) struct PkHybridTaskDescriptor {
 }
 
 #[cfg_attr(not(feature = "paimon"), allow(dead_code))]
-impl PkHybridTaskDescriptor {
+impl PkHybridSplitDescriptor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         table_path: TablePath,
@@ -314,7 +314,7 @@ impl PkHybridTaskDescriptor {
         lake_splits: Vec<String>,
         pk_indexes: Vec<usize>,
         output_projection: Option<Vec<usize>>,
-    ) -> UnionReadResult<Self> {
+    ) -> FlussLakeResult<Self> {
         if table_path.database().is_empty() || table_path.table().is_empty() {
             return Err(invalid_descriptor(
                 "database and table names must not be empty",
@@ -452,7 +452,7 @@ impl PkHybridTaskDescriptor {
         self.start_offset == self.stop_offset && self.lake_splits.is_empty()
     }
 
-    fn encode(&self) -> UnionReadResult<Vec<u8>> {
+    fn encode(&self) -> FlussLakeResult<Vec<u8>> {
         let database = self.table_path.database().as_bytes();
         let table = self.table_path.table().as_bytes();
         let database_len = wire_len(database.len(), "database name")?;
@@ -477,8 +477,8 @@ impl PkHybridTaskDescriptor {
         }
 
         let mut encoded = Vec::with_capacity(PK_HYBRID_HEADER_SIZE + database.len() + table.len());
-        encoded.extend_from_slice(&TASK_DESCRIPTOR_MAGIC);
-        encoded.push(PK_HYBRID_TASK_KIND);
+        encoded.extend_from_slice(&SPLIT_DESCRIPTOR_MAGIC);
+        encoded.push(PK_HYBRID_SPLIT_KIND);
         encoded.push(flags);
         encoded.extend_from_slice(&self.table_bucket.table_id().to_le_bytes());
         encoded.extend_from_slice(&self.schema_id.to_le_bytes());
@@ -508,7 +508,7 @@ impl PkHybridTaskDescriptor {
         for pk_index in &self.pk_indexes {
             let pk_index = u32::try_from(*pk_index).map_err(|_| {
                 invalid_descriptor(format!(
-                    "primary-key index {pk_index} exceeds the task wire format limit"
+                    "primary-key index {pk_index} exceeds the split wire format limit"
                 ))
             })?;
             encoded.extend_from_slice(&pk_index.to_le_bytes());
@@ -517,14 +517,14 @@ impl PkHybridTaskDescriptor {
             for field_index in projection {
                 let field_index = u32::try_from(*field_index).map_err(|_| {
                     invalid_descriptor(format!(
-                        "field index {field_index} exceeds the task wire format limit"
+                        "field index {field_index} exceeds the split wire format limit"
                     ))
                 })?;
                 encoded.extend_from_slice(&field_index.to_le_bytes());
             }
         }
         // A BTreeMap keeps the encoding deterministic: the same plan always
-        // produces the same task bytes.
+        // produces the same split bytes.
         for (key, value) in &self.catalog_options {
             encoded.extend_from_slice(&wire_len(key.len(), "catalog option key")?.to_le_bytes());
             encoded
@@ -535,7 +535,7 @@ impl PkHybridTaskDescriptor {
         Ok(encoded)
     }
 
-    fn decode(encoded: &[u8]) -> UnionReadResult<Self> {
+    fn decode(encoded: &[u8]) -> FlussLakeResult<Self> {
         if encoded.len() < PK_HYBRID_HEADER_SIZE {
             return Err(invalid_descriptor(format!(
                 "pk-hybrid descriptor is truncated: expected at least {PK_HYBRID_HEADER_SIZE} bytes, got {}",
@@ -544,14 +544,14 @@ impl PkHybridTaskDescriptor {
         }
 
         let mut reader = DescriptorReader::new(encoded);
-        reader.expect_bytes(&TASK_DESCRIPTOR_MAGIC, "task descriptor magic")?;
-        let kind = reader.read_u8("task kind")?;
-        if kind != PK_HYBRID_TASK_KIND {
+        reader.expect_bytes(&SPLIT_DESCRIPTOR_MAGIC, "split descriptor magic")?;
+        let kind = reader.read_u8("split kind")?;
+        if kind != PK_HYBRID_SPLIT_KIND {
             return Err(invalid_descriptor(format!(
-                "expected pk-hybrid task kind {PK_HYBRID_TASK_KIND}, got {kind}"
+                "expected pk-hybrid split kind {PK_HYBRID_SPLIT_KIND}, got {kind}"
             )));
         }
-        let flags = reader.read_u8("task flags")?;
+        let flags = reader.read_u8("split flags")?;
         let known_flags = PARTITION_PRESENT | PROJECTION_PRESENT | SNAPSHOT_PRESENT;
         if flags & !known_flags != 0 {
             return Err(invalid_descriptor(format!(
@@ -649,7 +649,7 @@ impl PkHybridTaskDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppendLogTaskDescriptor {
+pub(crate) struct AppendLogSplitDescriptor {
     table_path: TablePath,
     schema_id: i32,
     table_bucket: TableBucket,
@@ -658,7 +658,7 @@ pub(crate) struct AppendLogTaskDescriptor {
     output_projection: Option<Vec<usize>>,
 }
 
-impl AppendLogTaskDescriptor {
+impl AppendLogSplitDescriptor {
     pub(crate) fn try_new(
         table_path: TablePath,
         schema_id: i32,
@@ -666,7 +666,7 @@ impl AppendLogTaskDescriptor {
         start_offset: i64,
         stop_offset: i64,
         output_projection: Option<Vec<usize>>,
-    ) -> UnionReadResult<Self> {
+    ) -> FlussLakeResult<Self> {
         if table_path.database().is_empty() || table_path.table().is_empty() {
             return Err(invalid_descriptor(
                 "database and table names must not be empty",
@@ -758,7 +758,7 @@ impl AppendLogTaskDescriptor {
         self.start_offset == self.stop_offset
     }
 
-    fn encode(&self) -> UnionReadResult<Vec<u8>> {
+    fn encode(&self) -> FlussLakeResult<Vec<u8>> {
         let database = self.table_path.database().as_bytes();
         let table = self.table_path.table().as_bytes();
         let database_len = wire_len(database.len(), "database name")?;
@@ -785,8 +785,8 @@ impl AppendLogTaskDescriptor {
         }
 
         let mut encoded = Vec::with_capacity(capacity);
-        encoded.extend_from_slice(&TASK_DESCRIPTOR_MAGIC);
-        encoded.push(APPEND_LOG_TASK_KIND);
+        encoded.extend_from_slice(&SPLIT_DESCRIPTOR_MAGIC);
+        encoded.push(APPEND_LOG_SPLIT_KIND);
         encoded.push(flags);
         encoded.extend_from_slice(&database_len.to_le_bytes());
         encoded.extend_from_slice(&table_len.to_le_bytes());
@@ -809,7 +809,7 @@ impl AppendLogTaskDescriptor {
             for field_index in projection {
                 let field_index = u32::try_from(*field_index).map_err(|_| {
                     invalid_descriptor(format!(
-                        "field index {field_index} exceeds the task wire format limit"
+                        "field index {field_index} exceeds the split wire format limit"
                     ))
                 })?;
                 encoded.extend_from_slice(&field_index.to_le_bytes());
@@ -818,7 +818,7 @@ impl AppendLogTaskDescriptor {
         Ok(encoded)
     }
 
-    fn decode(encoded: &[u8]) -> UnionReadResult<Self> {
+    fn decode(encoded: &[u8]) -> FlussLakeResult<Self> {
         if encoded.len() < APPEND_LOG_HEADER_SIZE {
             return Err(invalid_descriptor(format!(
                 "append-log descriptor is truncated: expected at least {APPEND_LOG_HEADER_SIZE} bytes, got {}",
@@ -827,14 +827,14 @@ impl AppendLogTaskDescriptor {
         }
 
         let mut reader = DescriptorReader::new(encoded);
-        reader.expect_bytes(&TASK_DESCRIPTOR_MAGIC, "task descriptor magic")?;
-        let kind = reader.read_u8("task kind")?;
-        if kind != APPEND_LOG_TASK_KIND {
+        reader.expect_bytes(&SPLIT_DESCRIPTOR_MAGIC, "split descriptor magic")?;
+        let kind = reader.read_u8("split kind")?;
+        if kind != APPEND_LOG_SPLIT_KIND {
             return Err(invalid_descriptor(format!(
-                "expected append-log task kind {APPEND_LOG_TASK_KIND}, got {kind}"
+                "expected append-log split kind {APPEND_LOG_SPLIT_KIND}, got {kind}"
             )));
         }
-        let flags = reader.read_u8("task flags")?;
+        let flags = reader.read_u8("split flags")?;
         let known_flags = PARTITION_PRESENT | PROJECTION_PRESENT;
         if flags & !known_flags != 0 {
             return Err(invalid_descriptor(format!(
@@ -911,7 +911,7 @@ impl<'a> DescriptorReader<'a> {
         Self { encoded, offset: 0 }
     }
 
-    fn expect_bytes(&mut self, expected: &[u8], field: &str) -> UnionReadResult<()> {
+    fn expect_bytes(&mut self, expected: &[u8], field: &str) -> FlussLakeResult<()> {
         let actual = self.read_exact(expected.len(), field)?;
         if actual != expected {
             return Err(invalid_descriptor(format!("{field} is invalid")));
@@ -919,39 +919,39 @@ impl<'a> DescriptorReader<'a> {
         Ok(())
     }
 
-    fn read_u8(&mut self, field: &str) -> UnionReadResult<u8> {
+    fn read_u8(&mut self, field: &str) -> FlussLakeResult<u8> {
         Ok(self.read_exact(size_of::<u8>(), field)?[0])
     }
 
-    fn read_u32(&mut self, field: &str) -> UnionReadResult<u32> {
+    fn read_u32(&mut self, field: &str) -> FlussLakeResult<u32> {
         let bytes = self.read_exact(size_of::<u32>(), field)?;
         Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
             invalid_descriptor(format!("{field} is not a valid u32"))
         })?))
     }
 
-    fn read_i32(&mut self, field: &str) -> UnionReadResult<i32> {
+    fn read_i32(&mut self, field: &str) -> FlussLakeResult<i32> {
         let bytes = self.read_exact(size_of::<i32>(), field)?;
         Ok(i32::from_le_bytes(bytes.try_into().map_err(|_| {
             invalid_descriptor(format!("{field} is not a valid i32"))
         })?))
     }
 
-    fn read_i64(&mut self, field: &str) -> UnionReadResult<i64> {
+    fn read_i64(&mut self, field: &str) -> FlussLakeResult<i64> {
         let bytes = self.read_exact(size_of::<i64>(), field)?;
         Ok(i64::from_le_bytes(bytes.try_into().map_err(|_| {
             invalid_descriptor(format!("{field} is not a valid i64"))
         })?))
     }
 
-    fn read_string(&mut self, len: usize, field: &str) -> UnionReadResult<String> {
+    fn read_string(&mut self, len: usize, field: &str) -> FlussLakeResult<String> {
         let bytes = self.read_exact(len, field)?;
         std::str::from_utf8(bytes)
             .map(str::to_string)
             .map_err(|error| invalid_descriptor(format!("{field} is not valid UTF-8: {error}")))
     }
 
-    fn read_exact(&mut self, len: usize, field: &str) -> UnionReadResult<&'a [u8]> {
+    fn read_exact(&mut self, len: usize, field: &str) -> FlussLakeResult<&'a [u8]> {
         let end = self
             .offset
             .checked_add(len)
@@ -965,7 +965,7 @@ impl<'a> DescriptorReader<'a> {
         Ok(bytes)
     }
 
-    fn finish(self) -> UnionReadResult<()> {
+    fn finish(self) -> FlussLakeResult<()> {
         if self.offset != self.encoded.len() {
             return Err(invalid_descriptor(format!(
                 "descriptor contains {} trailing bytes",
@@ -980,21 +980,21 @@ impl<'a> DescriptorReader<'a> {
     }
 }
 
-fn wire_len(len: usize, field: &str) -> UnionReadResult<u32> {
+fn wire_len(len: usize, field: &str) -> FlussLakeResult<u32> {
     u32::try_from(len)
-        .map_err(|_| invalid_descriptor(format!("{field} exceeds the task wire format limit")))
+        .map_err(|_| invalid_descriptor(format!("{field} exceeds the split wire format limit")))
 }
 
-fn invalid_descriptor(message: impl Into<String>) -> UnionReadError {
-    UnionReadError::InvalidTask(message.into())
+fn invalid_descriptor(message: impl Into<String>) -> FlussLakeError {
+    FlussLakeError::InvalidSplit(message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn descriptor(projection: Option<Vec<usize>>) -> AppendLogTaskDescriptor {
-        AppendLogTaskDescriptor::try_new(
+    fn descriptor(projection: Option<Vec<usize>>) -> AppendLogSplitDescriptor {
+        AppendLogSplitDescriptor::try_new(
             TablePath::new("fluss", "orders"),
             3,
             TableBucket::new_with_partition(7, Some(11), 2),
@@ -1007,18 +1007,18 @@ mod tests {
 
     #[test]
     fn append_log_descriptor_round_trips() {
-        let descriptor = TaskDescriptor::AppendLog(descriptor(Some(vec![2, 0])));
+        let descriptor = SplitDescriptor::AppendLog(descriptor(Some(vec![2, 0])));
 
         assert_eq!(
-            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
         );
     }
 
     #[test]
     fn append_log_descriptor_round_trips_without_partition_or_projection() {
-        let descriptor = TaskDescriptor::AppendLog(
-            AppendLogTaskDescriptor::try_new(
+        let descriptor = SplitDescriptor::AppendLog(
+            AppendLogSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1030,7 +1030,7 @@ mod tests {
         );
 
         assert_eq!(
-            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
         );
     }
@@ -1038,7 +1038,7 @@ mod tests {
     #[test]
     fn rejects_invalid_append_log_ranges_and_projection() {
         assert!(matches!(
-            AppendLogTaskDescriptor::try_new(
+            AppendLogSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1046,10 +1046,10 @@ mod tests {
                 20,
                 None,
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         assert!(matches!(
-            AppendLogTaskDescriptor::try_new(
+            AppendLogSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1057,48 +1057,48 @@ mod tests {
                 20,
                 Some(vec![1, 1]),
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
     #[test]
     fn rejects_unknown_kind_flags_and_trailing_bytes() {
-        let encoded = TaskDescriptor::AppendLog(descriptor(Some(vec![2, 0])))
+        let encoded = SplitDescriptor::AppendLog(descriptor(Some(vec![2, 0])))
             .encode()
             .unwrap();
 
         let mut unknown_kind = encoded.clone();
         unknown_kind[4] = 99;
         assert!(matches!(
-            TaskDescriptor::decode(&unknown_kind),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&unknown_kind),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         let mut unknown_flags = encoded.clone();
         unknown_flags[5] = 1 << 7;
         assert!(matches!(
-            TaskDescriptor::decode(&unknown_flags),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&unknown_flags),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         let mut trailing = encoded;
         trailing.push(0);
         assert!(matches!(
-            TaskDescriptor::decode(&trailing),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&trailing),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
     #[test]
     fn rejects_untrusted_projection_count_before_allocating() {
-        let mut encoded = TaskDescriptor::AppendLog(descriptor(Some(vec![2, 0])))
+        let mut encoded = SplitDescriptor::AppendLog(descriptor(Some(vec![2, 0])))
             .encode()
             .unwrap();
         encoded[54..58].copy_from_slice(&u32::MAX.to_le_bytes());
 
         assert!(matches!(
-            TaskDescriptor::decode(&encoded),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&encoded),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
@@ -1109,8 +1109,8 @@ mod tests {
         options
     }
 
-    fn lake_split_descriptor(projected_fields: Option<Vec<String>>) -> LakeSplitTaskDescriptor {
-        LakeSplitTaskDescriptor::try_new(
+    fn lake_split_descriptor(projected_fields: Option<Vec<String>>) -> LakeSplitDescriptor {
+        LakeSplitDescriptor::try_new(
             TablePath::new("fluss", "orders"),
             42,
             catalog_options(),
@@ -1122,118 +1122,118 @@ mod tests {
 
     #[test]
     fn lake_split_descriptor_round_trips() {
-        let descriptor = TaskDescriptor::LakeSplit(lake_split_descriptor(Some(vec![
+        let descriptor = SplitDescriptor::LakeSplit(lake_split_descriptor(Some(vec![
             "amount".to_string(),
             "id".to_string(),
         ])));
 
         assert_eq!(
-            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
         );
     }
 
     #[test]
     fn lake_split_descriptor_round_trips_without_projection() {
-        let descriptor = TaskDescriptor::LakeSplit(lake_split_descriptor(None));
+        let descriptor = SplitDescriptor::LakeSplit(lake_split_descriptor(None));
 
         assert_eq!(
-            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
         );
     }
 
     #[test]
     fn lake_split_encoding_is_deterministic() {
-        let descriptor = TaskDescriptor::LakeSplit(lake_split_descriptor(None));
+        let descriptor = SplitDescriptor::LakeSplit(lake_split_descriptor(None));
 
         assert_eq!(
             descriptor.encode().unwrap(),
             descriptor.encode().unwrap(),
-            "the same plan must always produce the same task bytes"
+            "the same plan must always produce the same split bytes"
         );
     }
 
     #[test]
     fn rejects_invalid_lake_split_identity_and_payload() {
         assert!(matches!(
-            LakeSplitTaskDescriptor::try_new(
+            LakeSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 -1,
                 catalog_options(),
                 None,
                 "{}".to_string(),
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         assert!(matches!(
-            LakeSplitTaskDescriptor::try_new(
+            LakeSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 1,
                 catalog_options(),
                 None,
                 String::new(),
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         assert!(matches!(
-            LakeSplitTaskDescriptor::try_new(
+            LakeSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 1,
                 catalog_options(),
                 Some(Vec::new()),
                 "{}".to_string(),
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         assert!(matches!(
-            LakeSplitTaskDescriptor::try_new(
+            LakeSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 1,
                 catalog_options(),
                 Some(vec![String::new()]),
                 "{}".to_string(),
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
     #[test]
     fn rejects_malformed_lake_split_envelopes() {
-        let encoded = TaskDescriptor::LakeSplit(lake_split_descriptor(None))
+        let encoded = SplitDescriptor::LakeSplit(lake_split_descriptor(None))
             .encode()
             .unwrap();
 
         let mut unknown_flags = encoded.clone();
         unknown_flags[5] = 1 << 7;
         assert!(matches!(
-            TaskDescriptor::decode(&unknown_flags),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&unknown_flags),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(matches!(
-            TaskDescriptor::decode(&trailing),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&trailing),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         assert!(matches!(
-            TaskDescriptor::decode(&encoded[..encoded.len() - 1]),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&encoded[..encoded.len() - 1]),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         // A projection flag without any projected field name must not decode.
         let mut inconsistent_projection = encoded;
         inconsistent_projection[5] = PROJECTION_PRESENT;
         assert!(matches!(
-            TaskDescriptor::decode(&inconsistent_projection),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&inconsistent_projection),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
-    fn pk_hybrid_descriptor() -> PkHybridTaskDescriptor {
-        PkHybridTaskDescriptor::try_new(
+    fn pk_hybrid_descriptor() -> PkHybridSplitDescriptor {
+        PkHybridSplitDescriptor::try_new(
             TablePath::new("fluss", "orders"),
             3,
             TableBucket::new_with_partition(7, Some(11), 2),
@@ -1253,10 +1253,10 @@ mod tests {
 
     #[test]
     fn pk_hybrid_descriptor_round_trips() {
-        let descriptor = TaskDescriptor::PkHybrid(pk_hybrid_descriptor());
+        let descriptor = SplitDescriptor::PkHybrid(pk_hybrid_descriptor());
 
         assert_eq!(
-            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
         );
     }
@@ -1265,8 +1265,8 @@ mod tests {
     /// partition, no snapshot, no lake splits, no projection.
     #[test]
     fn pk_hybrid_descriptor_round_trips_in_log_only_form() {
-        let descriptor = TaskDescriptor::PkHybrid(
-            PkHybridTaskDescriptor::try_new(
+        let descriptor = SplitDescriptor::PkHybrid(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1282,19 +1282,19 @@ mod tests {
         );
 
         assert_eq!(
-            TaskDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
         );
     }
 
     #[test]
     fn pk_hybrid_encoding_is_deterministic() {
-        let descriptor = TaskDescriptor::PkHybrid(pk_hybrid_descriptor());
+        let descriptor = SplitDescriptor::PkHybrid(pk_hybrid_descriptor());
 
         assert_eq!(
             descriptor.encode().unwrap(),
             descriptor.encode().unwrap(),
-            "the same plan must always produce the same task bytes"
+            "the same plan must always produce the same split bytes"
         );
     }
 
@@ -1302,7 +1302,7 @@ mod tests {
     fn rejects_invalid_pk_hybrid_shapes() {
         // Lake splits without the snapshot they were planned against.
         assert!(matches!(
-            PkHybridTaskDescriptor::try_new(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1314,11 +1314,11 @@ mod tests {
                 vec![0],
                 None,
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
-        // A primary-key task without key indexes cannot merge anything.
+        // A primary-key split without key indexes cannot merge anything.
         assert!(matches!(
-            PkHybridTaskDescriptor::try_new(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1330,11 +1330,11 @@ mod tests {
                 Vec::new(),
                 None,
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         // Duplicate key indexes.
         assert!(matches!(
-            PkHybridTaskDescriptor::try_new(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1346,11 +1346,11 @@ mod tests {
                 vec![0, 0],
                 None,
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         // Inverted changelog range.
         assert!(matches!(
-            PkHybridTaskDescriptor::try_new(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1362,11 +1362,11 @@ mod tests {
                 vec![0],
                 None,
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         // Empty split payload.
         assert!(matches!(
-            PkHybridTaskDescriptor::try_new(
+            PkHybridSplitDescriptor::try_new(
                 TablePath::new("fluss", "orders"),
                 3,
                 TableBucket::new(7, 2),
@@ -1378,33 +1378,33 @@ mod tests {
                 vec![0],
                 None,
             ),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
     #[test]
     fn rejects_malformed_pk_hybrid_envelopes() {
-        let encoded = TaskDescriptor::PkHybrid(pk_hybrid_descriptor())
+        let encoded = SplitDescriptor::PkHybrid(pk_hybrid_descriptor())
             .encode()
             .unwrap();
 
         let mut unknown_flags = encoded.clone();
         unknown_flags[5] |= 1 << 7;
         assert!(matches!(
-            TaskDescriptor::decode(&unknown_flags),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&unknown_flags),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(matches!(
-            TaskDescriptor::decode(&trailing),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&trailing),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         assert!(matches!(
-            TaskDescriptor::decode(&encoded[..encoded.len() - 1]),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&encoded[..encoded.len() - 1]),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
 
         // Clearing the snapshot flag while its value remains set must not
@@ -1412,8 +1412,8 @@ mod tests {
         let mut inconsistent_snapshot = encoded;
         inconsistent_snapshot[5] &= !SNAPSHOT_PRESENT;
         assert!(matches!(
-            TaskDescriptor::decode(&inconsistent_snapshot),
-            Err(UnionReadError::InvalidTask(_))
+            SplitDescriptor::decode(&inconsistent_snapshot),
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 }

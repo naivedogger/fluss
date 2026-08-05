@@ -23,7 +23,9 @@
 //! matching rows. The engine always re-evaluates its original predicates as
 //! residual filters regardless of the pruning outcome.
 
-use crate::{PredicateInput, PredicatePushdownDecision, PredicatePushdownLevel};
+use crate::{
+    FlussLakePredicateInput, FlussLakePredicatePushdownDecision, FlussLakePredicatePushdownLevel,
+};
 use fluss::metadata::{ResolvedPartitionSpec, RowType};
 use fluss::predicate::{ComparisonOperator, FieldRef, PruningLiteral, PruningPredicate};
 use std::collections::HashMap;
@@ -51,7 +53,7 @@ impl PartitionPruner {
     pub(crate) fn new(
         row_type: &RowType,
         partition_keys: &[String],
-        predicates: &[PredicateInput],
+        predicates: &[FlussLakePredicateInput],
     ) -> Self {
         let mut partition_fields = HashMap::with_capacity(partition_keys.len());
         for partition_key in partition_keys {
@@ -79,17 +81,17 @@ impl PartitionPruner {
     /// residual evaluation obligation.
     pub(crate) fn decisions(
         &self,
-        predicates: &[PredicateInput],
-    ) -> Vec<PredicatePushdownDecision> {
+        predicates: &[FlussLakePredicateInput],
+    ) -> Vec<FlussLakePredicatePushdownDecision> {
         predicates
             .iter()
             .map(|input| {
                 let level = if self.can_prune(input.predicate()) {
-                    PredicatePushdownLevel::PruningOnly
+                    FlussLakePredicatePushdownLevel::PruningOnly
                 } else {
-                    PredicatePushdownLevel::Unsupported
+                    FlussLakePredicatePushdownLevel::Unsupported
                 };
-                PredicatePushdownDecision::new(input.id(), level)
+                FlussLakePredicatePushdownDecision::new(input.id(), level)
             })
             .collect()
     }
@@ -300,7 +302,7 @@ fn literal_equals(partition_value: &str, literal: &PruningLiteral) -> Option<boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PredicateId;
+    use crate::FlussLakePredicateId;
     use fluss::metadata::{DataField, DataTypes};
     use fluss::predicate::NullCheckOperator;
     use std::sync::Arc;
@@ -322,11 +324,11 @@ mod tests {
     }
 
     fn pruner(predicates: Vec<PruningPredicate>) -> PartitionPruner {
-        let inputs: Vec<PredicateInput> = predicates
+        let inputs: Vec<FlussLakePredicateInput> = predicates
             .into_iter()
             .enumerate()
             .map(|(index, predicate)| {
-                PredicateInput::new(PredicateId::new(index as u32), predicate)
+                FlussLakePredicateInput::new(FlussLakePredicateId::new(index as u32), predicate)
             })
             .collect();
         PartitionPruner::new(
@@ -441,20 +443,20 @@ mod tests {
     #[test]
     fn decisions_report_pruning_only_for_evaluable_partition_predicates() {
         let inputs = vec![
-            PredicateInput::new(
-                PredicateId::new(1),
+            FlussLakePredicateInput::new(
+                FlussLakePredicateId::new(1),
                 PruningPredicate::comparison(ComparisonOperator::Equal, region_field(), "US"),
             ),
-            PredicateInput::new(
-                PredicateId::new(2),
+            FlussLakePredicateInput::new(
+                FlussLakePredicateId::new(2),
                 PruningPredicate::comparison(
                     ComparisonOperator::Equal,
                     FieldRef::new(0, "id", DataTypes::int()),
                     42_i32,
                 ),
             ),
-            PredicateInput::new(
-                PredicateId::new(3),
+            FlussLakePredicateInput::new(
+                FlussLakePredicateId::new(3),
                 PruningPredicate::null_check(NullCheckOperator::IsNull, region_field()),
             ),
         ];
@@ -462,9 +464,18 @@ mod tests {
 
         let decisions = pruner.decisions(&inputs);
 
-        assert_eq!(decisions[0].level(), PredicatePushdownLevel::PruningOnly);
-        assert_eq!(decisions[1].level(), PredicatePushdownLevel::Unsupported);
-        assert_eq!(decisions[2].level(), PredicatePushdownLevel::Unsupported);
+        assert_eq!(
+            decisions[0].level(),
+            FlussLakePredicatePushdownLevel::PruningOnly
+        );
+        assert_eq!(
+            decisions[1].level(),
+            FlussLakePredicatePushdownLevel::Unsupported
+        );
+        assert_eq!(
+            decisions[2].level(),
+            FlussLakePredicatePushdownLevel::Unsupported
+        );
         assert!(
             decisions
                 .iter()

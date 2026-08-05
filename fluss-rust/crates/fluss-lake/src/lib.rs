@@ -20,22 +20,21 @@
 //! finite stream of Arrow record batches.
 
 mod executor;
+mod facade;
 #[cfg(feature = "paimon")]
 mod paimon;
 mod pk_overlay;
 mod planner;
-#[doc(hidden)]
-pub mod planning;
+mod planning;
 mod pruning;
-mod task;
+mod split_descriptor;
 mod union_read;
 
-pub use executor::FlussUnionReadExecutor;
-pub use planner::FlussUnionReadPlanner;
+pub use facade::{FlussLakeRead, FlussLakeScan, FlussLakeTable};
 pub use union_read::{
-    CURRENT_UNION_READ_TASK_VERSION, DEFAULT_UNION_READ_IDLE_TIMEOUT, PredicateId, PredicateInput,
-    PredicatePushdownDecision, PredicatePushdownLevel, SendableRecordBatchStream, UnionReadError,
-    UnionReadExecutionContext, UnionReadExecutor, UnionReadMode, UnionReadPlan,
-    UnionReadPlanFuture, UnionReadPlanner, UnionReadRequest, UnionReadResult, UnionReadStatistics,
-    UnionReadTask,
+    CURRENT_FLUSS_LAKE_SPLIT_VERSION, DEFAULT_FLUSS_LAKE_IDLE_TIMEOUT, FlussLakeError,
+    FlussLakeExecutionContext, FlussLakePredicateId, FlussLakePredicateInput,
+    FlussLakePredicatePushdownDecision, FlussLakePredicatePushdownLevel, FlussLakeReadMode,
+    FlussLakeReadPlan, FlussLakeReadSplit, FlussLakeReadStatistics, FlussLakeRecordBatchStream,
+    FlussLakeResult,
 };

@@ -27,7 +27,7 @@
 //! reads disabled, so an ORC table fails at read time with an explicit
 //! unsupported-format error.
 
-use crate::{SendableRecordBatchStream, UnionReadError, UnionReadResult};
+use crate::{FlussLakeError, FlussLakeRecordBatchStream, FlussLakeResult};
 use fluss::metadata::{RowType, TableInfo, TablePath};
 use futures::StreamExt;
 use paimon::catalog::Identifier;
@@ -69,7 +69,7 @@ pub(crate) fn is_sensitive_catalog_option(key: &str) -> bool {
 
 /// Catalog configuration needed to reopen one Paimon table.
 ///
-/// This is planner output that travels inside a task descriptor, so it must
+/// This is planner output that travels inside a split descriptor, so it must
 /// stay a plain serializable map rather than a live catalog handle. Secrets are
 /// deliberately not part of it: see [`PaimonCatalogOptions::non_sensitive`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +82,7 @@ impl PaimonCatalogOptions {
     ///
     /// `table.datalake.paimon.warehouse` becomes `warehouse`, and so on for
     /// every other prefixed property.
-    pub(crate) fn from_table_info(table_info: &TableInfo) -> UnionReadResult<Self> {
+    pub(crate) fn from_table_info(table_info: &TableInfo) -> FlussLakeResult<Self> {
         let options: HashMap<String, String> = table_info
             .properties
             .iter()
@@ -93,7 +93,7 @@ impl PaimonCatalogOptions {
             })
             .collect();
         if !options.contains_key("warehouse") {
-            return Err(UnionReadError::Planning(format!(
+            return Err(FlussLakeError::Planning(format!(
                 "table {} has a readable lake snapshot but no {PAIMON_PROPERTY_PREFIX}warehouse property",
                 table_info.table_path
             )));
@@ -109,9 +109,9 @@ impl PaimonCatalogOptions {
         Self { options }
     }
 
-    /// Returns the options that may be embedded in a task descriptor.
+    /// Returns the options that may be embedded in a split descriptor.
     ///
-    /// Tasks are cached, logged and persisted by engines, so secrets must never
+    /// Splits are cached, logged and persisted by engines, so secrets must never
     /// be serialized into them. An executor re-supplies the withheld options
     /// through its execution context.
     pub(crate) fn non_sensitive(&self) -> HashMap<String, String> {
@@ -122,7 +122,7 @@ impl PaimonCatalogOptions {
             .collect()
     }
 
-    /// Merges runtime-supplied credentials over the task-carried options.
+    /// Merges runtime-supplied credentials over the split-carried options.
     ///
     /// Runtime values win: a credential rotated after planning must take
     /// effect without re-planning.
@@ -146,7 +146,7 @@ async fn open_pinned_table(
     table_path: &TablePath,
     catalog_options: &PaimonCatalogOptions,
     snapshot_id: i64,
-) -> UnionReadResult<Table> {
+) -> FlussLakeResult<Table> {
     let mut options = Options::default();
     for (key, value) in catalog_options.as_map() {
         options.set(key, value);
@@ -183,7 +183,7 @@ async fn open_pinned_table(
 pub(crate) fn projected_field_names(
     row_type: &RowType,
     output_projection: Option<&[usize]>,
-) -> UnionReadResult<Vec<String>> {
+) -> FlussLakeResult<Vec<String>> {
     let Some(projection) = output_projection else {
         return Ok(row_type
             .fields()
@@ -194,7 +194,7 @@ pub(crate) fn projected_field_names(
     let mut names = Vec::with_capacity(projection.len());
     for field_index in projection {
         let field = row_type.fields().get(*field_index).ok_or_else(|| {
-            UnionReadError::InvalidRequest(format!(
+            FlussLakeError::InvalidRequest(format!(
                 "output projection field index {field_index} exceeds table width {}",
                 row_type.fields().len()
             ))
@@ -206,14 +206,14 @@ pub(crate) fn projected_field_names(
 
 /// Plans the immutable Paimon splits of one readable lake snapshot.
 ///
-/// Splits are returned as JSON so that they can be embedded in opaque task
+/// Splits are returned as JSON so that they can be embedded in opaque split
 /// descriptors and shipped to execution workers.
 pub(crate) async fn plan_snapshot_splits(
     table_path: &TablePath,
     catalog_options: &PaimonCatalogOptions,
     snapshot_id: i64,
     projected_fields: Option<&[String]>,
-) -> UnionReadResult<Vec<String>> {
+) -> FlussLakeResult<Vec<String>> {
     let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
     let mut read_builder = table.new_read_builder();
     if let Some(field_names) = projected_fields {
@@ -243,16 +243,16 @@ pub(crate) async fn plan_snapshot_splits(
 pub(crate) fn ensure_deduplicate_merge_engine(
     table_options: &HashMap<String, String>,
     table_path: &TablePath,
-) -> UnionReadResult<()> {
+) -> FlussLakeResult<()> {
     let merge_engine = paimon::spec::CoreOptions::new(table_options)
         .merge_engine()
         .map_err(|error| {
-            UnionReadError::Planning(format!(
+            FlussLakeError::Planning(format!(
                 "failed to resolve the Paimon merge engine of {table_path}: {error}"
             ))
         })?;
     if merge_engine != paimon::spec::MergeEngine::Deduplicate {
-        return Err(UnionReadError::Planning(format!(
+        return Err(FlussLakeError::Planning(format!(
             "primary-key UnionRead only supports the deduplicate merge engine, but the Paimon table for {table_path} uses {merge_engine:?}; refusing to plan a read that would silently produce an incorrect current view"
         )));
     }
@@ -261,7 +261,7 @@ pub(crate) fn ensure_deduplicate_merge_engine(
 
 /// Plans the Paimon splits of a primary-key snapshot, grouped by bucket.
 ///
-/// A PK bucket's lake baseline and its log tail must land in the same task,
+/// A PK bucket's lake baseline and its log tail must land in the same split,
 /// so splits are keyed by their Paimon bucket id — which Fluss tiering keeps
 /// aligned with the Fluss bucket id. Planning is rejected up front for merge
 /// engines other than deduplicate.
@@ -269,7 +269,7 @@ pub(crate) async fn plan_pk_snapshot_splits(
     table_path: &TablePath,
     catalog_options: &PaimonCatalogOptions,
     snapshot_id: i64,
-) -> UnionReadResult<HashMap<i32, Vec<String>>> {
+) -> FlussLakeResult<HashMap<i32, Vec<String>>> {
     let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
     ensure_deduplicate_merge_engine(table.schema().options(), table_path)?;
 
@@ -283,7 +283,7 @@ pub(crate) async fn plan_pk_snapshot_splits(
     let mut splits_by_bucket: HashMap<i32, Vec<String>> = HashMap::new();
     for split in plan.splits() {
         if split.bucket() < 0 {
-            return Err(UnionReadError::Planning(format!(
+            return Err(FlussLakeError::Planning(format!(
                 "Paimon snapshot {snapshot_id} of {table_path} produced a split with negative bucket {}",
                 split.bucket()
             )));
@@ -296,9 +296,9 @@ pub(crate) async fn plan_pk_snapshot_splits(
     Ok(splits_by_bucket)
 }
 
-fn encode_split(split: &DataSplit) -> UnionReadResult<String> {
+fn encode_split(split: &DataSplit) -> FlussLakeResult<String> {
     serde_json::to_string(split).map_err(|error| {
-        UnionReadError::Planning(format!("failed to serialize Paimon split: {error}"))
+        FlussLakeError::Planning(format!("failed to serialize Paimon split: {error}"))
     })
 }
 
@@ -309,7 +309,7 @@ pub(crate) async fn read_snapshot_split(
     snapshot_id: i64,
     projected_fields: Option<&[String]>,
     encoded_split: &str,
-) -> UnionReadResult<SendableRecordBatchStream> {
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     read_snapshot_splits(
         table_path,
         catalog_options,
@@ -333,7 +333,7 @@ pub(crate) async fn read_snapshot_splits(
     snapshot_id: i64,
     projected_fields: Option<&[String]>,
     splits: Vec<DataSplit>,
-) -> UnionReadResult<SendableRecordBatchStream> {
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
     let mut read_builder = table.new_read_builder();
     if let Some(field_names) = projected_fields {
@@ -353,14 +353,14 @@ pub(crate) async fn read_snapshot_splits(
     })))
 }
 
-pub(crate) fn decode_split(encoded_split: &str) -> UnionReadResult<DataSplit> {
+pub(crate) fn decode_split(encoded_split: &str) -> FlussLakeResult<DataSplit> {
     serde_json::from_str(encoded_split).map_err(|error| {
-        UnionReadError::InvalidTask(format!("failed to decode Paimon split: {error}"))
+        FlussLakeError::InvalidSplit(format!("failed to decode Paimon split: {error}"))
     })
 }
 
-fn paimon_error(action: &str, error: paimon::Error) -> UnionReadError {
-    UnionReadError::Execution(format!("failed to {action}: {error}"))
+fn paimon_error(action: &str, error: paimon::Error) -> FlussLakeError {
+    FlussLakeError::Execution(format!("failed to {action}: {error}"))
 }
 
 #[cfg(test)]
@@ -419,16 +419,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_credentials_override_task_carried_options() {
-        let mut task_options = HashMap::new();
-        task_options.insert("warehouse".to_string(), "/tmp/warehouse".to_string());
-        task_options.insert("s3.endpoint".to_string(), "http://stale:9000".to_string());
+    fn runtime_credentials_override_split_carried_options() {
+        let mut split_options = HashMap::new();
+        split_options.insert("warehouse".to_string(), "/tmp/warehouse".to_string());
+        split_options.insert("s3.endpoint".to_string(), "http://stale:9000".to_string());
         let mut credentials = HashMap::new();
         credentials.insert("s3.secret-key".to_string(), "ROTATED".to_string());
         credentials.insert("s3.endpoint".to_string(), "http://fresh:9000".to_string());
 
         let merged =
-            PaimonCatalogOptions::from_map(task_options).with_runtime_credentials(&credentials);
+            PaimonCatalogOptions::from_map(split_options).with_runtime_credentials(&credentials);
 
         assert_eq!(
             merged.as_map().get("s3.secret-key"),
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(
             merged.as_map().get("s3.endpoint"),
             Some(&"http://fresh:9000".to_string()),
-            "a credential rotated after planning must win over the task value"
+            "a credential rotated after planning must win over the split value"
         );
         assert_eq!(
             merged.as_map().get("warehouse"),
@@ -449,7 +449,7 @@ mod tests {
     fn rejects_projection_beyond_the_frozen_schema() {
         assert!(matches!(
             projected_field_names(&row_type(), Some(&[3])),
-            Err(UnionReadError::InvalidRequest(_))
+            Err(FlussLakeError::InvalidRequest(_))
         ));
     }
 
@@ -488,7 +488,7 @@ mod tests {
                         &merge_engine_options(Some(rejected)),
                         &table_path
                     ),
-                    Err(UnionReadError::Planning(_))
+                    Err(FlussLakeError::Planning(_))
                 ),
                 "merge engine {rejected} must be rejected at planning"
             );

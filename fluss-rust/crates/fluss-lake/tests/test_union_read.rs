@@ -28,9 +28,8 @@ use fluss::predicate::{ComparisonOperator, FieldRef, PruningPredicate};
 #[cfg(feature = "paimon")]
 use fluss::row::GenericRow;
 use fluss_lake::{
-    FlussUnionReadExecutor, FlussUnionReadPlanner, PredicateId, PredicateInput,
-    PredicatePushdownLevel, UnionReadError, UnionReadExecutionContext, UnionReadExecutor,
-    UnionReadPlanner, UnionReadRequest, UnionReadTask,
+    FlussLakeError, FlussLakeExecutionContext, FlussLakePredicateId, FlussLakePredicateInput,
+    FlussLakePredicatePushdownLevel, FlussLakeReadSplit, FlussLakeTable,
 };
 use futures::TryStreamExt;
 use std::sync::Arc;
@@ -206,37 +205,43 @@ async fn paimon_pk_union_read_merges_update_delete_and_insert_end_to_end() {
         .await
         .expect("Failed to flush Paimon PK changelog tail");
 
-    let plan = FlussUnionReadPlanner::new(connection.clone())
-        .plan(UnionReadRequest::new(table_path.clone()))
+    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
+        .await
+        .expect("Failed to open real Paimon PK lake table");
+    let scan = lake_table.new_scan();
+    let plan = scan
+        .plan()
         .await
         .expect("Failed to plan real Paimon PK UnionRead");
     assert_eq!(
-        plan.tasks().len(),
+        plan.splits().len(),
         1,
-        "one bucket must produce one hybrid task containing all Paimon splits and its log tail"
+        "one bucket must produce one hybrid split containing all Paimon splits and its log tail"
     );
-    let transported_task =
-        UnionReadTask::decode(&plan.tasks()[0].encode().expect("Failed to encode PK task"))
-            .expect("Failed to decode transported PK task");
+    let transported_split = FlussLakeReadSplit::decode(
+        &plan.splits()[0]
+            .encode()
+            .expect("Failed to encode PK split"),
+    )
+    .expect("Failed to decode transported PK split");
+    let read = scan
+        .new_read(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
+        .expect("Failed to create real Paimon PK UnionRead reader");
 
-    let execute = |task| {
-        FlussUnionReadExecutor
-            .execute(
-                task,
-                UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
-            )
-            .expect("Failed to execute real Paimon PK UnionRead task")
+    let execute = |split| {
+        read.read_split(split)
+            .expect("Failed to execute real Paimon PK UnionRead split")
     };
     let first = tokio::time::timeout(
         Duration::from_secs(20),
-        execute(transported_task.clone()).try_collect::<Vec<_>>(),
+        execute(transported_split.clone()).try_collect::<Vec<_>>(),
     )
     .await
     .expect("Timed out waiting for real Paimon PK UnionRead")
     .expect("Failed to collect real Paimon PK UnionRead");
     let retried = tokio::time::timeout(
         Duration::from_secs(20),
-        execute(transported_task).try_collect::<Vec<_>>(),
+        execute(transported_split).try_collect::<Vec<_>>(),
     )
     .await
     .expect("Timed out waiting for retried Paimon PK UnionRead")
@@ -251,7 +256,7 @@ async fn paimon_pk_union_read_merges_update_delete_and_insert_end_to_end() {
     assert_eq!(
         extract_pk_rows(&retried),
         expected,
-        "retrying an immutable transported task must reproduce the same logical rows"
+        "retrying an immutable transported split must reproduce the same logical rows"
     );
 
     drop(writer);
@@ -299,19 +304,23 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         .await
         .expect("Failed to flush pre-plan batch");
 
-    let plan = FlussUnionReadPlanner::new(connection.clone())
-        .plan(UnionReadRequest::new(table_path.clone()).with_output_projection(vec![1]))
+    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
+        .await
+        .expect("Failed to open append-log lake table");
+    let scan = lake_table.new_scan().with_output_projection(vec![1]);
+    let plan = scan
+        .plan()
         .await
         .expect("Failed to plan append-log UnionRead");
     assert_eq!(plan.output_schema().fields().len(), 1);
     assert_eq!(plan.output_schema().field(0).name(), "name");
-    assert_eq!(plan.tasks().len(), 1);
-    let transported_task = UnionReadTask::decode(
-        &plan.tasks()[0]
+    assert_eq!(plan.splits().len(), 1);
+    let transported_split = FlussLakeReadSplit::decode(
+        &plan.splits()[0]
             .encode()
-            .expect("Failed to encode UnionRead task"),
+            .expect("Failed to encode UnionRead split"),
     )
-    .expect("Failed to decode transported UnionRead task");
+    .expect("Failed to decode transported UnionRead split");
 
     writer
         .append_arrow_batch(append_batch(vec![4, 5], vec!["after-4", "after-5"]))
@@ -321,12 +330,12 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         .await
         .expect("Failed to flush post-plan batch");
 
-    let stream = FlussUnionReadExecutor
-        .execute(
-            transported_task,
-            UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
-        )
-        .expect("Failed to execute append-log UnionRead task");
+    let read = scan
+        .new_read(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
+        .expect("Failed to create append-log UnionRead reader");
+    let stream = read
+        .read_split(transported_split)
+        .expect("Failed to execute append-log UnionRead split");
     let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
         .await
         .expect("Timed out waiting for bounded UnionRead stream to finish")
@@ -415,39 +424,46 @@ async fn partitioned_plan_prunes_partitions_and_executes_matching_buckets() {
         .await
         .expect("Failed to flush partitioned batches");
 
-    let request =
-        UnionReadRequest::new(table_path.clone()).with_predicates(vec![PredicateInput::new(
-            PredicateId::new(7),
+    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
+        .await
+        .expect("Failed to open partitioned lake table");
+    let scan = lake_table
+        .new_scan()
+        .with_predicates(vec![FlussLakePredicateInput::new(
+            FlussLakePredicateId::new(7),
             PruningPredicate::comparison(
                 ComparisonOperator::Equal,
                 FieldRef::new(1, "region", DataTypes::string()),
                 "US",
             ),
         )]);
-    let plan = FlussUnionReadPlanner::new(connection.clone())
-        .plan(request)
+    let plan = scan
+        .plan()
         .await
         .expect("Failed to plan partitioned UnionRead");
 
     let decisions = plan.predicate_pushdown_decisions();
     assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0].predicate_id(), PredicateId::new(7));
-    assert_eq!(decisions[0].level(), PredicatePushdownLevel::PruningOnly);
+    assert_eq!(decisions[0].predicate_id(), FlussLakePredicateId::new(7));
+    assert_eq!(
+        decisions[0].level(),
+        FlussLakePredicatePushdownLevel::PruningOnly
+    );
     assert!(decisions[0].level().requires_residual_evaluation());
     // The EU partition is pruned, so only the US partition's bucket remains.
-    assert_eq!(plan.tasks().len(), 1);
+    assert_eq!(plan.splits().len(), 1);
 
+    let read = scan
+        .new_read(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
+        .expect("Failed to create partitioned UnionRead reader");
     let mut ids = Vec::new();
-    for task in plan.tasks() {
-        let transported_task =
-            UnionReadTask::decode(&task.encode().expect("Failed to encode UnionRead task"))
-                .expect("Failed to decode transported UnionRead task");
-        let stream = FlussUnionReadExecutor
-            .execute(
-                transported_task,
-                UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
-            )
-            .expect("Failed to execute partitioned UnionRead task");
+    for split in plan.splits() {
+        let transported_split =
+            FlussLakeReadSplit::decode(&split.encode().expect("Failed to encode UnionRead split"))
+                .expect("Failed to decode transported UnionRead split");
+        let stream = read
+            .read_split(transported_split)
+            .expect("Failed to execute partitioned UnionRead split");
         let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
             .await
             .expect("Timed out waiting for bounded UnionRead stream to finish")
@@ -465,7 +481,7 @@ async fn partitioned_plan_prunes_partitions_and_executes_matching_buckets() {
 }
 
 #[tokio::test]
-async fn stale_schema_task_is_rejected_after_alter_table() {
+async fn stale_schema_split_is_rejected_after_alter_table() {
     let cluster = support::get_shared_cluster();
     let connection = Arc::new(cluster.get_fluss_connection().await);
     let admin = connection.get_admin().expect("Failed to get Fluss admin");
@@ -499,12 +515,16 @@ async fn stale_schema_task_is_rejected_after_alter_table() {
         .await
         .expect("Failed to flush pre-plan batch");
 
-    let plan = FlussUnionReadPlanner::new(connection.clone())
-        .plan(UnionReadRequest::new(table_path.clone()))
+    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
+        .await
+        .expect("Failed to open stale-schema lake table");
+    let scan = lake_table.new_scan();
+    let plan = scan
+        .plan()
         .await
         .expect("Failed to plan append-log UnionRead");
-    assert_eq!(plan.tasks().len(), 1);
-    let stale_task = plan.tasks()[0].clone();
+    assert_eq!(plan.splits().len(), 1);
+    let stale_split = plan.splits()[0].clone();
 
     let age_type_json = serde_json::to_vec(
         &DataTypes::int()
@@ -529,26 +549,26 @@ async fn stale_schema_task_is_rejected_after_alter_table() {
         .await
         .expect("Failed to alter UnionRead integration test table");
 
-    // `execute` is synchronous and lazy: schema drift is an environment
+    // `read_split` is synchronous and lazy: schema drift is an environment
     // failure, so it surfaces as the first item of the returned stream.
-    let stream = FlussUnionReadExecutor
-        .execute(
-            stale_task,
-            UnionReadExecutionContext::default().with_fluss_connection(connection.clone()),
-        )
-        .expect("Opening a stale-schema task stream must not fail structurally");
+    let read = scan
+        .new_read(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
+        .expect("Failed to create stale-schema UnionRead reader");
+    let stream = read
+        .read_split(stale_split)
+        .expect("Opening a stale-schema split stream must not fail structurally");
     let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
         .await
-        .expect("Timed out waiting for the stale-schema task to fail");
+        .expect("Timed out waiting for the stale-schema split to fail");
     match result {
-        Err(UnionReadError::Execution(message)) => {
+        Err(FlussLakeError::Execution(message)) => {
             assert!(
                 message.contains("schema id"),
                 "unexpected execution error: {message}"
             );
         }
         Err(other) => panic!("expected an execution error, got: {other}"),
-        Ok(_) => panic!("stale-schema task must not execute after alter table"),
+        Ok(_) => panic!("stale-schema split must not execute after alter table"),
     }
 
     drop(writer);

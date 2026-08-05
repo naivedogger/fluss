@@ -17,15 +17,15 @@
 
 //! Low-level planning helpers used by the UnionRead implementation.
 //!
-//! Upstream engines should use [`crate::UnionReadPlanner`] and treat its tasks
-//! as opaque rather than depending on the types in this module.
+//! Upstream engines should use [`crate::FlussLakeScan`] and treat its splits as
+//! opaque rather than depending on the types in this module.
 
-use crate::task::{
-    AppendLogTaskDescriptor, LakeSplitTaskDescriptor, PkHybridTaskDescriptor, TaskDescriptor,
+use crate::split_descriptor::{
+    AppendLogSplitDescriptor, LakeSplitDescriptor, PkHybridSplitDescriptor, SplitDescriptor,
 };
 use crate::{
-    CURRENT_UNION_READ_TASK_VERSION, UnionReadError, UnionReadResult, UnionReadStatistics,
-    UnionReadTask,
+    CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeError, FlussLakeReadSplit, FlussLakeReadStatistics,
+    FlussLakeResult,
 };
 use fluss::SnapshotId;
 use fluss::client::FlussAdmin;
@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, HashMap};
 
 /// One immutable `[start_offset, stop_offset)` Fluss log boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrozenBucketRange {
+pub(crate) struct FrozenBucketRange {
     table_bucket: TableBucket,
     partition_name: Option<String>,
     start_offset: i64,
@@ -48,18 +48,6 @@ impl FrozenBucketRange {
         &self.table_bucket
     }
 
-    pub fn partition_name(&self) -> Option<&str> {
-        self.partition_name.as_deref()
-    }
-
-    pub fn start_offset(&self) -> i64 {
-        self.start_offset
-    }
-
-    pub fn stop_offset(&self) -> i64 {
-        self.stop_offset
-    }
-
     pub fn is_empty(&self) -> bool {
         self.start_offset == self.stop_offset
     }
@@ -67,7 +55,7 @@ impl FrozenBucketRange {
 
 /// A readable lake snapshot and all server-issued Fluss log boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrozenReadBoundary {
+pub(crate) struct FrozenReadBoundary {
     readable_lake_snapshot_id: Option<SnapshotId>,
     bucket_ranges: Vec<FrozenBucketRange>,
 }
@@ -82,15 +70,15 @@ impl FrozenReadBoundary {
     }
 }
 
-/// Creates one opaque append-log task from a frozen bucket range.
-pub fn create_append_log_task(
+/// Creates one opaque append-log split from a frozen bucket range.
+pub(crate) fn create_append_log_split(
     table_path: &TablePath,
     schema_id: i32,
     bucket_range: &FrozenBucketRange,
     output_projection: Option<&[usize]>,
-    statistics: UnionReadStatistics,
-) -> UnionReadResult<UnionReadTask> {
-    let descriptor = TaskDescriptor::AppendLog(AppendLogTaskDescriptor::try_new(
+    statistics: FlussLakeReadStatistics,
+) -> FlussLakeResult<FlussLakeReadSplit> {
+    let descriptor = SplitDescriptor::AppendLog(AppendLogSplitDescriptor::try_new(
         table_path.clone(),
         schema_id,
         bucket_range.table_bucket.clone(),
@@ -102,7 +90,7 @@ pub fn create_append_log_task(
         .table_bucket
         .partition_id()
         .map_or_else(|| "root".to_string(), |id| id.to_string());
-    let task_id = format!(
+    let split_id = format!(
         "append-log/{}/{}/{}/{}-{}",
         bucket_range.table_bucket.table_id(),
         partition,
@@ -110,51 +98,51 @@ pub fn create_append_log_task(
         bucket_range.start_offset,
         bucket_range.stop_offset
     );
-    UnionReadTask::try_new(
-        task_id,
-        CURRENT_UNION_READ_TASK_VERSION,
+    FlussLakeReadSplit::try_new(
+        split_id,
+        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
         descriptor.encode()?,
         statistics,
     )
 }
 
-/// Creates one opaque lake-split task from a frozen lake snapshot split.
+/// Creates one opaque lake split from a frozen lake snapshot split.
 ///
-/// `split_index` only makes the task id unique and readable for scheduling; the
+/// `split_index` only makes the split id unique and readable for scheduling; the
 /// executor never derives read semantics from it.
 #[cfg_attr(not(feature = "paimon"), allow(dead_code))]
-pub(crate) fn create_lake_split_task(
+pub(crate) fn create_lake_split(
     table_path: &TablePath,
     snapshot_id: i64,
     catalog_options: BTreeMap<String, String>,
     projected_fields: Option<Vec<String>>,
     encoded_split: String,
     split_index: usize,
-    statistics: UnionReadStatistics,
-) -> UnionReadResult<UnionReadTask> {
-    let descriptor = TaskDescriptor::LakeSplit(LakeSplitTaskDescriptor::try_new(
+    statistics: FlussLakeReadStatistics,
+) -> FlussLakeResult<FlussLakeReadSplit> {
+    let descriptor = SplitDescriptor::LakeSplit(LakeSplitDescriptor::try_new(
         table_path.clone(),
         snapshot_id,
         catalog_options,
         projected_fields,
         encoded_split,
     )?);
-    let task_id = format!("lake-split/{table_path}/{snapshot_id}/{split_index}");
-    UnionReadTask::try_new(
-        task_id,
-        CURRENT_UNION_READ_TASK_VERSION,
+    let split_id = format!("lake-split/{table_path}/{snapshot_id}/{split_index}");
+    FlussLakeReadSplit::try_new(
+        split_id,
+        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
         descriptor.encode()?,
         statistics,
     )
 }
 
-/// Creates one opaque primary-key hybrid task from a frozen bucket boundary.
+/// Creates one opaque primary-key hybrid split from a frozen bucket boundary.
 ///
-/// All lake splits of the bucket travel in this single task: a PK merge
+/// All lake splits of the bucket travel in this single split: a PK merge
 /// completes independently per bucket, and its lake baseline and log tail
 /// must meet inside one executor.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_pk_hybrid_task(
+pub(crate) fn create_pk_hybrid_split(
     table_path: &TablePath,
     schema_id: i32,
     bucket_range: &FrozenBucketRange,
@@ -163,9 +151,9 @@ pub(crate) fn create_pk_hybrid_task(
     lake_splits: Vec<String>,
     pk_indexes: Vec<usize>,
     output_projection: Option<&[usize]>,
-    statistics: UnionReadStatistics,
-) -> UnionReadResult<UnionReadTask> {
-    let descriptor = TaskDescriptor::PkHybrid(PkHybridTaskDescriptor::try_new(
+    statistics: FlussLakeReadStatistics,
+) -> FlussLakeResult<FlussLakeReadSplit> {
+    let descriptor = SplitDescriptor::PkHybrid(PkHybridSplitDescriptor::try_new(
         table_path.clone(),
         schema_id,
         bucket_range.table_bucket.clone(),
@@ -181,7 +169,7 @@ pub(crate) fn create_pk_hybrid_task(
         .table_bucket
         .partition_id()
         .map_or_else(|| "root".to_string(), |id| id.to_string());
-    let task_id = format!(
+    let split_id = format!(
         "pk-hybrid/{}/{}/{}/{}-{}",
         bucket_range.table_bucket.table_id(),
         partition,
@@ -189,32 +177,12 @@ pub(crate) fn create_pk_hybrid_task(
         bucket_range.start_offset,
         bucket_range.stop_offset
     );
-    UnionReadTask::try_new(
-        task_id,
-        CURRENT_UNION_READ_TASK_VERSION,
+    FlussLakeReadSplit::try_new(
+        split_id,
+        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
         descriptor.encode()?,
         statistics,
     )
-}
-
-/// Freezes the mutable table state needed by a bounded UnionRead plan.
-///
-/// The readable lake snapshot supplies per-bucket start offsets. Buckets not
-/// represented in the snapshot — including every bucket when no readable
-/// snapshot exists at all — start at the server-issued earliest offset,
-/// matching the Java connector's fallback in all no-snapshot cases. Stop
-/// offsets always come from a server `Latest` list-offsets response. The
-/// returned values are copied into task descriptions and never recomputed by
-/// executors.
-pub async fn freeze_read_boundary(
-    admin: &FlussAdmin,
-    table_path: &TablePath,
-) -> UnionReadResult<FrozenReadBoundary> {
-    let table_info = admin
-        .get_table_info(table_path)
-        .await
-        .map_err(|error| planning_client_error("get table metadata", error))?;
-    freeze_read_boundary_for_table(admin, table_path, &table_info, None).await
 }
 
 /// Freezes boundaries for a resolved table, optionally skipping partitions.
@@ -227,9 +195,9 @@ pub(crate) async fn freeze_read_boundary_for_table(
     table_path: &TablePath,
     table_info: &TableInfo,
     partition_filter: Option<&(dyn Fn(&PartitionInfo) -> bool + Sync)>,
-) -> UnionReadResult<FrozenReadBoundary> {
+) -> FlussLakeResult<FrozenReadBoundary> {
     if table_info.num_buckets <= 0 {
-        return Err(UnionReadError::Planning(format!(
+        return Err(FlussLakeError::Planning(format!(
             "table {table_path} has invalid bucket count {}",
             table_info.num_buckets
         )));
@@ -305,12 +273,12 @@ fn collect_snapshot_offsets(
     table_path: &TablePath,
     table_id: i64,
     readable_snapshot: Option<&LakeSnapshotInfo>,
-) -> UnionReadResult<HashMap<TableBucket, i64>> {
+) -> FlussLakeResult<HashMap<TableBucket, i64>> {
     let Some(snapshot) = readable_snapshot else {
         return Ok(HashMap::new());
     };
     if snapshot.table_id != table_id {
-        return Err(UnionReadError::Planning(format!(
+        return Err(FlussLakeError::Planning(format!(
             "readable snapshot {} belongs to table id {}, but {table_path} resolved to table id {table_id}",
             snapshot.snapshot_id, snapshot.table_id
         )));
@@ -322,7 +290,7 @@ fn collect_snapshot_offsets(
             continue;
         };
         if offset < 0 {
-            return Err(UnionReadError::Planning(format!(
+            return Err(FlussLakeError::Planning(format!(
                 "readable snapshot {} returned negative log offset {offset} for bucket {}",
                 snapshot.snapshot_id, bucket_snapshot.bucket_id
             )));
@@ -333,7 +301,7 @@ fn collect_snapshot_offsets(
             bucket_snapshot.bucket_id,
         );
         if offsets.insert(table_bucket.clone(), offset).is_some() {
-            return Err(UnionReadError::Planning(format!(
+            return Err(FlussLakeError::Planning(format!(
                 "readable snapshot {} contains duplicate boundary for {table_bucket}",
                 snapshot.snapshot_id
             )));
@@ -347,7 +315,7 @@ async fn load_server_offsets(
     table_path: &TablePath,
     partition_name: Option<&str>,
     bucket_ids: &[i32],
-) -> UnionReadResult<(HashMap<i32, i64>, HashMap<i32, i64>)> {
+) -> FlussLakeResult<(HashMap<i32, i64>, HashMap<i32, i64>)> {
     let earliest = list_server_offsets(
         admin,
         table_path,
@@ -371,7 +339,7 @@ async fn list_server_offsets(
     partition_name: Option<&str>,
     bucket_ids: &[i32],
     offset_spec: OffsetSpec,
-) -> UnionReadResult<HashMap<i32, i64>> {
+) -> FlussLakeResult<HashMap<i32, i64>> {
     let offset_name = match offset_spec {
         OffsetSpec::Earliest => "earliest",
         OffsetSpec::Latest => "latest",
@@ -398,12 +366,12 @@ fn required_offset(
     offsets: &HashMap<i32, i64>,
     table_bucket: &TableBucket,
     offset_name: &str,
-) -> UnionReadResult<i64> {
+) -> FlussLakeResult<i64> {
     offsets
         .get(&table_bucket.bucket_id())
         .copied()
         .ok_or_else(|| {
-            UnionReadError::Planning(format!(
+            FlussLakeError::Planning(format!(
                 "server did not return the {offset_name} offset for {table_bucket}"
             ))
         })
@@ -415,9 +383,9 @@ fn freeze_bucket_range(
     snapshot_offset: Option<i64>,
     earliest_offset: i64,
     stop_offset: i64,
-) -> UnionReadResult<FrozenBucketRange> {
+) -> FlussLakeResult<FrozenBucketRange> {
     if earliest_offset < 0 || stop_offset < 0 {
-        return Err(UnionReadError::Planning(format!(
+        return Err(FlussLakeError::Planning(format!(
             "server returned a negative log boundary [{earliest_offset}, {stop_offset}) for {table_bucket}"
         )));
     }
@@ -428,12 +396,12 @@ fn freeze_bucket_range(
         // the server's earliest offset. The Java connector fails too, at
         // fetch time (offset-out-of-range); surfacing it at plan time gives
         // a clearer, typed error before any work is scheduled.
-        return Err(UnionReadError::DataUnavailable(format!(
+        return Err(FlussLakeError::DataUnavailable(format!(
             "readable snapshot offset {start_offset} for {table_bucket} is older than the server earliest offset {earliest_offset}: the log tail needed to complete the result has been removed by retention; re-plan to freeze currently-valid boundaries"
         )));
     }
     if start_offset > stop_offset {
-        return Err(UnionReadError::Planning(format!(
+        return Err(FlussLakeError::Planning(format!(
             "read start offset {start_offset} exceeds server latest offset {stop_offset} for {table_bucket}"
         )));
     }
@@ -446,8 +414,8 @@ fn freeze_bucket_range(
     })
 }
 
-fn planning_client_error(action: &str, error: ClientError) -> UnionReadError {
-    UnionReadError::Planning(format!("failed to {action}: {error}"))
+fn planning_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    FlussLakeError::Planning(format!("failed to {action}: {error}"))
 }
 
 #[cfg(test)]
@@ -458,8 +426,8 @@ mod tests {
     fn snapshot_offset_defines_start_and_server_latest_defines_stop() {
         let range = freeze_bucket_range(TableBucket::new(5, 2), None, Some(12), 8, 20).unwrap();
 
-        assert_eq!(range.start_offset(), 12);
-        assert_eq!(range.stop_offset(), 20);
+        assert_eq!(range.start_offset, 12);
+        assert_eq!(range.stop_offset, 20);
         assert!(!range.is_empty());
     }
 
@@ -467,25 +435,25 @@ mod tests {
     fn bucket_without_snapshot_uses_frozen_server_earliest() {
         let range = freeze_bucket_range(TableBucket::new(5, 2), None, None, 8, 20).unwrap();
 
-        assert_eq!(range.start_offset(), 8);
-        assert_eq!(range.stop_offset(), 20);
+        assert_eq!(range.start_offset, 8);
+        assert_eq!(range.stop_offset, 20);
     }
 
     #[test]
     fn snapshot_gap_caused_by_log_retention_is_data_unavailable() {
         let result = freeze_bucket_range(TableBucket::new(5, 2), None, Some(7), 8, 20);
 
-        // Re-executing a task frozen on this boundary can never succeed, so
+        // Re-executing a split frozen on this boundary can never succeed, so
         // the error must be the typed, re-plan-recoverable kind rather than
         // a generic planning failure.
-        assert!(matches!(result, Err(UnionReadError::DataUnavailable(_))));
+        assert!(matches!(result, Err(FlussLakeError::DataUnavailable(_))));
     }
 
     #[test]
     fn rejects_start_after_server_latest() {
         let result = freeze_bucket_range(TableBucket::new(5, 2), None, Some(21), 8, 20);
 
-        assert!(matches!(result, Err(UnionReadError::Planning(_))));
+        assert!(matches!(result, Err(FlussLakeError::Planning(_))));
     }
 
     #[test]

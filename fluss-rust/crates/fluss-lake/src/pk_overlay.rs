@@ -30,7 +30,7 @@
 //! snapshot mechanism targets — per-file reads are already merge-free, so an
 //! imposed sort would pay for ordering the layout no longer needs.
 
-use crate::{SendableRecordBatchStream, UnionReadError, UnionReadResult};
+use crate::{FlussLakeError, FlussLakeRecordBatchStream, FlussLakeResult};
 use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::{filter_record_batch, interleave_record_batch};
 use arrow::datatypes::SchemaRef;
@@ -76,16 +76,16 @@ impl PkOverlay {
         schema: SchemaRef,
         key_positions: Vec<usize>,
         memory_limit_bytes: Option<usize>,
-    ) -> UnionReadResult<Self> {
+    ) -> FlussLakeResult<Self> {
         if key_positions.is_empty() {
-            return Err(UnionReadError::InvalidTask(
+            return Err(FlussLakeError::InvalidSplit(
                 "primary-key merge requires at least one key column".to_string(),
             ));
         }
         let mut sort_fields = Vec::with_capacity(key_positions.len());
         for position in &key_positions {
             let field = schema.fields().get(*position).ok_or_else(|| {
-                UnionReadError::InvalidTask(format!(
+                FlussLakeError::InvalidSplit(format!(
                     "primary-key column position {position} exceeds the physical read width {}",
                     schema.fields().len()
                 ))
@@ -93,7 +93,7 @@ impl PkOverlay {
             sort_fields.push(SortField::new(field.data_type().clone()));
         }
         let key_converter = RowConverter::new(sort_fields).map_err(|error| {
-            UnionReadError::Execution(format!(
+            FlussLakeError::Execution(format!(
                 "failed to create the primary-key row encoder: {error}"
             ))
         })?;
@@ -113,7 +113,7 @@ impl PkOverlay {
     ///
     /// Both merge inputs go through this one converter, so the encoded bytes
     /// are comparable across the lake and log sides.
-    fn encode_keys(&self, batch: &RecordBatch) -> UnionReadResult<Rows> {
+    fn encode_keys(&self, batch: &RecordBatch) -> FlussLakeResult<Rows> {
         let key_columns: Vec<_> = self
             .key_positions
             .iter()
@@ -122,7 +122,7 @@ impl PkOverlay {
         self.key_converter
             .convert_columns(&key_columns)
             .map_err(|error| {
-                UnionReadError::Execution(format!("failed to encode primary keys: {error}"))
+                FlussLakeError::Execution(format!("failed to encode primary keys: {error}"))
             })
     }
 
@@ -133,12 +133,12 @@ impl PkOverlay {
     /// are rebuilt under the frozen schema — which keeps the emitted batches
     /// matching the plan's output schema — while any real disagreement about
     /// column names or types fails explicitly instead of being reinterpreted.
-    fn normalize(&self, batch: &RecordBatch) -> UnionReadResult<RecordBatch> {
+    fn normalize(&self, batch: &RecordBatch) -> FlussLakeResult<RecordBatch> {
         if batch.schema_ref() == &self.schema {
             return Ok(batch.clone());
         }
         if batch.num_columns() != self.schema.fields().len() {
-            return Err(UnionReadError::Execution(format!(
+            return Err(FlussLakeError::Execution(format!(
                 "primary-key merge input has {} columns but the frozen physical read has {}",
                 batch.num_columns(),
                 self.schema.fields().len()
@@ -147,7 +147,7 @@ impl PkOverlay {
         for (position, expected) in self.schema.fields().iter().enumerate() {
             let actual = batch.schema_ref().field(position);
             if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
-                return Err(UnionReadError::Execution(format!(
+                return Err(FlussLakeError::Execution(format!(
                     "primary-key merge input column {position} is {}:{} but the frozen physical read expects {}:{}",
                     actual.name(),
                     actual.data_type(),
@@ -157,7 +157,7 @@ impl PkOverlay {
             }
         }
         RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec()).map_err(|error| {
-            UnionReadError::Execution(format!(
+            FlussLakeError::Execution(format!(
                 "failed to restate a primary-key merge input under the frozen read schema: {error}"
             ))
         })
@@ -171,9 +171,9 @@ impl PkOverlay {
         &mut self,
         batch: RecordBatch,
         change_types: &[ChangeType],
-    ) -> UnionReadResult<()> {
+    ) -> FlussLakeResult<()> {
         if change_types.len() != batch.num_rows() {
-            return Err(UnionReadError::Execution(format!(
+            return Err(FlussLakeError::Execution(format!(
                 "changelog batch has {} rows but {} change types",
                 batch.num_rows(),
                 change_types.len()
@@ -201,7 +201,7 @@ impl PkOverlay {
                 }),
                 ChangeType::Delete | ChangeType::UpdateBefore => None,
                 ChangeType::AppendOnly => {
-                    return Err(UnionReadError::Execution(format!(
+                    return Err(FlussLakeError::Execution(format!(
                         "primary-key merge received an append-only record at row {row_index}; a changelog is required to reconstruct the current view"
                     )));
                 }
@@ -221,7 +221,7 @@ impl PkOverlay {
     pub(crate) fn probe_lake_batch(
         &self,
         batch: &RecordBatch,
-    ) -> UnionReadResult<Option<RecordBatch>> {
+    ) -> FlussLakeResult<Option<RecordBatch>> {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -236,7 +236,7 @@ impl PkOverlay {
             return Ok(None);
         }
         let filtered = filter_record_batch(&batch, &keep).map_err(|error| {
-            UnionReadError::Execution(format!("failed to filter superseded lake rows: {error}"))
+            FlussLakeError::Execution(format!("failed to filter superseded lake rows: {error}"))
         })?;
         Ok(Some(filtered))
     }
@@ -244,7 +244,7 @@ impl PkOverlay {
     /// Emits the tail rows that survive as the current value of their key.
     ///
     /// Called once the lake side has drained; tombstones contribute nothing.
-    pub(crate) fn into_surviving_batch(self) -> UnionReadResult<Option<RecordBatch>> {
+    pub(crate) fn into_surviving_batch(self) -> FlussLakeResult<Option<RecordBatch>> {
         let mut indices: Vec<(usize, usize)> = self
             .entries
             .values()
@@ -254,12 +254,12 @@ impl PkOverlay {
             return Ok(None);
         }
         // Emission order is unspecified by contract, but a deterministic
-        // order keeps results reproducible across runs of the same task.
+        // order keeps results reproducible across runs of the same split.
         indices.sort_unstable();
 
         let batches: Vec<&RecordBatch> = self.tail_batches.iter().collect();
         let merged = interleave_record_batch(&batches, &indices).map_err(|error| {
-            UnionReadError::Execution(format!("failed to emit surviving changelog rows: {error}"))
+            FlussLakeError::Execution(format!("failed to emit surviving changelog rows: {error}"))
         })?;
         Ok(Some(merged))
     }
@@ -268,11 +268,11 @@ impl PkOverlay {
     ///
     /// v1 does not spill: availability degrades explicitly, never
     /// correctness. A tail this large means tiering has fallen far behind.
-    fn check_memory_limit(&self) -> UnionReadResult<()> {
+    fn check_memory_limit(&self) -> FlussLakeResult<()> {
         if let Some(limit) = self.memory_limit_bytes
             && self.charged_bytes > limit
         {
-            return Err(UnionReadError::Execution(format!(
+            return Err(FlussLakeError::Execution(format!(
                 "primary-key merge overlay needs at least {} bytes for {} distinct keys, exceeding the {limit} byte limit; the changelog tail is too large to merge in memory (v1 does not spill), so re-run with a higher limit or after lake tiering catches up",
                 self.charged_bytes,
                 self.entries.len()
@@ -290,13 +290,13 @@ impl PkOverlay {
 /// below by the tail read, an accepted v1 tradeoff of hash overlay.
 pub(crate) fn merged_stream(
     overlay: PkOverlay,
-    lake_stream: SendableRecordBatchStream,
+    lake_stream: FlussLakeRecordBatchStream,
     output_column_count: usize,
-) -> SendableRecordBatchStream {
+) -> FlussLakeRecordBatchStream {
     enum Phase {
         Lake {
             overlay: PkOverlay,
-            lake_stream: SendableRecordBatchStream,
+            lake_stream: FlussLakeRecordBatchStream,
         },
         Survivors(PkOverlay),
         Done,
@@ -359,13 +359,13 @@ pub(crate) fn merged_stream(
 ///
 /// The physical projection appends any primary-key column the request did not
 /// ask for, so the engine-visible output is exactly the leading prefix.
-fn project_output(batch: &RecordBatch, output_column_count: usize) -> UnionReadResult<RecordBatch> {
+fn project_output(batch: &RecordBatch, output_column_count: usize) -> FlussLakeResult<RecordBatch> {
     if batch.num_columns() == output_column_count {
         return Ok(batch.clone());
     }
     let projection: Vec<usize> = (0..output_column_count).collect();
     batch.project(&projection).map_err(|error| {
-        UnionReadError::Execution(format!(
+        FlussLakeError::Execution(format!(
             "failed to strip the hidden primary-key columns added for merging: {error}"
         ))
     })
@@ -435,7 +435,7 @@ mod tests {
         lake_batches: Vec<RecordBatch>,
         output_column_count: usize,
     ) -> Vec<(i32, String, i64)> {
-        let lake: SendableRecordBatchStream =
+        let lake: FlussLakeRecordBatchStream =
             Box::pin(futures::stream::iter(lake_batches.into_iter().map(Ok)));
         let merged: Vec<RecordBatch> = merged_stream(overlay, lake, output_column_count)
             .try_collect()
@@ -580,7 +580,7 @@ mod tests {
                 &[ChangeType::UpdateAfter],
             )
             .unwrap();
-        let lake: SendableRecordBatchStream = Box::pin(futures::stream::iter(vec![Ok(
+        let lake: FlussLakeRecordBatchStream = Box::pin(futures::stream::iter(vec![Ok(
             physical_batch(vec!["one", "two"], vec![10, 20], vec![1, 2]),
         )]));
 
@@ -606,7 +606,7 @@ mod tests {
             &[ChangeType::AppendOnly],
         );
 
-        assert!(matches!(result, Err(UnionReadError::Execution(_))));
+        assert!(matches!(result, Err(FlussLakeError::Execution(_))));
     }
 
     /// The overlay is bounded by `memory_limit_bytes`; exceeding it must fail
@@ -621,7 +621,7 @@ mod tests {
         );
 
         match result {
-            Err(UnionReadError::Execution(message)) => {
+            Err(FlussLakeError::Execution(message)) => {
                 assert!(
                     message.contains("byte limit"),
                     "unexpected error: {message}"
@@ -635,11 +635,11 @@ mod tests {
     fn rejects_key_positions_outside_the_physical_read() {
         assert!(matches!(
             PkOverlay::try_new(schema(), vec![9], None),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
         assert!(matches!(
             PkOverlay::try_new(schema(), Vec::new(), None),
-            Err(UnionReadError::InvalidTask(_))
+            Err(FlussLakeError::InvalidSplit(_))
         ));
     }
 
@@ -657,7 +657,7 @@ mod tests {
 
         assert!(matches!(
             overlay.probe_lake_batch(&narrow),
-            Err(UnionReadError::Execution(_))
+            Err(FlussLakeError::Execution(_))
         ));
     }
 
