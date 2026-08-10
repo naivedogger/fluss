@@ -162,6 +162,12 @@ jobs:
           path: /tmp
       - name: Load server image
         run: docker load -i /tmp/fluss-dev.tar
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -172,6 +178,16 @@ jobs:
           workspaces: fluss-rust
       - name: Integration tests
         run: cargo test --features integration_tests --test test_fluss -p fluss-rs
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+      - name: UnionRead integration tests
+        run: cargo test -p fluss-lake --features integration_tests --test test_union_read -- --nocapture --test-threads=1
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+      - name: Paimon UnionRead E2E
+        run: scripts/run-paimon-union-read-e2e.sh
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
