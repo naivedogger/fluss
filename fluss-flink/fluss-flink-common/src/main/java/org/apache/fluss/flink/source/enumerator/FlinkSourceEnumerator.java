@@ -619,6 +619,7 @@ public class FlinkSourceEnumerator
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.initialDiscoveryFinished = initialDiscoveryFinished;
         this.unassignedSplits = new ArrayList<>(unassignedSplits);
+        this.noMoreNewSplits = initialDiscoveryFinished && hasFiniteSplitSet();
     }
 
     @Override
@@ -679,7 +680,7 @@ public class FlinkSourceEnumerator
                     }
                 }
 
-                if (scanPartitionDiscoveryIntervalMs > 0 && !bounded) {
+                if (isPeriodicPartitionDiscoveryEnabled()) {
                     // should do partition discovery
                     LOG.info(
                             "Starting the FlussSourceEnumerator for table {} "
@@ -765,7 +766,7 @@ public class FlinkSourceEnumerator
                             + "{} splits already restored from checkpoint state.",
                     tablePath,
                     pendingSplitAssignment.values().stream().mapToInt(List::size).sum());
-            initialDiscoveryFinished = true;
+            markInitialDiscoveryFinished();
             return;
         }
 
@@ -854,8 +855,13 @@ public class FlinkSourceEnumerator
             return;
         }
         if (t != null) {
-            LOG.error("Failed to list partitions for {}", tablePath, t);
-            return;
+            if (isPeriodicPartitionDiscoveryEnabled()) {
+                LOG.warn("Failed to list partitions for {}. Will retry.", tablePath, t);
+                return;
+            }
+            throw new FlinkRuntimeException(
+                    String.format("Failed to list partitions for %s", tablePath),
+                    ExceptionUtils.stripCompletionException(t));
         }
 
         LOG.debug(
@@ -871,7 +877,10 @@ public class FlinkSourceEnumerator
             // to track), mark initial discovery as finished immediately since there are
             // no splits that need to be persisted in state first.
             if (!initialDiscoveryFinished) {
-                initialDiscoveryFinished = true;
+                markInitialDiscoveryFinished();
+            }
+            if (noMoreNewSplits) {
+                assignPendingSplits(context.registeredReaders().keySet());
             }
             LOG.debug("No partition changes detected for table {}", tablePath);
             return;
@@ -1181,15 +1190,28 @@ public class FlinkSourceEnumerator
             Map<Integer, Long> stoppingOffsets =
                     stoppingOffsetsInitializer.getBucketOffsets(
                             partitionName, bucketsNeedInitOffset, bucketOffsetsRetriever);
-            startingOffsets.forEach(
-                    (bucketId, startingOffset) ->
-                            splits.add(
-                                    new LogSplit(
-                                            new TableBucket(
-                                                    tableInfo.getTableId(), partitionId, bucketId),
-                                            partitionName,
-                                            startingOffset,
-                                            stoppingOffsets.get(bucketId))));
+            for (Integer bucketId : bucketsNeedInitOffset) {
+                Long startingOffset = startingOffsets.get(bucketId);
+                Long stoppingOffset = stoppingOffsets.get(bucketId);
+                checkState(
+                        startingOffset != null,
+                        "Starting offset should be present for bucket %s.",
+                        bucketId);
+                checkState(
+                        stoppingOffset != null
+                                && (stoppingOffset == LogSplit.NO_STOPPING_OFFSET
+                                        || stoppingOffset >= 0),
+                        "Stopping offset for bucket %s must be non-negative or the no-stopping "
+                                + "sentinel, but was %s.",
+                        bucketId,
+                        stoppingOffset);
+                splits.add(
+                        new LogSplit(
+                                new TableBucket(tableInfo.getTableId(), partitionId, bucketId),
+                                partitionName,
+                                startingOffset,
+                                stoppingOffset));
+            }
         }
         return splits;
     }
@@ -1299,12 +1321,25 @@ public class FlinkSourceEnumerator
         return removedPartitionsMap.containsKey(split.getTableBucket().getPartitionId());
     }
 
+    private boolean isPeriodicPartitionDiscoveryEnabled() {
+        return isPartitioned && streaming && !bounded && scanPartitionDiscoveryIntervalMs > 0;
+    }
+
+    private boolean hasFiniteSplitSet() {
+        return !isPeriodicPartitionDiscoveryEnabled();
+    }
+
+    private void markInitialDiscoveryFinished() {
+        initialDiscoveryFinished = true;
+        noMoreNewSplits = hasFiniteSplitSet();
+    }
+
     private void handleSplitsAdd(List<SourceSplitBase> splits, Throwable t) {
         if (t != null) {
-            if (isPartitioned && streaming && !bounded && scanPartitionDiscoveryIntervalMs > 0) {
+            if (isPeriodicPartitionDiscoveryEnabled()) {
                 // it means continuously read new partition splits, not throw exception, temporally
                 // warn it to avoid job fail. TODO: fix me in #288
-                LOG.warn("Failed to list splits for {}.", tablePath, t);
+                LOG.warn("Failed to list splits for {}. Will retry.", tablePath, t);
                 return;
             } else {
                 throw new FlinkRuntimeException(
@@ -1313,7 +1348,7 @@ public class FlinkSourceEnumerator
             }
         }
 
-        initialDiscoveryFinished = true;
+        markInitialDiscoveryFinished();
         if (pendingHybridLakeFlussSplits != null) {
             // removed from the pendingHybridLakeFlussSplits since this split already be moved to
             // unassignedSplits
@@ -1332,18 +1367,6 @@ public class FlinkSourceEnumerator
                         ? "null"
                         : pendingHybridLakeFlussSplits.size());
 
-        if (isPartitioned) {
-            if (bounded || scanPartitionDiscoveryIntervalMs <= 0) {
-                // For a bounded read (batch execution mode or a bounded streaming read) or when
-                // partition discovery is disabled, splits are only added once, so readers can be
-                // signaled that no more splits will come and finish eventually.
-                noMoreNewSplits = true;
-            }
-        } else {
-            // if not partitioned, only will add splits only once,
-            // so, noMoreNewPartitionSplits should be set to true
-            noMoreNewSplits = true;
-        }
         doHandleSplitsAdd(splits);
     }
 

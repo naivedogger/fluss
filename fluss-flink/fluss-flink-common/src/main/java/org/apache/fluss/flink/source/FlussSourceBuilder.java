@@ -20,8 +20,10 @@ package org.apache.fluss.flink.source;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.initializer.LatestOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
+import org.apache.fluss.client.initializer.TimestampOffsetsInitializer;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
@@ -44,6 +46,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
  * Builder class for creating {@link FlussSource} instances.
@@ -198,9 +201,16 @@ public class FlussSourceBuilder<OUT> {
      * @return this builder
      */
     public FlussSourceBuilder<OUT> setBounded(OffsetsInitializer stoppingOffsetsInitializer) {
-        this.stoppingOffsetsInitializer =
+        OffsetsInitializer checkedStoppingOffsetsInitializer =
                 checkNotNull(
                         stoppingOffsetsInitializer, "stoppingOffsetsInitializer must not be null");
+        checkArgument(
+                checkedStoppingOffsetsInitializer instanceof LatestOffsetsInitializer
+                        || checkedStoppingOffsetsInitializer instanceof TimestampOffsetsInitializer,
+                "Only OffsetsInitializer.latest() and OffsetsInitializer.timestamp(...) are "
+                        + "supported as stopping offsets, but was %s.",
+                checkedStoppingOffsetsInitializer.getClass().getName());
+        this.stoppingOffsetsInitializer = checkedStoppingOffsetsInitializer;
         return this;
     }
 

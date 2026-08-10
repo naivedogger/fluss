@@ -63,6 +63,25 @@ public class FlussSourceBuilderTest extends FlinkTestBase {
     }
 
     @Test
+    public void testRejectUnsupportedStoppingOffsetsInitializer() {
+        FlussSourceBuilder<TestRecord> builder = FlussSource.builder();
+
+        assertThatThrownBy(() -> builder.setBounded(OffsetsInitializer.earliest()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(
+                        "Only OffsetsInitializer.latest() and "
+                                + "OffsetsInitializer.timestamp(...) are supported");
+        assertThatThrownBy(() -> builder.setBounded(OffsetsInitializer.full()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(
+                        "Only OffsetsInitializer.latest() and "
+                                + "OffsetsInitializer.timestamp(...) are supported");
+
+        assertThat(builder.setBounded(OffsetsInitializer.latest())).isSameAs(builder);
+        assertThat(builder.setBounded(OffsetsInitializer.timestamp(1L))).isSameAs(builder);
+    }
+
+    @Test
     public void testMissingBootstrapServers() {
         // Given
         Executable executable =

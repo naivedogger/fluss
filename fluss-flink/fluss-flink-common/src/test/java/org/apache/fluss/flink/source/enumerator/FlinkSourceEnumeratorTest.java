@@ -64,6 +64,7 @@ import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitsAssignment;
 import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -82,6 +83,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
@@ -1135,6 +1138,12 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
         ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
         Map<Long, String> partitionNameByIds =
                 waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
+        partitionNameByIds
+                .keySet()
+                .forEach(
+                        partitionId ->
+                                FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(
+                                        tableId, partitionId));
 
         try (MockSplitEnumeratorContext<SourceSplitBase> context =
                 new MockSplitEnumeratorContext<>(numSubtasks)) {
@@ -1325,6 +1334,204 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
             // that no more splits will come, which lets the job finish eventually
             for (int i = 0; i < numSubtasks; i++) {
                 assertThat(context.hasNoMoreSplits(i)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void testBoundedStreamingRestoreSignalsNoMoreSplits() throws Throwable {
+        int numSubtasks = 3;
+        createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
+        Map<Long, String> partitions =
+                waitUntilPartitions(
+                        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), DEFAULT_TABLE_PATH);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                        new MockSplitEnumeratorContext<>(numSubtasks);
+                MockWorkExecutor workExecutor = new MockWorkExecutor(context);
+                FlinkSourceEnumerator enumerator =
+                        new FlinkSourceEnumerator(
+                                DEFAULT_TABLE_PATH,
+                                flussConf,
+                                false,
+                                true,
+                                context,
+                                Collections.emptySet(),
+                                partitions,
+                                null,
+                                OffsetsInitializer.earliest(),
+                                OffsetsInitializer.latest(),
+                                DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
+                                        .defaultValue(),
+                                true,
+                                null,
+                                null,
+                                workExecutor,
+                                LeaseContext.DEFAULT,
+                                true,
+                                true,
+                                Collections.emptyList())) {
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+                assertThat(context.hasNoMoreSplits(i)).isTrue();
+            }
+
+            // The restored partition set has not changed. The one-time discovery must not clear
+            // the restored terminal state.
+            workExecutor.runNextOneTimeCallable();
+            for (int i = 0; i < numSubtasks; i++) {
+                assertThat(context.hasNoMoreSplits(i)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void testBoundedNonPartitionedRestoreSignalsNoMoreSplits() throws Exception {
+        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        LogSplit restoredSplit = new LogSplit(new TableBucket(tableId, 0), null, 0L, 0L);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                        new MockSplitEnumeratorContext<>(1);
+                MockWorkExecutor workExecutor = new MockWorkExecutor(context);
+                FlinkSourceEnumerator enumerator =
+                        new FlinkSourceEnumerator(
+                                DEFAULT_TABLE_PATH,
+                                flussConf,
+                                false,
+                                false,
+                                context,
+                                Collections.emptySet(),
+                                Collections.emptyMap(),
+                                null,
+                                OffsetsInitializer.earliest(),
+                                OffsetsInitializer.latest(),
+                                DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
+                                        .defaultValue(),
+                                true,
+                                null,
+                                null,
+                                workExecutor,
+                                LeaseContext.DEFAULT,
+                                true,
+                                true,
+                                Collections.singletonList(restoredSplit))) {
+            enumerator.start();
+            registerReader(context, enumerator, 0);
+
+            assertThat(getReadersAssignments(context).get(0)).containsExactly(restoredSplit);
+            assertThat(context.hasNoMoreSplits(0)).isTrue();
+        }
+    }
+
+    @Test
+    void testBoundedStreamingReadWithNoPartitionsSignalsNoMoreSplits() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded-empty-partition-table");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("partition_col", DataTypes.STRING())
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .partitionedBy("partition_col")
+                        .distributedBy(DEFAULT_BUCKET_NUM, "id")
+                        .build();
+        createTable(tablePath, tableDescriptor);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                        new MockSplitEnumeratorContext<>(2);
+                FlinkSourceEnumerator enumerator =
+                        new FlinkSourceEnumerator(
+                                tablePath,
+                                flussConf,
+                                false,
+                                true,
+                                context,
+                                OffsetsInitializer.earliest(),
+                                OffsetsInitializer.latest(),
+                                DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
+                                        .defaultValue(),
+                                true,
+                                null,
+                                null,
+                                LeaseContext.DEFAULT,
+                                false)) {
+            enumerator.start();
+            registerReader(context, enumerator, 0);
+            registerReader(context, enumerator, 1);
+
+            context.runNextOneTimeCallable();
+
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+            assertThat(context.hasNoMoreSplits(0)).isTrue();
+            assertThat(context.hasNoMoreSplits(1)).isTrue();
+        }
+    }
+
+    @Test
+    void testBoundedPartitionDiscoveryFailureFailsJob() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded-partition-discovery-failure");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("partition_col", DataTypes.STRING())
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .partitionedBy("partition_col")
+                        .distributedBy(DEFAULT_BUCKET_NUM, "id")
+                        .build();
+        createTable(tablePath, tableDescriptor);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(1)) {
+            WorkerExecutor failingWorkerExecutor =
+                    new WorkerExecutor(context) {
+                        @Override
+                        public <T> void callAsync(
+                                Callable<T> callable, BiConsumer<T, Throwable> handler) {
+                            context.callAsync(
+                                    () -> {
+                                        throw new FlinkRuntimeException(
+                                                "expected partition discovery failure");
+                                    },
+                                    handler);
+                        }
+                    };
+
+            try (FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            tablePath,
+                            flussConf,
+                            false,
+                            true,
+                            context,
+                            Collections.emptySet(),
+                            Collections.emptyMap(),
+                            null,
+                            OffsetsInitializer.earliest(),
+                            OffsetsInitializer.latest(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
+                            true,
+                            null,
+                            null,
+                            failingWorkerExecutor,
+                            LeaseContext.DEFAULT,
+                            false,
+                            false,
+                            Collections.emptyList())) {
+                enumerator.start();
+
+                assertThatThrownBy(context::runNextOneTimeCallable)
+                        .isInstanceOf(FlinkRuntimeException.class)
+                        .hasMessage("Failed to list partitions for " + tablePath);
             }
         }
     }
