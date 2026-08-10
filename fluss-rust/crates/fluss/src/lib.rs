@@ -135,6 +135,7 @@ pub mod config;
 pub mod error;
 pub mod metrics;
 
+pub use bucketing::BucketingFunction;
 mod bucketing;
 mod compression;
 pub mod io;

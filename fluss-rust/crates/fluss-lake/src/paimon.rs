@@ -82,8 +82,20 @@ impl PaimonCatalogOptions {
     ///
     /// `table.datalake.paimon.warehouse` becomes `warehouse`, and so on for
     /// every other prefixed property.
+    #[allow(dead_code)]
     pub(crate) fn from_table_info(table_info: &TableInfo) -> FlussLakeResult<Self> {
-        let options: HashMap<String, String> = table_info
+        Self::from_table_info_with_overrides(table_info, &HashMap::new())
+    }
+
+    /// Merges caller-provided catalog properties over server table metadata.
+    ///
+    /// Full `table.datalake.paimon.*` keys are preferred. Bare Paimon option
+    /// names remain accepted for execution-context compatibility.
+    pub(crate) fn from_table_info_with_overrides(
+        table_info: &TableInfo,
+        overrides: &HashMap<String, String>,
+    ) -> FlussLakeResult<Self> {
+        let mut options: HashMap<String, String> = table_info
             .properties
             .iter()
             .chain(table_info.custom_properties.iter())
@@ -92,8 +104,15 @@ impl PaimonCatalogOptions {
                     .map(|suffix| (suffix.to_string(), value.clone()))
             })
             .collect();
+        for (key, value) in overrides {
+            if let Some(suffix) = key.strip_prefix(PAIMON_PROPERTY_PREFIX) {
+                options.insert(suffix.to_string(), value.clone());
+            } else if !key.starts_with("table.datalake.") {
+                options.insert(key.clone(), value.clone());
+            }
+        }
         if !options.contains_key("warehouse") {
-            return Err(FlussLakeError::Planning(format!(
+            return Err(FlussLakeError::PlanningFailed(format!(
                 "table {} has a readable lake snapshot but no {PAIMON_PROPERTY_PREFIX}warehouse property",
                 table_info.table_path
             )));
@@ -122,7 +141,16 @@ impl PaimonCatalogOptions {
             .collect()
     }
 
-    /// Merges runtime-supplied credentials over the split-carried options.
+    /// Returns only runtime-sensitive options.
+    pub(crate) fn sensitive(&self) -> HashMap<String, String> {
+        self.options
+            .iter()
+            .filter(|(key, _)| is_sensitive_catalog_option(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Merges runtime-supplied options over the split-carried options.
     ///
     /// Runtime values win: a credential rotated after planning must take
     /// effect without re-planning.
@@ -212,23 +240,35 @@ pub(crate) async fn plan_snapshot_splits(
     table_path: &TablePath,
     catalog_options: &PaimonCatalogOptions,
     snapshot_id: i64,
-    projected_fields: Option<&[String]>,
-) -> FlussLakeResult<Vec<String>> {
+    validate_merge_engine: bool,
+) -> FlussLakeResult<HashMap<(String, i32), Vec<String>>> {
     let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
-    let mut read_builder = table.new_read_builder();
-    if let Some(field_names) = projected_fields {
-        let borrowed: Vec<&str> = field_names.iter().map(String::as_str).collect();
-        read_builder
-            .with_projection(&borrowed)
-            .map_err(|error| paimon_error("apply Paimon planning projection", error))?;
+    if validate_merge_engine {
+        ensure_deduplicate_merge_engine(table.schema().options(), table_path)?;
     }
-    let plan = read_builder
+    let partition_keys = table.schema().partition_keys().to_vec();
+    let plan = table
+        .new_read_builder()
         .new_scan()
         .plan()
         .await
         .map_err(|error| paimon_error("plan Paimon snapshot splits", error))?;
 
-    plan.splits().iter().map(encode_split).collect()
+    let mut grouped = HashMap::new();
+    for split in plan.splits() {
+        if split.bucket() < 0 {
+            return Err(FlussLakeError::PlanningFailed(format!(
+                "Paimon snapshot {snapshot_id} of {table_path} produced a split with negative bucket {}",
+                split.bucket()
+            )));
+        }
+        let partition_path = split_partition_path(split, &partition_keys)?;
+        grouped
+            .entry((partition_path, split.bucket()))
+            .or_insert_with(Vec::new)
+            .push(encode_split(split)?);
+    }
+    Ok(grouped)
 }
 
 /// Rejects Paimon merge engines whose current view v1 cannot reproduce.
@@ -247,12 +287,12 @@ pub(crate) fn ensure_deduplicate_merge_engine(
     let merge_engine = paimon::spec::CoreOptions::new(table_options)
         .merge_engine()
         .map_err(|error| {
-            FlussLakeError::Planning(format!(
+            FlussLakeError::UnsupportedMergeEngine(format!(
                 "failed to resolve the Paimon merge engine of {table_path}: {error}"
             ))
         })?;
     if merge_engine != paimon::spec::MergeEngine::Deduplicate {
-        return Err(FlussLakeError::Planning(format!(
+        return Err(FlussLakeError::UnsupportedMergeEngine(format!(
             "primary-key UnionRead only supports the deduplicate merge engine, but the Paimon table for {table_path} uses {merge_engine:?}; refusing to plan a read that would silently produce an incorrect current view"
         )));
     }
@@ -265,40 +305,97 @@ pub(crate) fn ensure_deduplicate_merge_engine(
 /// so splits are keyed by their Paimon bucket id — which Fluss tiering keeps
 /// aligned with the Fluss bucket id. Planning is rejected up front for merge
 /// engines other than deduplicate.
+#[allow(dead_code)]
 pub(crate) async fn plan_pk_snapshot_splits(
     table_path: &TablePath,
     catalog_options: &PaimonCatalogOptions,
     snapshot_id: i64,
-) -> FlussLakeResult<HashMap<i32, Vec<String>>> {
-    let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
-    ensure_deduplicate_merge_engine(table.schema().options(), table_path)?;
+) -> FlussLakeResult<HashMap<(String, i32), Vec<String>>> {
+    plan_snapshot_splits(table_path, catalog_options, snapshot_id, true).await
+}
 
-    let plan = table
-        .new_read_builder()
-        .new_scan()
-        .plan()
-        .await
-        .map_err(|error| paimon_error("plan Paimon snapshot splits", error))?;
-
-    let mut splits_by_bucket: HashMap<i32, Vec<String>> = HashMap::new();
-    for split in plan.splits() {
-        if split.bucket() < 0 {
-            return Err(FlussLakeError::Planning(format!(
-                "Paimon snapshot {snapshot_id} of {table_path} produced a split with negative bucket {}",
-                split.bucket()
+fn split_partition_path(split: &DataSplit, partition_keys: &[String]) -> FlussLakeResult<String> {
+    if partition_keys.is_empty() {
+        return Ok(String::new());
+    }
+    let bucket_segment = format!("bucket-{}", split.bucket());
+    let mut segments: Vec<&str> = split
+        .bucket_path()
+        .trim_end_matches('/')
+        .split('/')
+        .collect();
+    if segments.pop() != Some(bucket_segment.as_str()) || segments.len() < partition_keys.len() {
+        return Err(FlussLakeError::PlanningFailed(format!(
+            "Paimon split bucket path '{}' does not end in the expected partition/bucket layout",
+            split.bucket_path()
+        )));
+    }
+    let partition_segments = &segments[segments.len() - partition_keys.len()..];
+    for (key, segment) in partition_keys.iter().zip(partition_segments) {
+        if !segment.starts_with(&format!("{key}=")) {
+            return Err(FlussLakeError::PlanningFailed(format!(
+                "Paimon split bucket path '{}' does not match partition key '{key}'",
+                split.bucket_path()
             )));
         }
-        splits_by_bucket
-            .entry(split.bucket())
-            .or_default()
-            .push(encode_split(split)?);
     }
-    Ok(splits_by_bucket)
+    Ok(partition_segments.join("/"))
+}
+
+pub(crate) fn encode_partition_qualified_name(qualified_name: &str) -> String {
+    qualified_name
+        .split('/')
+        .map(|segment| match segment.split_once('=') {
+            Some((key, value)) => {
+                format!("{}={}", escape_path_name(key), escape_path_name(value))
+            }
+            None => escape_path_name(segment),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn escape_path_name(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(
+            character,
+            '\x00'
+                ..='\x1F'
+                    | '\x7F'
+                    | '"'
+                    | '#'
+                    | '%'
+                    | '\''
+                    | '*'
+                    | '/'
+                    | ':'
+                    | '='
+                    | '?'
+                    | '\\'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '^'
+        ) {
+            let mut buffer = [0; 4];
+            for byte in character.encode_utf8(&mut buffer).as_bytes() {
+                escaped.push('%');
+                escaped.push(HEX[(byte >> 4) as usize] as char);
+                escaped.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 fn encode_split(split: &DataSplit) -> FlussLakeResult<String> {
     serde_json::to_string(split).map_err(|error| {
-        FlussLakeError::Planning(format!("failed to serialize Paimon split: {error}"))
+        FlussLakeError::PlanningFailed(format!("failed to serialize Paimon split: {error}"))
     })
 }
 
@@ -360,13 +457,27 @@ pub(crate) fn decode_split(encoded_split: &str) -> FlussLakeResult<DataSplit> {
 }
 
 fn paimon_error(action: &str, error: paimon::Error) -> FlussLakeError {
-    FlussLakeError::Execution(format!("failed to {action}: {error}"))
+    let unavailable = match &error {
+        paimon::Error::IoUnexpected { source, .. } => format!("{:?}", source.kind()) == "NotFound",
+        paimon::Error::DataInvalid { message, .. } => {
+            let message = message.to_ascii_lowercase();
+            message.contains("does not exist")
+                || message.contains("not found")
+                || message.contains("no such file")
+        }
+        _ => false,
+    };
+    if unavailable {
+        FlussLakeError::DataUnavailable(format!("failed to {action}: {error}"))
+    } else {
+        FlussLakeError::Execution(format!("failed to {action}: {error}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluss::metadata::{DataField, DataTypes};
+    use fluss::metadata::{DataField, DataTypes, Schema};
 
     fn row_type() -> RowType {
         RowType::new(vec![
@@ -374,6 +485,31 @@ mod tests {
             DataField::new("name", DataTypes::string(), None),
             DataField::new("amount", DataTypes::bigint(), None),
         ])
+    }
+
+    fn table_info(
+        properties: HashMap<String, String>,
+        custom_properties: HashMap<String, String>,
+    ) -> TableInfo {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .build()
+            .unwrap();
+        TableInfo::new(
+            TablePath::new("fluss", "orders"),
+            7,
+            1,
+            schema,
+            vec!["id".to_string()],
+            Vec::<String>::new().into(),
+            1,
+            properties,
+            custom_properties,
+            None,
+            0,
+            0,
+        )
     }
 
     #[test]
@@ -446,6 +582,48 @@ mod tests {
     }
 
     #[test]
+    fn caller_catalog_properties_override_server_metadata() {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "table.datalake.paimon.warehouse".to_string(),
+            "s3://server/warehouse".to_string(),
+        );
+        properties.insert(
+            "table.datalake.paimon.s3.endpoint".to_string(),
+            "http://server:9000".to_string(),
+        );
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "table.datalake.paimon.warehouse".to_string(),
+            "s3://caller/warehouse".to_string(),
+        );
+        overrides.insert(
+            "table.datalake.paimon.s3.secret-key".to_string(),
+            "CALLER-SECRET".to_string(),
+        );
+
+        let options = PaimonCatalogOptions::from_table_info_with_overrides(
+            &table_info(properties, HashMap::new()),
+            &overrides,
+        )
+        .unwrap();
+
+        assert_eq!(
+            options.as_map().get("warehouse"),
+            Some(&"s3://caller/warehouse".to_string())
+        );
+        assert_eq!(
+            options.as_map().get("s3.endpoint"),
+            Some(&"http://server:9000".to_string())
+        );
+        assert_eq!(
+            options.sensitive().get("s3.secret-key"),
+            Some(&"CALLER-SECRET".to_string())
+        );
+        assert!(!options.non_sensitive().contains_key("s3.secret-key"));
+    }
+
+    #[test]
     fn rejects_projection_beyond_the_frozen_schema() {
         assert!(matches!(
             projected_field_names(&row_type(), Some(&[3])),
@@ -488,10 +666,45 @@ mod tests {
                         &merge_engine_options(Some(rejected)),
                         &table_path
                     ),
-                    Err(FlussLakeError::Planning(_))
+                    Err(FlussLakeError::UnsupportedMergeEngine(_))
                 ),
                 "merge engine {rejected} must be rejected at planning"
             );
         }
+    }
+
+    #[test]
+    fn missing_snapshot_file_maps_to_data_unavailable() {
+        let error = paimon::Error::DataInvalid {
+            message: "snapshot file does not exist: snapshot-42".to_string(),
+            source: None,
+        };
+
+        assert!(matches!(
+            paimon_error("open pinned snapshot", error),
+            FlussLakeError::DataUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn extracts_partition_and_bucket_identity_from_split_path() {
+        let split = DataSplit::builder()
+            .with_snapshot(42)
+            .with_partition(paimon::spec::BinaryRow::new(1))
+            .with_bucket(3)
+            .with_bucket_path("s3://warehouse/fluss/orders/region=US/bucket-3".to_string())
+            .with_total_buckets(4)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            split_partition_path(&split, &["region".to_string()]).unwrap(),
+            "region=US"
+        );
+        assert_eq!(
+            encode_partition_qualified_name("region=US/day=a=b"),
+            "region=US/day=a%3Db"
+        );
     }
 }

@@ -21,11 +21,12 @@
 //! opaque rather than depending on the types in this module.
 
 use crate::split_descriptor::{
-    AppendLogSplitDescriptor, LakeSplitDescriptor, PkHybridSplitDescriptor, SplitDescriptor,
+    AppendLogSplitDescriptor, LakeSplitDescriptor, LogicalSplitDescriptor, PkHybridSplitDescriptor,
+    SplitDescriptor,
 };
 use crate::{
-    CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeError, FlussLakeReadSplit, FlussLakeReadStatistics,
-    FlussLakeResult,
+    CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeError, FlussLakePartitionIdentity,
+    FlussLakeReadSplit, FlussLakeReadStatistics, FlussLakeResult,
 };
 use fluss::SnapshotId;
 use fluss::client::FlussAdmin;
@@ -39,6 +40,7 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) struct FrozenBucketRange {
     table_bucket: TableBucket,
     partition_name: Option<String>,
+    partition_qualified_name: Option<String>,
     start_offset: i64,
     stop_offset: i64,
 }
@@ -51,6 +53,10 @@ impl FrozenBucketRange {
     pub fn is_empty(&self) -> bool {
         self.start_offset == self.stop_offset
     }
+
+    pub fn partition_qualified_name(&self) -> Option<&str> {
+        self.partition_qualified_name.as_deref()
+    }
 }
 
 /// A readable lake snapshot and all server-issued Fluss log boundaries.
@@ -58,6 +64,50 @@ impl FrozenBucketRange {
 pub(crate) struct FrozenReadBoundary {
     readable_lake_snapshot_id: Option<SnapshotId>,
     bucket_ranges: Vec<FrozenBucketRange>,
+}
+
+/// Creates one opaque logical `(partition, bucket)` split.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_logical_split(
+    table_path: &TablePath,
+    schema_id: i32,
+    bucket_range: &FrozenBucketRange,
+    snapshot_id: Option<i64>,
+    catalog_options: BTreeMap<String, String>,
+    lake_splits: Vec<String>,
+    primary_key_indexes: Vec<usize>,
+    statistics: FlussLakeReadStatistics,
+) -> FlussLakeResult<FlussLakeReadSplit> {
+    let descriptor = SplitDescriptor::Logical(LogicalSplitDescriptor::try_new(
+        table_path.clone(),
+        schema_id,
+        bucket_range.table_bucket.clone(),
+        bucket_range.start_offset,
+        bucket_range.stop_offset,
+        snapshot_id,
+        catalog_options,
+        lake_splits,
+        primary_key_indexes,
+    )?);
+    let partition = bucket_range
+        .table_bucket
+        .partition_id()
+        .map_or_else(|| "root".to_string(), |id| id.to_string());
+    let split_id = format!(
+        "{table_path}:{partition}:{}",
+        bucket_range.table_bucket.bucket_id()
+    );
+    FlussLakeReadSplit::try_new(
+        split_id,
+        bucket_range.table_bucket.bucket_id(),
+        bucket_identity(
+            &bucket_range.table_bucket,
+            bucket_range.partition_name.clone(),
+        ),
+        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
+        descriptor.encode()?,
+        statistics,
+    )
 }
 
 impl FrozenReadBoundary {
@@ -71,6 +121,7 @@ impl FrozenReadBoundary {
 }
 
 /// Creates one opaque append-log split from a frozen bucket range.
+#[allow(dead_code)]
 pub(crate) fn create_append_log_split(
     table_path: &TablePath,
     schema_id: i32,
@@ -100,10 +151,28 @@ pub(crate) fn create_append_log_split(
     );
     FlussLakeReadSplit::try_new(
         split_id,
+        bucket_range.table_bucket.bucket_id(),
+        bucket_identity(
+            &bucket_range.table_bucket,
+            bucket_range.partition_name.clone(),
+        ),
         CURRENT_FLUSS_LAKE_SPLIT_VERSION,
         descriptor.encode()?,
         statistics,
     )
+}
+
+fn bucket_identity(
+    table_bucket: &TableBucket,
+    partition_name: Option<String>,
+) -> Option<FlussLakePartitionIdentity> {
+    if table_bucket.partition_id().is_none() && partition_name.is_none() {
+        return None;
+    }
+    Some(FlussLakePartitionIdentity::new(
+        table_bucket.partition_id(),
+        partition_name,
+    ))
 }
 
 /// Creates one opaque lake split from a frozen lake snapshot split.
@@ -111,6 +180,7 @@ pub(crate) fn create_append_log_split(
 /// `split_index` only makes the split id unique and readable for scheduling; the
 /// executor never derives read semantics from it.
 #[cfg_attr(not(feature = "paimon"), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn create_lake_split(
     table_path: &TablePath,
     snapshot_id: i64,
@@ -128,8 +198,13 @@ pub(crate) fn create_lake_split(
         encoded_split,
     )?);
     let split_id = format!("lake-split/{table_path}/{snapshot_id}/{split_index}");
+    // Lake splits from the catalog do not expose bucket/partition identity in
+    // the current API; report a neutral scheduling identity until the planner
+    // can extract it from the encoded split.
     FlussLakeReadSplit::try_new(
         split_id,
+        0,
+        None,
         CURRENT_FLUSS_LAKE_SPLIT_VERSION,
         descriptor.encode()?,
         statistics,
@@ -142,6 +217,7 @@ pub(crate) fn create_lake_split(
 /// completes independently per bucket, and its lake baseline and log tail
 /// must meet inside one executor.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn create_pk_hybrid_split(
     table_path: &TablePath,
     schema_id: i32,
@@ -179,6 +255,11 @@ pub(crate) fn create_pk_hybrid_split(
     );
     FlussLakeReadSplit::try_new(
         split_id,
+        bucket_range.table_bucket.bucket_id(),
+        bucket_identity(
+            &bucket_range.table_bucket,
+            bucket_range.partition_name.clone(),
+        ),
         CURRENT_FLUSS_LAKE_SPLIT_VERSION,
         descriptor.encode()?,
         statistics,
@@ -197,7 +278,7 @@ pub(crate) async fn freeze_read_boundary_for_table(
     partition_filter: Option<&(dyn Fn(&PartitionInfo) -> bool + Sync)>,
 ) -> FlussLakeResult<FrozenReadBoundary> {
     if table_info.num_buckets <= 0 {
-        return Err(FlussLakeError::Planning(format!(
+        return Err(FlussLakeError::PlanningFailed(format!(
             "table {table_path} has invalid bucket count {}",
             table_info.num_buckets
         )));
@@ -216,7 +297,7 @@ pub(crate) async fn freeze_read_boundary_for_table(
     let snapshot_offsets =
         collect_snapshot_offsets(table_path, table_info.table_id, readable_snapshot.as_ref())?;
     let mut partitions = if table_info.partition_keys.is_empty() {
-        vec![(None, None)]
+        vec![(None, None, None)]
     } else {
         let mut partition_infos = admin
             .list_partition_infos(table_path)
@@ -236,7 +317,7 @@ pub(crate) async fn freeze_read_boundary_for_table(
 
     let bucket_ids: Vec<i32> = (0..table_info.num_buckets).collect();
     let mut bucket_ranges = Vec::with_capacity(partitions.len() * bucket_ids.len());
-    for (partition_id, partition_name) in partitions.drain(..) {
+    for (partition_id, partition_name, partition_qualified_name) in partitions.drain(..) {
         let (earliest_offsets, latest_offsets) =
             load_server_offsets(admin, table_path, partition_name.as_deref(), &bucket_ids).await?;
 
@@ -249,6 +330,7 @@ pub(crate) async fn freeze_read_boundary_for_table(
             bucket_ranges.push(freeze_bucket_range(
                 table_bucket,
                 partition_name.clone(),
+                partition_qualified_name.clone(),
                 snapshot_offset,
                 earliest_offset,
                 stop_offset,
@@ -262,10 +344,14 @@ pub(crate) async fn freeze_read_boundary_for_table(
     })
 }
 
-fn partition_identity(partition_info: PartitionInfo) -> (Option<i64>, Option<String>) {
+fn partition_identity(
+    partition_info: PartitionInfo,
+) -> (Option<i64>, Option<String>, Option<String>) {
+    let resolved = partition_info.get_resolved_partition_spec();
     (
         Some(partition_info.get_partition_id()),
         Some(partition_info.get_partition_name()),
+        Some(resolved.get_partition_qualified_name()),
     )
 }
 
@@ -278,7 +364,7 @@ fn collect_snapshot_offsets(
         return Ok(HashMap::new());
     };
     if snapshot.table_id != table_id {
-        return Err(FlussLakeError::Planning(format!(
+        return Err(FlussLakeError::PlanningFailed(format!(
             "readable snapshot {} belongs to table id {}, but {table_path} resolved to table id {table_id}",
             snapshot.snapshot_id, snapshot.table_id
         )));
@@ -290,7 +376,7 @@ fn collect_snapshot_offsets(
             continue;
         };
         if offset < 0 {
-            return Err(FlussLakeError::Planning(format!(
+            return Err(FlussLakeError::PlanningFailed(format!(
                 "readable snapshot {} returned negative log offset {offset} for bucket {}",
                 snapshot.snapshot_id, bucket_snapshot.bucket_id
             )));
@@ -301,7 +387,7 @@ fn collect_snapshot_offsets(
             bucket_snapshot.bucket_id,
         );
         if offsets.insert(table_bucket.clone(), offset).is_some() {
-            return Err(FlussLakeError::Planning(format!(
+            return Err(FlussLakeError::PlanningFailed(format!(
                 "readable snapshot {} contains duplicate boundary for {table_bucket}",
                 snapshot.snapshot_id
             )));
@@ -371,7 +457,7 @@ fn required_offset(
         .get(&table_bucket.bucket_id())
         .copied()
         .ok_or_else(|| {
-            FlussLakeError::Planning(format!(
+            FlussLakeError::PlanningFailed(format!(
                 "server did not return the {offset_name} offset for {table_bucket}"
             ))
         })
@@ -380,12 +466,13 @@ fn required_offset(
 fn freeze_bucket_range(
     table_bucket: TableBucket,
     partition_name: Option<String>,
+    partition_qualified_name: Option<String>,
     snapshot_offset: Option<i64>,
     earliest_offset: i64,
     stop_offset: i64,
 ) -> FlussLakeResult<FrozenBucketRange> {
     if earliest_offset < 0 || stop_offset < 0 {
-        return Err(FlussLakeError::Planning(format!(
+        return Err(FlussLakeError::PlanningFailed(format!(
             "server returned a negative log boundary [{earliest_offset}, {stop_offset}) for {table_bucket}"
         )));
     }
@@ -401,7 +488,7 @@ fn freeze_bucket_range(
         )));
     }
     if start_offset > stop_offset {
-        return Err(FlussLakeError::Planning(format!(
+        return Err(FlussLakeError::PlanningFailed(format!(
             "read start offset {start_offset} exceeds server latest offset {stop_offset} for {table_bucket}"
         )));
     }
@@ -409,22 +496,25 @@ fn freeze_bucket_range(
     Ok(FrozenBucketRange {
         table_bucket,
         partition_name,
+        partition_qualified_name,
         start_offset,
         stop_offset,
     })
 }
 
 fn planning_client_error(action: &str, error: ClientError) -> FlussLakeError {
-    FlussLakeError::Planning(format!("failed to {action}: {error}"))
+    FlussLakeError::PlanningFailed(format!("failed to {action}: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::split_descriptor::SplitDescriptor;
 
     #[test]
     fn snapshot_offset_defines_start_and_server_latest_defines_stop() {
-        let range = freeze_bucket_range(TableBucket::new(5, 2), None, Some(12), 8, 20).unwrap();
+        let range =
+            freeze_bucket_range(TableBucket::new(5, 2), None, None, Some(12), 8, 20).unwrap();
 
         assert_eq!(range.start_offset, 12);
         assert_eq!(range.stop_offset, 20);
@@ -433,7 +523,7 @@ mod tests {
 
     #[test]
     fn bucket_without_snapshot_uses_frozen_server_earliest() {
-        let range = freeze_bucket_range(TableBucket::new(5, 2), None, None, 8, 20).unwrap();
+        let range = freeze_bucket_range(TableBucket::new(5, 2), None, None, None, 8, 20).unwrap();
 
         assert_eq!(range.start_offset, 8);
         assert_eq!(range.stop_offset, 20);
@@ -441,7 +531,7 @@ mod tests {
 
     #[test]
     fn snapshot_gap_caused_by_log_retention_is_data_unavailable() {
-        let result = freeze_bucket_range(TableBucket::new(5, 2), None, Some(7), 8, 20);
+        let result = freeze_bucket_range(TableBucket::new(5, 2), None, None, Some(7), 8, 20);
 
         // Re-executing a split frozen on this boundary can never succeed, so
         // the error must be the typed, re-plan-recoverable kind rather than
@@ -451,15 +541,58 @@ mod tests {
 
     #[test]
     fn rejects_start_after_server_latest() {
-        let result = freeze_bucket_range(TableBucket::new(5, 2), None, Some(21), 8, 20);
+        let result = freeze_bucket_range(TableBucket::new(5, 2), None, None, Some(21), 8, 20);
 
-        assert!(matches!(result, Err(FlussLakeError::Planning(_))));
+        assert!(matches!(result, Err(FlussLakeError::PlanningFailed(_))));
     }
 
     #[test]
     fn allows_empty_bounded_tail() {
-        let range = freeze_bucket_range(TableBucket::new(5, 2), None, Some(20), 8, 20).unwrap();
+        let range =
+            freeze_bucket_range(TableBucket::new(5, 2), None, None, Some(20), 8, 20).unwrap();
 
         assert!(range.is_empty());
+    }
+
+    #[test]
+    fn logical_split_carries_one_partition_bucket_lake_and_log_unit() {
+        let range = FrozenBucketRange {
+            table_bucket: TableBucket::new_with_partition(5, Some(9), 2),
+            partition_name: Some("US".to_string()),
+            partition_qualified_name: Some("region=US".to_string()),
+            start_offset: 12,
+            stop_offset: 20,
+        };
+        let mut options = BTreeMap::new();
+        options.insert("warehouse".to_string(), "s3://warehouse".to_string());
+        let split = create_logical_split(
+            &TablePath::new("fluss", "orders"),
+            3,
+            &range,
+            Some(42),
+            options,
+            vec!["{\"bucket\":2}".to_string()],
+            Vec::new(),
+            FlussLakeReadStatistics::default(),
+        )
+        .unwrap();
+
+        assert_eq!(split.bucket_id, 2);
+        assert_eq!(
+            split
+                .partition
+                .as_ref()
+                .and_then(|value| value.partition_id()),
+            Some(9)
+        );
+        match SplitDescriptor::decode(split.execution_descriptor()).unwrap() {
+            SplitDescriptor::Logical(descriptor) => {
+                assert_eq!(descriptor.snapshot_id(), Some(42));
+                assert_eq!(descriptor.start_offset(), 12);
+                assert_eq!(descriptor.stop_offset(), 20);
+                assert_eq!(descriptor.lake_splits().len(), 1);
+            }
+            other => panic!("expected a logical split, got {other:?}"),
+        }
     }
 }

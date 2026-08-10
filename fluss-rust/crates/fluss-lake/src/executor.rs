@@ -16,14 +16,17 @@
 // under the License.
 
 use crate::pk_overlay::{PkOverlay, merged_stream};
+use crate::predicate::FlussLakePredicate;
 use crate::split_descriptor::{
-    AppendLogSplitDescriptor, LakeSplitDescriptor, PkHybridSplitDescriptor, SplitDescriptor,
+    AppendLogSplitDescriptor, LakeSplitDescriptor, LogicalSplitDescriptor, PkHybridSplitDescriptor,
+    SplitDescriptor,
 };
-use crate::union_read::FlussLakeExecutor;
+use crate::union_read::{FlussLakeExecutor, FlussLakeScanSpec};
 use crate::{
-    FlussLakeError, FlussLakeExecutionContext, FlussLakeReadSplit, FlussLakeRecordBatchStream,
-    FlussLakeResult,
+    FlussLakeError, FlussLakeExecutionContext, FlussLakeReadMode, FlussLakeReadSplit,
+    FlussLakeRecordBatchStream, FlussLakeResult,
 };
+use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use fluss::client::{FlussConnection, FlussTable, RecordBatchLogReader};
 use fluss::error::Error as ClientError;
@@ -33,13 +36,12 @@ use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// Poll timeout used while folding a bounded changelog tail.
 ///
-/// Short polls keep the idle-progress check responsive; the bounded read's
-/// real deadline is the context idle timeout, not this interval.
-const TAIL_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Short polls keep the bounded read responsive; the read terminates at the
+/// frozen stop boundary or with a typed error.
+const TAIL_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Default Fluss-Rust executor for opaque UnionRead splits.
 #[derive(Debug, Clone, Copy, Default)]
@@ -50,6 +52,8 @@ impl FlussLakeExecutor for FlussUnionReadExecutor {
         &self,
         split: FlussLakeReadSplit,
         context: FlussLakeExecutionContext,
+        specification: FlussLakeScanSpec,
+        table_properties: HashMap<String, String>,
     ) -> FlussLakeResult<FlussLakeRecordBatchStream> {
         // Structural validation fails fast; environment work is deferred to
         // the first poll of the returned stream.
@@ -57,7 +61,320 @@ impl FlussLakeExecutor for FlussUnionReadExecutor {
             SplitDescriptor::AppendLog(descriptor) => execute_append_log(descriptor, context),
             SplitDescriptor::LakeSplit(descriptor) => execute_lake_split(descriptor, context),
             SplitDescriptor::PkHybrid(descriptor) => execute_pk_hybrid(descriptor, context),
+            SplitDescriptor::Logical(descriptor) => {
+                execute_logical_split(descriptor, context, specification, table_properties)
+            }
         }
+    }
+}
+
+fn execute_logical_split(
+    descriptor: LogicalSplitDescriptor,
+    context: FlussLakeExecutionContext,
+    specification: FlussLakeScanSpec,
+    table_properties: HashMap<String, String>,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
+    if descriptor.is_empty()
+        || (specification.read_mode() == FlussLakeReadMode::LakeOnly
+            && descriptor.lake_splits().is_empty())
+    {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    let connection = context.fluss_connection().cloned().ok_or_else(|| {
+        FlussLakeError::Execution(
+            "logical UnionRead split requires a Fluss connection in the execution context"
+                .to_string(),
+        )
+    })?;
+    Ok(lazy_stream(open_logical_stream(
+        connection,
+        descriptor,
+        context,
+        specification,
+        table_properties,
+    )))
+}
+
+async fn open_logical_stream(
+    connection: Arc<FlussConnection>,
+    descriptor: LogicalSplitDescriptor,
+    context: FlussLakeExecutionContext,
+    specification: FlussLakeScanSpec,
+    table_properties: HashMap<String, String>,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
+    let table = connection
+        .get_table(descriptor.table_path())
+        .await
+        .map_err(|error| execution_client_error("open Fluss table", error))?;
+    validate_frozen_identity(
+        &table,
+        descriptor.table_path(),
+        descriptor.table_bucket(),
+        descriptor.schema_id(),
+    )?;
+    if table.has_primary_key() != descriptor.is_primary_key() {
+        return Err(FlussLakeError::InvalidSplit(format!(
+            "logical split primary-key identity no longer matches table {}",
+            descriptor.table_path()
+        )));
+    }
+
+    let table_info = table.get_table_info();
+    let physical = PhysicalProjection::resolve(
+        table_info.row_type(),
+        specification.output_projection(),
+        specification.filter(),
+        descriptor.primary_key_indexes(),
+    )?;
+    let lake_stream = open_logical_lake_stream(
+        &descriptor,
+        &context,
+        table_info,
+        &table_properties,
+        &physical,
+    )
+    .await?;
+
+    if specification.read_mode() == FlussLakeReadMode::LakeOnly {
+        return Ok(lake_stream);
+    }
+    if descriptor.is_primary_key() {
+        let mut overlay = PkOverlay::try_new(
+            physical.arrow_schema(table_info.row_type())?,
+            physical.key_positions.clone(),
+            context.memory_limit_bytes(),
+        )?;
+        fold_logical_changelog_tail(&table, &descriptor, &physical, &mut overlay).await?;
+        return Ok(merged_stream(overlay, lake_stream));
+    }
+
+    let log_stream = open_logical_append_log_stream(&table, &descriptor, &physical).await?;
+    Ok(Box::pin(lake_stream.chain(log_stream)))
+}
+
+#[cfg(feature = "paimon")]
+async fn open_logical_lake_stream(
+    descriptor: &LogicalSplitDescriptor,
+    context: &FlussLakeExecutionContext,
+    table_info: &fluss::metadata::TableInfo,
+    table_properties: &HashMap<String, String>,
+    physical: &PhysicalProjection,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
+    if descriptor.lake_splits().is_empty() {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    let snapshot_id = descriptor.snapshot_id().ok_or_else(|| {
+        FlussLakeError::InvalidSplit(format!(
+            "logical split for {} carries lake splits without a pinned snapshot id",
+            descriptor.table_path()
+        ))
+    })?;
+    let mut runtime_options = crate::paimon::PaimonCatalogOptions::from_table_info_with_overrides(
+        table_info,
+        table_properties,
+    )?
+    .sensitive();
+    runtime_options.extend(context.lake_credentials().clone());
+    let catalog_options = crate::paimon::PaimonCatalogOptions::from_map(
+        descriptor
+            .catalog_options()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+    .with_runtime_credentials(&runtime_options);
+    let projected_fields =
+        crate::paimon::projected_field_names(table_info.row_type(), Some(&physical.field_indexes))?;
+    let splits = descriptor
+        .lake_splits()
+        .iter()
+        .map(|split| crate::paimon::decode_split(split))
+        .collect::<FlussLakeResult<Vec<_>>>()?;
+    crate::paimon::read_snapshot_splits(
+        descriptor.table_path(),
+        &catalog_options,
+        snapshot_id,
+        Some(&projected_fields),
+        splits,
+    )
+    .await
+}
+
+#[cfg(not(feature = "paimon"))]
+async fn open_logical_lake_stream(
+    descriptor: &LogicalSplitDescriptor,
+    _context: &FlussLakeExecutionContext,
+    _table_info: &fluss::metadata::TableInfo,
+    _table_properties: &HashMap<String, String>,
+    _physical: &PhysicalProjection,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
+    if descriptor.lake_splits().is_empty() {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    Err(FlussLakeError::Execution(format!(
+        "logical split for {} carries lake splits, but this build has no lake format feature enabled",
+        descriptor.table_path()
+    )))
+}
+
+async fn open_logical_append_log_stream(
+    table: &FlussTable<'_>,
+    descriptor: &LogicalSplitDescriptor,
+    physical: &PhysicalProjection,
+) -> FlussLakeResult<FlussLakeRecordBatchStream> {
+    if descriptor.start_offset() == descriptor.stop_offset() {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    let scanner = table
+        .new_scan()
+        .project(&physical.field_indexes)
+        .map_err(|error| execution_client_error("apply append-log projection", error))?
+        .create_record_batch_log_scanner()
+        .map_err(|error| execution_client_error("create append-log scanner", error))?;
+    match descriptor.table_bucket().partition_id() {
+        Some(partition_id) => scanner
+            .subscribe_partition(
+                partition_id,
+                descriptor.table_bucket().bucket_id(),
+                descriptor.start_offset(),
+            )
+            .await
+            .map_err(|error| execution_client_error("subscribe partition bucket", error))?,
+        None => scanner
+            .subscribe(
+                descriptor.table_bucket().bucket_id(),
+                descriptor.start_offset(),
+            )
+            .await
+            .map_err(|error| execution_client_error("subscribe table bucket", error))?,
+    }
+    let reader = RecordBatchLogReader::new_until_offsets(
+        scanner,
+        HashMap::from([(descriptor.table_bucket().clone(), descriptor.stop_offset())]),
+    )
+    .map_err(|error| execution_client_error("create bounded append-log reader", error))?;
+    Ok(Box::pin(reader.into_stream().map(|result| {
+        result
+            .map(|scan_batch| scan_batch.into_batch())
+            .map_err(|error| execution_client_error("read bounded append-log split", error))
+    })))
+}
+
+async fn fold_logical_changelog_tail(
+    table: &FlussTable<'_>,
+    descriptor: &LogicalSplitDescriptor,
+    physical: &PhysicalProjection,
+    overlay: &mut PkOverlay,
+) -> FlussLakeResult<()> {
+    if descriptor.start_offset() == descriptor.stop_offset() {
+        return Ok(());
+    }
+    let scanner = table
+        .new_scan()
+        .project(&physical.field_indexes)
+        .map_err(|error| execution_client_error("apply changelog projection", error))?
+        .create_log_scanner()
+        .map_err(|error| execution_client_error("create changelog scanner", error))?;
+    let table_bucket = descriptor.table_bucket().clone();
+    match table_bucket.partition_id() {
+        Some(partition_id) => scanner
+            .subscribe_partition(
+                partition_id,
+                table_bucket.bucket_id(),
+                descriptor.start_offset(),
+            )
+            .await
+            .map_err(|error| execution_client_error("subscribe partition bucket", error))?,
+        None => scanner
+            .subscribe(table_bucket.bucket_id(), descriptor.start_offset())
+            .await
+            .map_err(|error| execution_client_error("subscribe table bucket", error))?,
+    }
+
+    let mut next_offset = descriptor.start_offset();
+    while next_offset < descriptor.stop_offset() {
+        let records = scanner
+            .poll(TAIL_POLL_TIMEOUT)
+            .await
+            .map_err(|error| execution_client_error("poll bounded changelog tail", error))?;
+        let bucket_records = records.records(&table_bucket);
+        if bucket_records.is_empty() {
+            continue;
+        }
+        next_offset = fold_tail_records(
+            bucket_records,
+            next_offset,
+            descriptor.stop_offset(),
+            overlay,
+        )?;
+    }
+    Ok(())
+}
+
+/// Physical columns are ordered as engine output, predicate-only columns,
+/// then primary-key-only columns. The reader filters first and strips the
+/// hidden suffix only after exact filtering.
+struct PhysicalProjection {
+    field_indexes: Vec<usize>,
+    key_positions: Vec<usize>,
+}
+
+impl PhysicalProjection {
+    fn resolve(
+        row_type: &RowType,
+        output_projection: Option<&[usize]>,
+        filter: &FlussLakePredicate,
+        primary_key_indexes: &[usize],
+    ) -> FlussLakeResult<Self> {
+        let field_count = row_type.fields().len();
+        let mut field_indexes = match output_projection {
+            Some(projection) => projection.to_vec(),
+            None => (0..field_count).collect(),
+        };
+        for field_index in filter.referenced_field_indexes(row_type)? {
+            if !field_indexes.contains(&field_index) {
+                field_indexes.push(field_index);
+            }
+        }
+        for primary_key_index in primary_key_indexes {
+            if *primary_key_index >= field_count {
+                return Err(FlussLakeError::InvalidSplit(format!(
+                    "primary-key field index {primary_key_index} exceeds the resolved table width {field_count}"
+                )));
+            }
+            if !field_indexes.contains(primary_key_index) {
+                field_indexes.push(*primary_key_index);
+            }
+        }
+        let key_positions = primary_key_indexes
+            .iter()
+            .map(|primary_key_index| {
+                field_indexes
+                    .iter()
+                    .position(|field_index| field_index == primary_key_index)
+                    .expect("primary-key columns were included in the physical projection")
+            })
+            .collect();
+        Ok(Self {
+            field_indexes,
+            key_positions,
+        })
+    }
+
+    fn arrow_schema(&self, row_type: &RowType) -> FlussLakeResult<arrow::datatypes::SchemaRef> {
+        let schema = fluss::record::to_arrow_schema(row_type).map_err(|error| {
+            FlussLakeError::Execution(format!(
+                "failed to convert the physical read schema to Arrow: {error}"
+            ))
+        })?;
+        schema
+            .project(&self.field_indexes)
+            .map(Arc::new)
+            .map_err(|error| {
+                FlussLakeError::Execution(format!(
+                    "failed to project the physical UnionRead schema: {error}"
+                ))
+            })
     }
 }
 
@@ -122,19 +439,9 @@ async fn open_pk_hybrid_stream(
     )?;
     fold_changelog_tail(&table, &descriptor, &physical, &mut overlay, &context).await?;
 
-    let lake_stream = open_pk_lake_stream(
-        &descriptor,
-        &context,
-        table_info.row_type(),
-        &physical,
-        context.idle_timeout(),
-    )
-    .await?;
-    Ok(merged_stream(
-        overlay,
-        lake_stream,
-        physical.output_column_count,
-    ))
+    let lake_stream =
+        open_pk_lake_stream(&descriptor, &context, table_info.row_type(), &physical).await?;
+    Ok(merged_stream(overlay, lake_stream))
 }
 
 /// Opens the lake half of a primary-key split.
@@ -148,7 +455,6 @@ async fn open_pk_lake_stream(
     context: &FlussLakeExecutionContext,
     row_type: &RowType,
     physical: &PhysicalPkProjection,
-    idle_timeout: Duration,
 ) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     if descriptor.lake_splits().is_empty() {
         return Ok(Box::pin(futures::stream::empty()));
@@ -175,15 +481,14 @@ async fn open_pk_lake_stream(
         splits.push(crate::paimon::decode_split(encoded_split)?);
     }
 
-    let stream = crate::paimon::read_snapshot_splits(
+    crate::paimon::read_snapshot_splits(
         descriptor.table_path(),
         &catalog_options,
         snapshot_id,
         Some(&projected_fields),
         splits,
     )
-    .await?;
-    Ok(with_idle_timeout(stream, idle_timeout))
+    .await
 }
 
 #[cfg(not(feature = "paimon"))]
@@ -192,7 +497,6 @@ async fn open_pk_lake_stream(
     _context: &FlussLakeExecutionContext,
     _row_type: &RowType,
     _physical: &PhysicalPkProjection,
-    _idle_timeout: Duration,
 ) -> FlussLakeResult<FlussLakeRecordBatchStream> {
     if descriptor.lake_splits().is_empty() {
         return Ok(Box::pin(futures::stream::empty()));
@@ -215,7 +519,7 @@ async fn fold_changelog_tail(
     descriptor: &PkHybridSplitDescriptor,
     physical: &PhysicalPkProjection,
     overlay: &mut PkOverlay,
-    context: &FlussLakeExecutionContext,
+    _context: &FlussLakeExecutionContext,
 ) -> FlussLakeResult<()> {
     if descriptor.start_offset() == descriptor.stop_offset() {
         return Ok(());
@@ -243,9 +547,7 @@ async fn fold_changelog_tail(
             .map_err(|error| execution_client_error("subscribe table bucket", error))?,
     }
 
-    let idle_timeout = context.idle_timeout();
     let mut next_offset = descriptor.start_offset();
-    let mut last_progress = Instant::now();
     while next_offset < descriptor.stop_offset() {
         let records = scanner
             .poll(TAIL_POLL_TIMEOUT)
@@ -253,13 +555,6 @@ async fn fold_changelog_tail(
             .map_err(|error| execution_client_error("poll bounded changelog tail", error))?;
         let bucket_records = records.records(&table_bucket);
         if bucket_records.is_empty() {
-            if last_progress.elapsed() > idle_timeout {
-                return Err(FlussLakeError::Execution(format!(
-                    "changelog tail of {table_bucket} made no progress within the {idle_timeout:?} idle timeout at offset {next_offset} of the frozen range [{}, {}); the stop offset existed at plan time, so a stalled fetch is an operational failure",
-                    descriptor.start_offset(),
-                    descriptor.stop_offset()
-                )));
-            }
             continue;
         }
 
@@ -269,7 +564,6 @@ async fn fold_changelog_tail(
             descriptor.stop_offset(),
             overlay,
         )?;
-        last_progress = Instant::now();
     }
     Ok(())
 }
@@ -376,6 +670,7 @@ fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> FlussLakeResult<Reco
 struct PhysicalPkProjection {
     field_indexes: Vec<usize>,
     key_positions: Vec<usize>,
+    #[allow(dead_code)]
     output_column_count: usize,
 }
 
@@ -450,14 +745,14 @@ fn validate_frozen_identity(
 ) -> FlussLakeResult<()> {
     let table_info = table.get_table_info();
     if table_info.table_id != table_bucket.table_id() {
-        return Err(FlussLakeError::Execution(format!(
+        return Err(FlussLakeError::SchemaIncompatible(format!(
             "split table id {} no longer matches resolved table id {} for {table_path}",
             table_bucket.table_id(),
             table_info.table_id
         )));
     }
     if table_info.schema_id != schema_id {
-        return Err(FlussLakeError::Execution(format!(
+        return Err(FlussLakeError::SchemaIncompatible(format!(
             "split schema id {schema_id} no longer matches current schema id {} for {table_path}; execution against a historical schema is not implemented",
             table_info.schema_id
         )));
@@ -476,32 +771,6 @@ where
     Box::pin(futures::stream::once(setup).try_flatten())
 }
 
-/// Enforces the bounded-read termination contract on a split stream.
-///
-/// A bounded read has exactly two exits: reaching its frozen stop boundary,
-/// or a typed error. The timeout bounds the wait for the *next* item and
-/// resets whenever one arrives, so a stalled fetch becomes an explicit error
-/// instead of an infinite wait — and never a silent partial result. Requires
-/// a Tokio runtime when polled, which the Fluss client needs anyway.
-fn with_idle_timeout(
-    stream: FlussLakeRecordBatchStream,
-    idle_timeout: Duration,
-) -> FlussLakeRecordBatchStream {
-    Box::pin(futures::stream::try_unfold(
-        stream,
-        move |mut stream| async move {
-            match tokio::time::timeout(idle_timeout, stream.next()).await {
-                Ok(Some(Ok(batch))) => Ok(Some((batch, stream))),
-                Ok(Some(Err(error))) => Err(error),
-                Ok(None) => Ok(None),
-                Err(_) => Err(FlussLakeError::Execution(format!(
-                    "bounded read made no progress within the {idle_timeout:?} idle timeout; the frozen stop boundary existed at plan time, so a stalled fetch is an operational failure rather than a reason to wait forever"
-                ))),
-            }
-        },
-    ))
-}
-
 /// Reads one frozen lake split.
 ///
 /// Lake splits are decodable in every build so that a split planned elsewhere
@@ -512,30 +781,26 @@ fn execute_lake_split(
     descriptor: LakeSplitDescriptor,
     context: FlussLakeExecutionContext,
 ) -> FlussLakeResult<FlussLakeRecordBatchStream> {
-    let idle_timeout = context.idle_timeout();
-    Ok(with_idle_timeout(
-        lazy_stream(async move {
-            // The split carries only non-sensitive options; secrets arrive through
-            // the execution context and override any split-carried value.
-            let catalog_options = crate::paimon::PaimonCatalogOptions::from_map(
-                descriptor
-                    .catalog_options()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            )
-            .with_runtime_credentials(context.lake_credentials());
-            crate::paimon::read_snapshot_split(
-                descriptor.table_path(),
-                &catalog_options,
-                descriptor.snapshot_id(),
-                descriptor.projected_fields(),
-                descriptor.encoded_split(),
-            )
-            .await
-        }),
-        idle_timeout,
-    ))
+    Ok(lazy_stream(async move {
+        // The split carries only non-sensitive options; secrets arrive through
+        // the execution context and override any split-carried value.
+        let catalog_options = crate::paimon::PaimonCatalogOptions::from_map(
+            descriptor
+                .catalog_options()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+        .with_runtime_credentials(context.lake_credentials());
+        crate::paimon::read_snapshot_split(
+            descriptor.table_path(),
+            &catalog_options,
+            descriptor.snapshot_id(),
+            descriptor.projected_fields(),
+            descriptor.encoded_split(),
+        )
+        .await
+    }))
 }
 
 #[cfg(not(feature = "paimon"))]
@@ -566,10 +831,7 @@ fn execute_append_log(
             "append-log split requires a Fluss connection in the execution context".to_string(),
         )
     })?;
-    Ok(with_idle_timeout(
-        lazy_stream(open_append_log_stream(connection, descriptor)),
-        context.idle_timeout(),
-    ))
+    Ok(lazy_stream(open_append_log_stream(connection, descriptor)))
 }
 
 async fn open_append_log_stream(
@@ -635,7 +897,58 @@ async fn open_append_log_stream(
 }
 
 fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
-    FlussLakeError::Execution(format!("failed to {action}: {error}"))
+    match error {
+        ClientError::LogOffsetOutOfRange { .. } => {
+            FlussLakeError::DataUnavailable(format!("failed to {action}: {error}"))
+        }
+        _ => FlussLakeError::Execution(format!("failed to {action}: {error}")),
+    }
+}
+
+/// Applies the exact predicate before stripping hidden physical columns.
+pub(crate) fn apply_filter_and_projection(
+    stream: FlussLakeRecordBatchStream,
+    filter: &FlussLakePredicate,
+    output_column_count: Option<usize>,
+) -> FlussLakeRecordBatchStream {
+    if matches!(filter, FlussLakePredicate::AlwaysTrue) && output_column_count.is_none() {
+        return stream;
+    }
+    let filter = Arc::new(filter.clone());
+    Box::pin(stream.try_filter_map(move |batch| {
+        let filter = Arc::clone(&filter);
+        async move {
+            let filtered = if matches!(filter.as_ref(), FlussLakePredicate::AlwaysTrue) {
+                batch
+            } else {
+                let mask = filter.evaluate_batch(&batch)?;
+                let true_count = mask.true_count();
+                if true_count == 0 {
+                    return Ok(None);
+                }
+                if true_count == batch.num_rows() {
+                    batch
+                } else {
+                    filter_record_batch(&batch, &mask).map_err(|error| {
+                        FlussLakeError::Execution(format!(
+                            "failed to apply filter to record batch: {error}"
+                        ))
+                    })?
+                }
+            };
+            if let Some(output_column_count) = output_column_count
+                && filtered.num_columns() != output_column_count
+            {
+                let projection: Vec<usize> = (0..output_column_count).collect();
+                return filtered.project(&projection).map(Some).map_err(|error| {
+                    FlussLakeError::Execution(format!(
+                        "failed to strip hidden UnionRead columns after filtering: {error}"
+                    ))
+                });
+            }
+            Ok(Some(filtered))
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -646,6 +959,10 @@ mod tests {
     use fluss::metadata::{TableBucket, TablePath};
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn execution_spec(table: &str) -> FlussLakeScanSpec {
+        FlussLakeScanSpec::new(TablePath::new("fluss", table))
+    }
 
     fn append_log_split(start_offset: i64, stop_offset: i64) -> FlussLakeReadSplit {
         let descriptor = SplitDescriptor::AppendLog(
@@ -661,6 +978,8 @@ mod tests {
         );
         FlussLakeReadSplit::try_new(
             "append-log/5/root/0".to_string(),
+            0,
+            None,
             CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor.encode().unwrap(),
             FlussLakeReadStatistics::default(),
@@ -675,6 +994,8 @@ mod tests {
             .execute(
                 append_log_split(10, 10),
                 FlussLakeExecutionContext::default(),
+                execution_spec("orders"),
+                HashMap::new(),
             )
             .unwrap();
 
@@ -687,6 +1008,8 @@ mod tests {
         let result = executor.execute(
             append_log_split(10, 11),
             FlussLakeExecutionContext::default(),
+            execution_spec("orders"),
+            HashMap::new(),
         );
 
         assert!(matches!(result, Err(FlussLakeError::Execution(_))));
@@ -723,77 +1046,6 @@ mod tests {
         assert!(futures::executor::block_on(stream.next()).is_none());
     }
 
-    /// A stalled bounded read must fail with a typed error instead of
-    /// waiting forever: the frozen stop boundary existed at plan time, so
-    /// lack of progress is an operational failure.
-    #[tokio::test]
-    async fn idle_timeout_fails_a_stalled_bounded_read() {
-        let stalled: FlussLakeRecordBatchStream = Box::pin(futures::stream::pending());
-        let mut stream = with_idle_timeout(stalled, Duration::from_millis(20));
-
-        let first = stream.next().await;
-
-        match first {
-            Some(Err(FlussLakeError::Execution(message))) => {
-                assert!(
-                    message.contains("idle timeout"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected an idle-timeout execution error, got: {other:?}"),
-        }
-    }
-
-    /// The idle timeout bounds the wait for the next item, not the total
-    /// read: it must reset whenever data arrives, and a stream that keeps
-    /// making progress must complete untouched.
-    #[tokio::test]
-    async fn idle_timeout_resets_on_progress_and_passes_bounded_streams_through() {
-        use arrow::datatypes::Schema;
-
-        let batches: Vec<FlussLakeResult<RecordBatch>> = (0..3)
-            .map(|_| Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))))
-            .collect();
-        let bounded: FlussLakeRecordBatchStream = Box::pin(futures::stream::iter(batches));
-        let mut stream = with_idle_timeout(bounded, Duration::from_millis(20));
-
-        let mut seen = 0;
-        while let Some(item) = stream.next().await {
-            item.unwrap();
-            seen += 1;
-        }
-
-        assert_eq!(seen, 3);
-    }
-
-    /// Progress must keep a stream alive past the idle threshold measured
-    /// from its start; only a gap longer than the threshold may fail it.
-    #[tokio::test]
-    async fn idle_timeout_measures_gaps_not_total_duration() {
-        use arrow::datatypes::Schema;
-
-        let ticking = futures::stream::unfold(0, |emitted| async move {
-            if emitted == 4 {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(15)).await;
-            let batch: FlussLakeResult<RecordBatch> =
-                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
-            Some((batch, emitted + 1))
-        });
-        // Each 15ms gap is under the 25ms threshold while the 60ms total is
-        // far over it: completion proves the timer resets on every item.
-        let mut stream = with_idle_timeout(Box::pin(ticking), Duration::from_millis(25));
-
-        let mut seen = 0;
-        while let Some(item) = stream.next().await {
-            item.unwrap();
-            seen += 1;
-        }
-
-        assert_eq!(seen, 4);
-    }
-
     /// A lake split planned elsewhere must stay decodable here, so that a
     /// build without any lake format reports why it cannot run it.
     #[test]
@@ -816,13 +1068,20 @@ mod tests {
         );
         let split = FlussLakeReadSplit::try_new(
             "lake-split/fluss.orders/7/0".to_string(),
+            0,
+            None,
             CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor.encode().unwrap(),
             FlussLakeReadStatistics::default(),
         )
         .unwrap();
 
-        let result = FlussUnionReadExecutor.execute(split, FlussLakeExecutionContext::default());
+        let result = FlussUnionReadExecutor.execute(
+            split,
+            FlussLakeExecutionContext::default(),
+            execution_spec("orders"),
+            HashMap::new(),
+        );
 
         match result {
             Err(FlussLakeError::Execution(message)) => {
@@ -887,6 +1146,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn physical_projection_keeps_predicate_columns_hidden_from_output() {
+        let physical = PhysicalProjection::resolve(
+            &pk_row_type(),
+            Some(&[2]),
+            &FlussLakePredicate::eq("id", 1_i32),
+            &[0, 1],
+        )
+        .unwrap();
+
+        assert_eq!(physical.field_indexes, vec![2, 0, 1]);
+        assert_eq!(physical.key_positions, vec![1, 2]);
+    }
+
     fn pk_hybrid_split(start_offset: i64, stop_offset: i64) -> FlussLakeReadSplit {
         use crate::split_descriptor::PkHybridSplitDescriptor;
         use std::collections::BTreeMap;
@@ -908,6 +1181,8 @@ mod tests {
         );
         FlussLakeReadSplit::try_new(
             "pk-hybrid/5/root/0".to_string(),
+            0,
+            None,
             CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor.encode().unwrap(),
             FlussLakeReadStatistics::default(),
@@ -923,6 +1198,8 @@ mod tests {
             .execute(
                 pk_hybrid_split(10, 10),
                 FlussLakeExecutionContext::default(),
+                execution_spec("pk_orders"),
+                HashMap::new(),
             )
             .unwrap();
 
@@ -934,6 +1211,8 @@ mod tests {
         let result = FlussUnionReadExecutor.execute(
             pk_hybrid_split(10, 11),
             FlussLakeExecutionContext::default(),
+            execution_spec("pk_orders"),
+            HashMap::new(),
         );
 
         assert!(matches!(result, Err(FlussLakeError::Execution(_))));
@@ -961,5 +1240,121 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(ids.values(), &[3, 1]);
+    }
+
+    #[test]
+    fn apply_filter_removes_non_matching_rows_from_stream() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use futures::stream;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+        let source: FlussLakeRecordBatchStream =
+            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
+        let filtered =
+            apply_filter_and_projection(source, &FlussLakePredicate::gt("id", 2_i32), None);
+
+        let batches: Vec<RecordBatch> =
+            futures::executor::block_on(filtered.try_collect()).unwrap();
+        assert_eq!(batches.len(), 1);
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[3, 4]);
+    }
+
+    #[test]
+    fn apply_filter_drops_batch_with_no_matching_rows() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use futures::stream;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+        let source: FlussLakeRecordBatchStream =
+            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
+        let filtered =
+            apply_filter_and_projection(source, &FlussLakePredicate::gt("id", 5_i32), None);
+
+        let batches: Vec<RecordBatch> =
+            futures::executor::block_on(filtered.try_collect()).unwrap();
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn exact_filter_runs_before_hidden_columns_are_stripped() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use futures::stream;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("id", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["one", "two"])) as arrow::array::ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source: FlussLakeRecordBatchStream =
+            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
+        let filtered =
+            apply_filter_and_projection(source, &FlussLakePredicate::eq("id", 2_i32), Some(1));
+
+        let batches: Vec<RecordBatch> =
+            futures::executor::block_on(filtered.try_collect()).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "name");
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "two");
+    }
+
+    #[test]
+    fn exact_filter_never_passes_through_a_missing_column() {
+        use arrow::array::StringArray;
+        use futures::stream;
+
+        let batch = RecordBatch::try_from_iter(vec![(
+            "name",
+            Arc::new(StringArray::from(vec!["one"])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let source: FlussLakeRecordBatchStream =
+            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
+        let filtered =
+            apply_filter_and_projection(source, &FlussLakePredicate::eq("id", 1_i32), None);
+
+        let result = futures::executor::block_on(filtered.try_collect::<Vec<RecordBatch>>());
+
+        assert!(matches!(result, Err(FlussLakeError::SchemaIncompatible(_))));
+    }
+
+    #[test]
+    fn log_offset_out_of_range_maps_to_data_unavailable() {
+        let error = ClientError::LogOffsetOutOfRange {
+            message: "offset 1 was removed".to_string(),
+        };
+
+        assert!(matches!(
+            execution_client_error("read bounded log", error),
+            FlussLakeError::DataUnavailable(_)
+        ));
     }
 }

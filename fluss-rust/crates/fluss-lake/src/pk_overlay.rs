@@ -291,7 +291,6 @@ impl PkOverlay {
 pub(crate) fn merged_stream(
     overlay: PkOverlay,
     lake_stream: FlussLakeRecordBatchStream,
-    output_column_count: usize,
 ) -> FlussLakeRecordBatchStream {
     enum Phase {
         Lake {
@@ -319,9 +318,8 @@ pub(crate) fn merged_stream(
                         match lake_stream.next().await {
                             Some(Ok(batch)) => match overlay.probe_lake_batch(&batch)? {
                                 Some(kept) => {
-                                    let output = project_output(&kept, output_column_count)?;
                                     return Ok(Some((
-                                        output,
+                                        kept,
                                         Phase::Lake {
                                             overlay,
                                             lake_stream,
@@ -341,10 +339,7 @@ pub(crate) fn merged_stream(
                     }
                     Phase::Survivors(overlay) => {
                         return match overlay.into_surviving_batch()? {
-                            Some(batch) => {
-                                let output = project_output(&batch, output_column_count)?;
-                                Ok(Some((output, Phase::Done)))
-                            }
+                            Some(batch) => Ok(Some((batch, Phase::Done))),
                             None => Ok(None),
                         };
                     }
@@ -353,22 +348,6 @@ pub(crate) fn merged_stream(
             }
         },
     ))
-}
-
-/// Strips the key columns the merge added behind the engine's back.
-///
-/// The physical projection appends any primary-key column the request did not
-/// ask for, so the engine-visible output is exactly the leading prefix.
-fn project_output(batch: &RecordBatch, output_column_count: usize) -> FlussLakeResult<RecordBatch> {
-    if batch.num_columns() == output_column_count {
-        return Ok(batch.clone());
-    }
-    let projection: Vec<usize> = (0..output_column_count).collect();
-    batch.project(&projection).map_err(|error| {
-        FlussLakeError::Execution(format!(
-            "failed to strip the hidden primary-key columns added for merging: {error}"
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -433,14 +412,11 @@ mod tests {
     async fn collect_merged(
         overlay: PkOverlay,
         lake_batches: Vec<RecordBatch>,
-        output_column_count: usize,
+        _output_column_count: usize,
     ) -> Vec<(i32, String, i64)> {
         let lake: FlussLakeRecordBatchStream =
             Box::pin(futures::stream::iter(lake_batches.into_iter().map(Ok)));
-        let merged: Vec<RecordBatch> = merged_stream(overlay, lake, output_column_count)
-            .try_collect()
-            .await
-            .unwrap();
+        let merged: Vec<RecordBatch> = merged_stream(overlay, lake).try_collect().await.unwrap();
         let mut rows: Vec<(i32, String, i64)> = merged.iter().flat_map(rows_of).collect();
         rows.sort();
         rows
@@ -552,9 +528,9 @@ mod tests {
         );
     }
 
-    /// Key columns widened into the physical read must not reach the engine.
+    /// The overlay keeps the widened physical schema for downstream filtering.
     #[tokio::test]
-    async fn hidden_key_columns_are_stripped_before_output() {
+    async fn hidden_key_columns_remain_available_after_overlay() {
         // A request for `name` and `amount` on a table keyed by `id`: the
         // physical read appends `id` last so the merge can compare keys.
         let physical_schema = Arc::new(Schema::new(vec![
@@ -584,14 +560,15 @@ mod tests {
             physical_batch(vec!["one", "two"], vec![10, 20], vec![1, 2]),
         )]));
 
-        let mut merged = merged_stream(overlay, lake, 2);
+        let mut merged = merged_stream(overlay, lake);
 
         let mut emitted = 0;
         while let Some(batch) = merged.next().await {
             let batch = batch.unwrap();
-            assert_eq!(batch.num_columns(), 2);
+            assert_eq!(batch.num_columns(), 3);
             assert_eq!(batch.schema().field(0).name(), "name");
             assert_eq!(batch.schema().field(1).name(), "amount");
+            assert_eq!(batch.schema().field(2).name(), "id");
             emitted += 1;
         }
         assert_eq!(emitted, 2, "one surviving lake batch and the overlay batch");

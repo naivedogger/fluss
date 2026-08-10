@@ -19,22 +19,26 @@
 //! Union read is a bounded batch query. Results are delivered lazily as a
 //! finite stream of Arrow record batches.
 
+mod bucket_pruning;
+mod context;
 mod executor;
 mod facade;
 #[cfg(feature = "paimon")]
 mod paimon;
 mod pk_overlay;
+mod plan;
 mod planner;
 mod planning;
+mod predicate;
 mod pruning;
+mod split;
 mod split_descriptor;
 mod union_read;
 
-pub use facade::{FlussLakeRead, FlussLakeScan, FlussLakeTable};
+pub use facade::{FlussLakeReader, FlussLakeScan, FlussLakeTable};
 pub use union_read::{
-    CURRENT_FLUSS_LAKE_SPLIT_VERSION, DEFAULT_FLUSS_LAKE_IDLE_TIMEOUT, FlussLakeError,
-    FlussLakeExecutionContext, FlussLakePredicateId, FlussLakePredicateInput,
-    FlussLakePredicatePushdownDecision, FlussLakePredicatePushdownLevel, FlussLakeReadMode,
-    FlussLakeReadPlan, FlussLakeReadSplit, FlussLakeReadStatistics, FlussLakeRecordBatchStream,
-    FlussLakeResult,
+    CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeComparisonOp, FlussLakeError,
+    FlussLakeExecutionContext, FlussLakeLiteral, FlussLakePartitionIdentity,
+    FlussLakePlanStatistics, FlussLakePredicate, FlussLakeReadMode, FlussLakeReadPlan,
+    FlussLakeReadSplit, FlussLakeReadStatistics, FlussLakeRecordBatchStream, FlussLakeResult,
 };

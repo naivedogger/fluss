@@ -15,17 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Conservative partition pruning over engine-supplied pruning predicates.
+//! Conservative partition pruning over the engine-supplied filter predicate.
 //!
 //! Partitions are pruned only when a predicate provably evaluates to false
 //! for the partition's key values. Any unsupported operator, literal kind or
 //! non-partition field keeps the partition, so pruning can never remove
-//! matching rows. The engine always re-evaluates its original predicates as
-//! residual filters regardless of the pruning outcome.
+//! matching rows. The engine always re-evaluates its original predicate as a
+//! residual filter regardless of the pruning outcome.
 
-use crate::{
-    FlussLakePredicateInput, FlussLakePredicatePushdownDecision, FlussLakePredicatePushdownLevel,
-};
+use crate::FlussLakePredicate;
 use fluss::metadata::{ResolvedPartitionSpec, RowType};
 use fluss::predicate::{ComparisonOperator, FieldRef, PruningLiteral, PruningPredicate};
 use std::collections::HashMap;
@@ -38,7 +36,7 @@ enum TruthValue {
     Unknown,
 }
 
-/// Evaluates request predicates against a table's partition key values.
+/// Evaluates the scan filter predicate against a table's partition key values.
 pub(crate) struct PartitionPruner {
     /// Table field index of each partition key, keyed by partition key name.
     partition_fields: HashMap<usize, String>,
@@ -49,11 +47,11 @@ impl PartitionPruner {
     /// Builds a pruner for one planning pass.
     ///
     /// `partition_keys` must reference existing fields of `row_type`; the
-    /// planner validates predicate field identity separately.
+    /// planner validates predicate column names separately.
     pub(crate) fn new(
         row_type: &RowType,
         partition_keys: &[String],
-        predicates: &[FlussLakePredicateInput],
+        filter: &FlussLakePredicate,
     ) -> Self {
         let mut partition_fields = HashMap::with_capacity(partition_keys.len());
         for partition_key in partition_keys {
@@ -65,35 +63,15 @@ impl PartitionPruner {
                 partition_fields.insert(field_index, partition_key.clone());
             }
         }
+        let predicates = match filter.to_pruning_predicate(row_type) {
+            Some(PruningPredicate::And(children)) => children,
+            Some(predicate) => vec![predicate],
+            None => Vec::new(),
+        };
         Self {
             partition_fields,
-            predicates: predicates
-                .iter()
-                .map(|input| input.predicate().clone())
-                .collect(),
+            predicates,
         }
-    }
-
-    /// Reports the pushdown level of every request predicate.
-    ///
-    /// A predicate is `PruningOnly` when this pruner could evaluate it to a
-    /// definitive false for some partition; every level keeps the engine's
-    /// residual evaluation obligation.
-    pub(crate) fn decisions(
-        &self,
-        predicates: &[FlussLakePredicateInput],
-    ) -> Vec<FlussLakePredicatePushdownDecision> {
-        predicates
-            .iter()
-            .map(|input| {
-                let level = if self.can_prune(input.predicate()) {
-                    FlussLakePredicatePushdownLevel::PruningOnly
-                } else {
-                    FlussLakePredicatePushdownLevel::Unsupported
-                };
-                FlussLakePredicatePushdownDecision::new(input.id(), level)
-            })
-            .collect()
     }
 
     /// Returns whether a partition may contain matching rows.
@@ -110,31 +88,6 @@ impl PartitionPruner {
         self.predicates
             .iter()
             .all(|predicate| self.evaluate(predicate, &partition_values) != TruthValue::False)
-    }
-
-    fn can_prune(&self, predicate: &PruningPredicate) -> bool {
-        match predicate {
-            PruningPredicate::Comparison {
-                operator,
-                field,
-                literal,
-            } => {
-                self.partition_fields.contains_key(&field.index())
-                    && comparison_is_evaluable(*operator, literal)
-            }
-            PruningPredicate::In { field, literals } => {
-                self.partition_fields.contains_key(&field.index())
-                    && !literals.is_empty()
-                    && literals.iter().all(literal_is_evaluable)
-            }
-            PruningPredicate::NullCheck { .. } => false,
-            // A conjunction prunes when any child prunes.
-            PruningPredicate::And(children) => children.iter().any(|child| self.can_prune(child)),
-            // A disjunction only prunes when every branch can be proven false.
-            PruningPredicate::Or(children) => {
-                !children.is_empty() && children.iter().all(|child| self.can_prune(child))
-            }
-        }
     }
 
     fn evaluate(
@@ -173,7 +126,7 @@ impl PartitionPruner {
             }
             PruningPredicate::Or(children) => {
                 if children.is_empty() {
-                    return TruthValue::Unknown;
+                    return TruthValue::False;
                 }
                 let mut result = TruthValue::False;
                 for child in children {
@@ -201,21 +154,6 @@ impl PartitionPruner {
         }
         partition_values.get(partition_key.as_str()).copied()
     }
-}
-
-fn comparison_is_evaluable(operator: ComparisonOperator, literal: &PruningLiteral) -> bool {
-    match operator {
-        ComparisonOperator::Equal | ComparisonOperator::NotEqual => literal_is_evaluable(literal),
-        ComparisonOperator::LessThan
-        | ComparisonOperator::LessThanOrEqual
-        | ComparisonOperator::GreaterThan
-        | ComparisonOperator::GreaterThanOrEqual => literal_as_integer(literal).is_some(),
-    }
-}
-
-/// Literal kinds whose equality against a partition value string is exact.
-fn literal_is_evaluable(literal: &PruningLiteral) -> bool {
-    matches!(literal, PruningLiteral::String(_)) || literal_as_integer(literal).is_some()
 }
 
 fn literal_as_integer(literal: &PruningLiteral) -> Option<i128> {
@@ -302,9 +240,7 @@ fn literal_equals(partition_value: &str, literal: &PruningLiteral) -> Option<boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FlussLakePredicateId;
     use fluss::metadata::{DataField, DataTypes};
-    use fluss::predicate::NullCheckOperator;
     use std::sync::Arc;
 
     fn row_type() -> RowType {
@@ -315,26 +251,11 @@ mod tests {
         ])
     }
 
-    fn region_field() -> FieldRef {
-        FieldRef::new(1, "region", DataTypes::string())
-    }
-
-    fn day_field() -> FieldRef {
-        FieldRef::new(2, "day", DataTypes::int())
-    }
-
-    fn pruner(predicates: Vec<PruningPredicate>) -> PartitionPruner {
-        let inputs: Vec<FlussLakePredicateInput> = predicates
-            .into_iter()
-            .enumerate()
-            .map(|(index, predicate)| {
-                FlussLakePredicateInput::new(FlussLakePredicateId::new(index as u32), predicate)
-            })
-            .collect();
+    fn pruner(filter: FlussLakePredicate) -> PartitionPruner {
         PartitionPruner::new(
             &row_type(),
             &["region".to_string(), "day".to_string()],
-            &inputs,
+            &filter,
         )
     }
 
@@ -348,11 +269,7 @@ mod tests {
 
     #[test]
     fn equal_predicate_prunes_non_matching_partition() {
-        let pruner = pruner(vec![PruningPredicate::comparison(
-            ComparisonOperator::Equal,
-            region_field(),
-            "US",
-        )]);
+        let pruner = pruner(FlussLakePredicate::eq("region", "US"));
 
         assert!(pruner.partition_may_match(&partition("US", "20260728")));
         assert!(!pruner.partition_may_match(&partition("EU", "20260728")));
@@ -360,11 +277,7 @@ mod tests {
 
     #[test]
     fn integer_range_predicate_prunes_by_numeric_order() {
-        let pruner = pruner(vec![PruningPredicate::comparison(
-            ComparisonOperator::GreaterThanOrEqual,
-            day_field(),
-            20260728_i32,
-        )]);
+        let pruner = pruner(FlussLakePredicate::ge("day", 20260728_i32));
 
         assert!(pruner.partition_may_match(&partition("US", "20260728")));
         // Lexicographic order would keep "9" here; numeric order prunes it.
@@ -373,21 +286,14 @@ mod tests {
 
     #[test]
     fn unparsable_partition_value_is_never_pruned() {
-        let pruner = pruner(vec![PruningPredicate::comparison(
-            ComparisonOperator::Equal,
-            day_field(),
-            20260728_i32,
-        )]);
+        let pruner = pruner(FlussLakePredicate::eq("day", 20260728_i32));
 
         assert!(pruner.partition_may_match(&partition("US", "not-a-number")));
     }
 
     #[test]
     fn in_list_predicate_prunes_partitions_outside_the_list() {
-        let pruner = pruner(vec![PruningPredicate::in_list(
-            region_field(),
-            ["US", "CN"],
-        )]);
+        let pruner = pruner(FlussLakePredicate::in_list("region", ["US", "CN"]));
 
         assert!(pruner.partition_may_match(&partition("CN", "20260728")));
         assert!(!pruner.partition_may_match(&partition("EU", "20260728")));
@@ -395,91 +301,52 @@ mod tests {
 
     #[test]
     fn non_partition_field_predicate_keeps_every_partition() {
-        let pruner = pruner(vec![PruningPredicate::comparison(
-            ComparisonOperator::Equal,
-            FieldRef::new(0, "id", DataTypes::int()),
-            42_i32,
-        )]);
+        let pruner = pruner(FlussLakePredicate::eq("id", 42_i32));
 
         assert!(pruner.partition_may_match(&partition("EU", "20260728")));
     }
 
     #[test]
     fn disjunction_prunes_only_when_every_branch_is_false() {
-        let or_pruner = pruner(vec![PruningPredicate::or([
-            PruningPredicate::comparison(ComparisonOperator::Equal, region_field(), "US"),
-            PruningPredicate::comparison(ComparisonOperator::Equal, region_field(), "CN"),
-        ])]);
+        let or_pruner = pruner(FlussLakePredicate::or([
+            FlussLakePredicate::eq("region", "US"),
+            FlussLakePredicate::eq("region", "CN"),
+        ]));
 
         assert!(or_pruner.partition_may_match(&partition("CN", "20260728")));
         assert!(!or_pruner.partition_may_match(&partition("EU", "20260728")));
 
-        let mixed = pruner(vec![PruningPredicate::or([
-            PruningPredicate::comparison(ComparisonOperator::Equal, region_field(), "US"),
-            PruningPredicate::comparison(
-                ComparisonOperator::Equal,
-                FieldRef::new(0, "id", DataTypes::int()),
-                42_i32,
-            ),
-        ])]);
+        let mixed = pruner(FlussLakePredicate::or([
+            FlussLakePredicate::eq("region", "US"),
+            FlussLakePredicate::eq("id", 42_i32),
+        ]));
         assert!(mixed.partition_may_match(&partition("EU", "20260728")));
     }
 
     #[test]
     fn conjunction_prunes_when_any_child_is_false() {
-        let pruner = pruner(vec![PruningPredicate::and([
-            PruningPredicate::comparison(ComparisonOperator::Equal, region_field(), "US"),
-            PruningPredicate::comparison(
-                ComparisonOperator::Equal,
-                FieldRef::new(0, "id", DataTypes::int()),
-                42_i32,
-            ),
-        ])]);
+        let pruner = pruner(FlussLakePredicate::and([
+            FlussLakePredicate::eq("region", "US"),
+            FlussLakePredicate::eq("id", 42_i32),
+        ]));
 
         assert!(pruner.partition_may_match(&partition("US", "20260728")));
         assert!(!pruner.partition_may_match(&partition("EU", "20260728")));
     }
 
     #[test]
-    fn decisions_report_pruning_only_for_evaluable_partition_predicates() {
-        let inputs = vec![
-            FlussLakePredicateInput::new(
-                FlussLakePredicateId::new(1),
-                PruningPredicate::comparison(ComparisonOperator::Equal, region_field(), "US"),
-            ),
-            FlussLakePredicateInput::new(
-                FlussLakePredicateId::new(2),
-                PruningPredicate::comparison(
-                    ComparisonOperator::Equal,
-                    FieldRef::new(0, "id", DataTypes::int()),
-                    42_i32,
-                ),
-            ),
-            FlussLakePredicateInput::new(
-                FlussLakePredicateId::new(3),
-                PruningPredicate::null_check(NullCheckOperator::IsNull, region_field()),
-            ),
-        ];
-        let pruner = PartitionPruner::new(&row_type(), &["region".to_string()], &inputs);
-
-        let decisions = pruner.decisions(&inputs);
-
-        assert_eq!(
-            decisions[0].level(),
-            FlussLakePredicatePushdownLevel::PruningOnly
-        );
-        assert_eq!(
-            decisions[1].level(),
-            FlussLakePredicatePushdownLevel::Unsupported
-        );
-        assert_eq!(
-            decisions[2].level(),
-            FlussLakePredicatePushdownLevel::Unsupported
-        );
+    fn always_true_keeps_every_partition() {
         assert!(
-            decisions
-                .iter()
-                .all(|decision| decision.level().requires_residual_evaluation())
+            pruner(FlussLakePredicate::always_true())
+                .partition_may_match(&partition("EU", "20260728"))
+        );
+    }
+
+    #[test]
+    fn always_false_prunes_every_partition() {
+        assert!(
+            !pruner(FlussLakePredicate::always_false())
+                .partition_may_match(&partition("US", "20260728"))
         );
     }
 }
