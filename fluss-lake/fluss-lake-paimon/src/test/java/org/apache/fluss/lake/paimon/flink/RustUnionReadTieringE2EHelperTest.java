@@ -65,6 +65,8 @@ class RustUnionReadTieringE2EHelperTest {
         long targetOffset =
                 Long.parseLong(
                         requiredEnvironmentVariable("FLUSS_RUST_UNION_READ_TARGET_LOG_END_OFFSET"));
+        Long targetPartitionId =
+                optionalLongEnvironmentVariable("FLUSS_RUST_UNION_READ_TARGET_PARTITION_ID");
         Duration timeout =
                 Duration.ofSeconds(
                         Long.parseLong(
@@ -86,7 +88,7 @@ class RustUnionReadTieringE2EHelperTest {
         execEnv.setParallelism(1);
 
         TablePath tablePath = TablePath.of(database, table);
-        TableBucket tableBucket = new TableBucket(tableId, 0);
+        TableBucket tableBucket = new TableBucket(tableId, targetPartitionId, 0);
         JobClient jobClient = null;
         try (Connection connection =
                         createConnectionWithRetry(flussConfig, Duration.ofSeconds(30));
@@ -177,5 +179,10 @@ class RustUnionReadTieringE2EHelperTest {
     private static String environmentVariableOrDefault(String name, String defaultValue) {
         String value = System.getenv(name);
         return value == null || value.trim().isEmpty() ? defaultValue : value;
+    }
+
+    private static Long optionalLongEnvironmentVariable(String name) {
+        String value = System.getenv(name);
+        return value == null || value.trim().isEmpty() ? null : Long.valueOf(value);
     }
 }

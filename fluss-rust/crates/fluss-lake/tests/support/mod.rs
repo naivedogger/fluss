@@ -147,11 +147,30 @@ pub async fn run_java_paimon_tiering_until_offset(
     table_id: i64,
     target_log_end_offset: i64,
 ) {
+    run_java_paimon_tiering_until_partition_offset(
+        bootstrap_servers,
+        table_path,
+        table_id,
+        None,
+        target_log_end_offset,
+    )
+    .await;
+}
+
+#[cfg(feature = "paimon")]
+pub async fn run_java_paimon_tiering_until_partition_offset(
+    bootstrap_servers: &str,
+    table_path: &TablePath,
+    table_id: i64,
+    target_partition_id: Option<i64>,
+    target_log_end_offset: i64,
+) {
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
         .expect("Failed to resolve Fluss repository root");
-    let status = Command::new(repository_root.join("mvnw"))
+    let mut command = Command::new(repository_root.join("mvnw"));
+    command
         .current_dir(repository_root)
         .args([
             "--offline",
@@ -176,7 +195,14 @@ pub async fn run_java_paimon_tiering_until_offset(
         .env(
             "FLUSS_RUST_UNION_READ_TARGET_LOG_END_OFFSET",
             target_log_end_offset.to_string(),
-        )
+        );
+    if let Some(partition_id) = target_partition_id {
+        command.env(
+            "FLUSS_RUST_UNION_READ_TARGET_PARTITION_ID",
+            partition_id.to_string(),
+        );
+    }
+    let status = command
         .status()
         .await
         .expect("Failed to start Java/Flink Paimon tiering helper");

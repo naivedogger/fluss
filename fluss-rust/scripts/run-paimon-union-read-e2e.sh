@@ -41,6 +41,6 @@ cargo test \
     -p fluss-lake \
     --features integration_tests,paimon \
     --test test_union_read \
-    paimon_pk_union_read_merges_update_delete_and_insert_end_to_end \
     -- \
-    --nocapture
+    --nocapture \
+    --test-threads=1
