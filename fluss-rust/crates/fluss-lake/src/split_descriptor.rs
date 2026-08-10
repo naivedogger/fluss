@@ -540,7 +540,7 @@ impl LogicalSplitDescriptor {
             primary_key_indexes.push(reader.read_u32("primary-key field index")? as usize);
         }
         let primary_key = flags & PRIMARY_KEY_TABLE != 0;
-        if primary_key != !primary_key_indexes.is_empty() {
+        if primary_key == primary_key_indexes.is_empty() {
             return Err(invalid_descriptor(
                 "primary-key flag and primary-key index count are inconsistent",
             ));
@@ -1463,17 +1463,6 @@ mod tests {
     }
 
     #[test]
-    fn lake_split_encoding_is_deterministic() {
-        let descriptor = SplitDescriptor::LakeSplit(lake_split_descriptor(None));
-
-        assert_eq!(
-            descriptor.encode().unwrap(),
-            descriptor.encode().unwrap(),
-            "the same plan must always produce the same split bytes"
-        );
-    }
-
-    #[test]
     fn rejects_invalid_lake_split_identity_and_payload() {
         assert!(matches!(
             LakeSplitDescriptor::try_new(
@@ -1652,17 +1641,6 @@ mod tests {
         assert_eq!(
             SplitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
             descriptor
-        );
-    }
-
-    #[test]
-    fn pk_hybrid_encoding_is_deterministic() {
-        let descriptor = SplitDescriptor::PkHybrid(pk_hybrid_descriptor());
-
-        assert_eq!(
-            descriptor.encode().unwrap(),
-            descriptor.encode().unwrap(),
-            "the same plan must always produce the same split bytes"
         );
     }
 

@@ -17,14 +17,17 @@
 use fluss::ServerType;
 use fluss::client::FlussAdmin;
 use fluss::error::{Error, FlussError};
-use fluss::metadata::{PartitionSpec, TableDescriptor, TablePath};
+use fluss::metadata::{TableDescriptor, TablePath};
 use fluss::rpc::message::OffsetSpec;
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
+#[cfg(feature = "paimon")]
 use std::collections::HashMap;
 #[cfg(feature = "paimon")]
 use std::path::Path;
 #[cfg(feature = "paimon")]
 use std::path::PathBuf;
+#[cfg(feature = "paimon")]
+use std::process::Command as StdCommand;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 #[cfg(feature = "paimon")]
@@ -32,13 +35,36 @@ use tokio::process::Command;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(feature = "paimon")]
+const S3_ACCESS_KEY: &str = "rustfsadmin";
+#[cfg(feature = "paimon")]
+const S3_SECRET_KEY: &str = "rustfsadmin";
+#[cfg(feature = "paimon")]
+const S3_BUCKET: &str = "fluss";
+#[cfg(feature = "paimon")]
+const S3_SERVER_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.83";
+#[cfg(feature = "paimon")]
+const S3_CLIENT_IMAGE: &str =
+    "minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 
 extern "C" fn cleanup_on_exit() {
     SHARED_CLUSTER.stop();
 }
 
+#[cfg(feature = "paimon")]
+extern "C" fn cleanup_s3_on_exit() {
+    let _ = StdCommand::new("docker")
+        .args(["rm", "-f", &s3_container_name()])
+        .status();
+}
+
 static CLUSTER_PORT: LazyLock<u16> =
     LazyLock::new(|| 20_000 + (std::process::id() % 20_000) as u16);
+
+#[cfg(feature = "paimon")]
+fn s3_container_name() -> String {
+    format!("rustfs-rust-union-read-{}", std::process::id())
+}
 
 #[cfg(feature = "paimon")]
 static SHARED_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -56,6 +82,96 @@ static SHARED_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
 #[cfg(feature = "paimon")]
 static PAIMON_WAREHOUSE_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| SHARED_DATA_DIR.join("paimon-warehouse"));
+
+#[cfg(feature = "paimon")]
+pub struct S3Fixture {
+    endpoint: String,
+}
+
+#[cfg(feature = "paimon")]
+impl S3Fixture {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn access_key(&self) -> &'static str {
+        S3_ACCESS_KEY
+    }
+
+    pub fn secret_key(&self) -> &'static str {
+        S3_SECRET_KEY
+    }
+
+    pub fn warehouse(&self) -> String {
+        format!("s3://{S3_BUCKET}/paimon")
+    }
+}
+
+#[cfg(feature = "paimon")]
+static S3_FIXTURE: LazyLock<S3Fixture> = LazyLock::new(|| {
+    let container_name = s3_container_name();
+    let port = *CLUSTER_PORT + 1_000;
+    let _ = StdCommand::new("docker")
+        .args(["rm", "-f", &container_name])
+        .status();
+    let mapped_port = format!("127.0.0.1:{port}:9000");
+    let status = StdCommand::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            &container_name,
+            "-p",
+            &mapped_port,
+            "-e",
+            &format!("RUSTFS_ACCESS_KEY={S3_ACCESS_KEY}"),
+            "-e",
+            &format!("RUSTFS_SECRET_KEY={S3_SECRET_KEY}"),
+            S3_SERVER_IMAGE,
+            "/data",
+        ])
+        .status()
+        .expect("Failed to start the RustFS S3-compatible test container");
+    assert!(
+        status.success(),
+        "Failed to start the RustFS test container"
+    );
+
+    let host_endpoint = format!("http://host.docker.internal:{port}");
+    let initialize_script = format!(
+        "until mc alias set union-read {host_endpoint} {S3_ACCESS_KEY} {S3_SECRET_KEY}; do \
+         sleep 1; done; mc mb --ignore-existing union-read/{S3_BUCKET}"
+    );
+    let status = StdCommand::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "--entrypoint",
+            "/bin/sh",
+            S3_CLIENT_IMAGE,
+            "-c",
+            &initialize_script,
+        ])
+        .status()
+        .expect("Failed to initialize the RustFS test bucket");
+    assert!(
+        status.success(),
+        "Failed to initialize the RustFS test bucket"
+    );
+
+    unsafe {
+        unsafe extern "C" {
+            fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+        }
+        atexit(cleanup_s3_on_exit);
+    }
+
+    S3Fixture {
+        endpoint: format!("http://127.0.0.1:{port}"),
+    }
+});
 
 static SHARED_CLUSTER: LazyLock<FlussTestingCluster> = LazyLock::new(|| {
     std::thread::spawn(|| {
@@ -141,28 +257,48 @@ pub fn paimon_warehouse_path() -> &'static Path {
 }
 
 #[cfg(feature = "paimon")]
+pub fn get_s3_fixture() -> &'static S3Fixture {
+    &S3_FIXTURE
+}
+
+#[cfg(feature = "paimon")]
+pub fn mirror_paimon_warehouse_to_s3() {
+    let fixture = get_s3_fixture();
+    let mount = format!("{}:/warehouse:ro", paimon_warehouse_path().display());
+    let container_endpoint = fixture
+        .endpoint()
+        .replace("127.0.0.1", "host.docker.internal");
+    let mirror_script = format!(
+        "mc alias set union-read {container_endpoint} {S3_ACCESS_KEY} {S3_SECRET_KEY} && \
+         mc mirror --overwrite /warehouse union-read/{S3_BUCKET}/paimon"
+    );
+    let status = StdCommand::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "-v",
+            &mount,
+            "--entrypoint",
+            "/bin/sh",
+            S3_CLIENT_IMAGE,
+            "-c",
+            &mirror_script,
+        ])
+        .status()
+        .expect("Failed to mirror the Paimon warehouse into RustFS");
+    assert!(
+        status.success(),
+        "Failed to mirror the Paimon warehouse into RustFS"
+    );
+}
+
+#[cfg(feature = "paimon")]
 pub async fn run_java_paimon_tiering_until_offset(
     bootstrap_servers: &str,
     table_path: &TablePath,
     table_id: i64,
-    target_log_end_offset: i64,
-) {
-    run_java_paimon_tiering_until_partition_offset(
-        bootstrap_servers,
-        table_path,
-        table_id,
-        None,
-        target_log_end_offset,
-    )
-    .await;
-}
-
-#[cfg(feature = "paimon")]
-pub async fn run_java_paimon_tiering_until_partition_offset(
-    bootstrap_servers: &str,
-    table_path: &TablePath,
-    table_id: i64,
-    target_partition_id: Option<i64>,
     target_log_end_offset: i64,
 ) {
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -196,12 +332,6 @@ pub async fn run_java_paimon_tiering_until_partition_offset(
             "FLUSS_RUST_UNION_READ_TARGET_LOG_END_OFFSET",
             target_log_end_offset.to_string(),
         );
-    if let Some(partition_id) = target_partition_id {
-        command.env(
-            "FLUSS_RUST_UNION_READ_TARGET_PARTITION_ID",
-            partition_id.to_string(),
-        );
-    }
     let status = command
         .status()
         .await
@@ -256,50 +386,6 @@ pub async fn create_table(
                 panic!(
                     "Timed out waiting for UnionRead integration test table {table_path}: {error}"
                 );
-            }
-        }
-    }
-}
-
-/// Creates a partitioned table and one partition per value, waiting until
-/// every partition can serve offset requests for bucket 0.
-pub async fn create_partitioned_table(
-    admin: &FlussAdmin,
-    table_path: &TablePath,
-    table_descriptor: &TableDescriptor,
-    partition_column: &str,
-    partition_values: &[&str],
-) {
-    admin
-        .create_table(table_path, table_descriptor, false)
-        .await
-        .expect("Failed to create UnionRead integration test table");
-
-    for partition_value in partition_values {
-        let mut partition_map = HashMap::new();
-        partition_map.insert(partition_column, *partition_value);
-        admin
-            .create_partition(table_path, &PartitionSpec::new(partition_map), true)
-            .await
-            .expect("Failed to create UnionRead integration test partition");
-    }
-
-    for partition_value in partition_values {
-        let start = Instant::now();
-        loop {
-            match admin
-                .list_partition_offsets(table_path, partition_value, &[0], OffsetSpec::Latest)
-                .await
-            {
-                Ok(_) => break,
-                Err(error) => {
-                    if start.elapsed() >= READINESS_TIMEOUT {
-                        panic!(
-                            "Timed out waiting for UnionRead integration test partition {partition_value} of {table_path}: {error}"
-                        );
-                    }
-                    tokio::time::sleep(READINESS_POLL_INTERVAL).await;
-                }
             }
         }
     }

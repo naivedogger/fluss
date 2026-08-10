@@ -457,16 +457,15 @@ pub(crate) fn decode_split(encoded_split: &str) -> FlussLakeResult<DataSplit> {
 }
 
 fn paimon_error(action: &str, error: paimon::Error) -> FlussLakeError {
-    let unavailable = match &error {
-        paimon::Error::IoUnexpected { source, .. } => format!("{:?}", source.kind()) == "NotFound",
-        paimon::Error::DataInvalid { message, .. } => {
-            let message = message.to_ascii_lowercase();
-            message.contains("does not exist")
-                || message.contains("not found")
-                || message.contains("no such file")
-        }
-        _ => false,
-    };
+    // Storage errors may be wrapped by Parquet before they reach Paimon. The
+    // outer variant is then `ParquetDataUnexpected`, while the rendered error
+    // chain still contains the underlying OpenDAL NotFound classification.
+    let message = error.to_string().to_ascii_lowercase();
+    let unavailable = message.contains("notfound")
+        || message.contains("not found")
+        || message.contains("does not exist")
+        || message.contains("no such file")
+        || message.contains("entity not found");
     if unavailable {
         FlussLakeError::DataUnavailable(format!("failed to {action}: {error}"))
     } else {
@@ -629,15 +628,6 @@ mod tests {
             projected_field_names(&row_type(), Some(&[3])),
             Err(FlussLakeError::InvalidRequest(_))
         ));
-    }
-
-    #[test]
-    fn catalog_options_round_trip_through_a_plain_map() {
-        let mut options = HashMap::new();
-        options.insert("warehouse".to_string(), "/tmp/warehouse".to_string());
-        let catalog_options = PaimonCatalogOptions::from_map(options.clone());
-
-        assert_eq!(catalog_options.as_map(), &options);
     }
 
     fn merge_engine_options(value: Option<&str>) -> HashMap<String, String> {

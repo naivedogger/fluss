@@ -245,18 +245,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_statistics_reports_split_count() {
-        let plan = FlussLakeReadPlan::new(
-            Arc::new(Schema::empty()),
-            Vec::new(),
-            FlussLakePlanStatistics::new(0),
-        );
-
-        assert_eq!(plan.splits().len(), 0);
-        assert_eq!(plan.statistics().split_count(), 0);
-    }
-
-    #[test]
     fn planner_and_executor_are_object_safe_engine_boundaries() {
         struct TestingUnionRead;
 

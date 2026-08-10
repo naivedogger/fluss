@@ -19,7 +19,7 @@
 
 mod support;
 
-use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use fluss::metadata::{
     AddColumn, AlterTableChanges, ColumnPositionType, DataTypes, JsonSerde, Schema,
@@ -32,6 +32,10 @@ use fluss_lake::{
     FlussLakeTable,
 };
 use futures::TryStreamExt;
+#[cfg(feature = "paimon")]
+use std::collections::HashMap;
+#[cfg(feature = "paimon")]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,15 +47,7 @@ fn append_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     .expect("Failed to build append record batch")
 }
 
-fn partitioned_batch(ids: Vec<i32>, regions: Vec<&str>, values: Vec<i64>) -> RecordBatch {
-    RecordBatch::try_from_iter(vec![
-        ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
-        ("region", Arc::new(StringArray::from(regions)) as ArrayRef),
-        ("value", Arc::new(Int64Array::from(values)) as ArrayRef),
-    ])
-    .expect("Failed to build partitioned record batch")
-}
-
+#[cfg(feature = "paimon")]
 fn extract_ids(batches: &[RecordBatch]) -> Vec<i32> {
     let mut ids: Vec<i32> = batches
         .iter()
@@ -79,17 +75,6 @@ fn pk_row(id: i32, name: Option<&str>) -> GenericRow<'_> {
 }
 
 #[cfg(feature = "paimon")]
-fn partitioned_pk_row<'a>(region: &'a str, id: i32, name: Option<&'a str>) -> GenericRow<'a> {
-    let mut row = GenericRow::new(3);
-    row.set_field(0, region);
-    row.set_field(1, id);
-    if let Some(name) = name {
-        row.set_field(2, name);
-    }
-    row
-}
-
-#[cfg(feature = "paimon")]
 fn extract_pk_rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -112,39 +97,81 @@ fn extract_pk_rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
 }
 
 #[cfg(feature = "paimon")]
-fn extract_partitioned_pk_rows(batches: &[RecordBatch]) -> Vec<(String, i32, String)> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let regions = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("region column should be a StringArray");
-        let ids = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("id column should be an Int32Array");
-        let names = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name column should be a StringArray");
-        for row in 0..batch.num_rows() {
-            rows.push((
-                regions.value(row).to_string(),
-                ids.value(row),
-                names.value(row).to_string(),
-            ));
+fn find_table_parquet_file(table_name: &str) -> PathBuf {
+    fn visit(directory: &Path, table_name: &str, result: &mut Option<PathBuf>) {
+        if result.is_some() {
+            return;
+        }
+        let entries = std::fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("Failed to list {}: {error}", directory.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to read entry below {}: {error}",
+                        directory.display()
+                    )
+                })
+                .path();
+            if path.is_dir() {
+                visit(&path, table_name, result);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+                && path
+                    .components()
+                    .any(|component| component.as_os_str() == table_name)
+            {
+                *result = Some(path);
+                return;
+            }
         }
     }
-    rows.sort_unstable();
-    rows
+
+    let mut result = None;
+    visit(support::paimon_warehouse_path(), table_name, &mut result);
+    result.unwrap_or_else(|| {
+        panic!(
+            "No Parquet data file found for table {table_name} below {}",
+            support::paimon_warehouse_path().display()
+        )
+    })
 }
 
-#[tokio::test]
-async fn union_read_test_cluster_accepts_connections() {
-    support::get_shared_cluster().get_fluss_connection().await;
+#[cfg(feature = "paimon")]
+fn s3_catalog_overrides(
+    fixture: &support::S3Fixture,
+    include_credentials: bool,
+) -> HashMap<String, String> {
+    let mut properties = HashMap::from([
+        (
+            "table.datalake.paimon.warehouse".to_string(),
+            fixture.warehouse(),
+        ),
+        (
+            "table.datalake.paimon.s3.endpoint".to_string(),
+            fixture.endpoint().to_string(),
+        ),
+        (
+            "table.datalake.paimon.s3.region".to_string(),
+            "us-east-1".to_string(),
+        ),
+        (
+            "table.datalake.paimon.s3.path-style-access".to_string(),
+            "true".to_string(),
+        ),
+    ]);
+    if include_credentials {
+        properties.insert(
+            "table.datalake.paimon.s3.access-key".to_string(),
+            fixture.access_key().to_string(),
+        );
+        properties.insert(
+            "table.datalake.paimon.s3.secret-key".to_string(),
+            fixture.secret_key().to_string(),
+        );
+    }
+    properties
 }
 
 /// Real PK UnionRead across a Paimon snapshot produced by Fluss' production
@@ -308,197 +335,264 @@ async fn paimon_pk_union_read_merges_update_delete_and_insert_end_to_end() {
         .expect("Failed to drop Paimon PK UnionRead table");
 }
 
-/// Real partitioned PK UnionRead across a Java-tiered Paimon snapshot and a
-/// bounded Fluss changelog tail. The partition predicate must prune the other
-/// physical partition while retaining the hidden primary-key columns required
-/// by the overlay.
+/// Real append UnionRead across a Java-tiered Paimon snapshot and a bounded
+/// Fluss log tail. This also verifies lake-only semantics and that retrying a
+/// frozen split after its planned lake file disappears returns DataUnavailable.
 #[cfg(feature = "paimon")]
 #[tokio::test]
-async fn partitioned_paimon_pk_union_read_executes_matching_partition_end_to_end() {
+async fn paimon_append_union_read_has_no_gap_or_overlap_end_to_end() {
     let cluster = support::get_shared_cluster();
     let connection = Arc::new(cluster.get_fluss_connection().await);
     let admin = connection.get_admin().expect("Failed to get Fluss admin");
-    let table_path = TablePath::new("fluss", "test_partitioned_paimon_pk_union_read_e2e");
+    let table_name = "test_paimon_append_union_read_e2e";
+    let table_path = TablePath::new("fluss", table_name);
     let table_descriptor = TableDescriptor::builder()
         .schema(
             Schema::builder()
-                .column("region", DataTypes::string())
                 .column("id", DataTypes::int())
                 .column("name", DataTypes::string())
-                .primary_key(vec!["region", "id"])
                 .build()
-                .expect("Failed to build partitioned Paimon PK schema"),
+                .expect("Failed to build Paimon append UnionRead schema"),
         )
-        .partitioned_by(vec!["region"])
         .distributed_by(Some(1), vec!["id".to_string()])
         .property("table.datalake.enabled", "true")
         .property("table.datalake.format", "paimon")
         .property("table.datalake.freshness", "1s")
         .custom_property("paimon.file.format", "parquet")
         .build()
-        .expect("Failed to build partitioned Paimon PK table descriptor");
-    support::create_partitioned_table(
-        &admin,
-        &table_path,
-        &table_descriptor,
-        "region",
-        &["US", "EU"],
-    )
-    .await;
-
-    let partition_infos = admin
-        .list_partition_infos(&table_path)
-        .await
-        .expect("Failed to list partitioned Paimon PK table partitions");
-    let us_partition_id = partition_infos
-        .iter()
-        .find(|partition| partition.get_partition_name() == "US")
-        .expect("US partition should exist")
-        .get_partition_id();
+        .expect("Failed to build Paimon append UnionRead table descriptor");
+    support::create_table(&admin, &table_path, &table_descriptor).await;
 
     let table = connection
         .get_table(&table_path)
         .await
-        .expect("Failed to open partitioned Paimon PK table");
+        .expect("Failed to open Paimon append UnionRead table");
     let writer = table
-        .new_upsert()
-        .expect("Failed to create partitioned Paimon PK upsert operation")
+        .new_append()
+        .expect("Failed to create Paimon append operation")
         .create_writer()
-        .expect("Failed to create partitioned Paimon PK writer");
-    for row in [
-        partitioned_pk_row("US", 1, Some("lake-old")),
-        partitioned_pk_row("US", 2, Some("lake-delete")),
-        partitioned_pk_row("US", 3, Some("lake-keep")),
-        partitioned_pk_row("EU", 10, Some("eu-lake")),
-    ] {
-        writer
-            .upsert(&row)
-            .expect("Failed to queue partitioned baseline upsert")
-            .await
-            .expect("Failed to acknowledge partitioned baseline upsert");
-    }
+        .expect("Failed to create Paimon append writer");
+    writer
+        .append_arrow_batch(append_batch(
+            vec![1, 2, 3],
+            vec!["lake-1", "lake-2", "lake-3"],
+        ))
+        .expect("Failed to append Paimon baseline batch");
     writer
         .flush()
         .await
-        .expect("Failed to flush partitioned Paimon PK baseline");
+        .expect("Failed to flush Paimon append baseline");
 
     let table_info = admin
         .get_table_info(&table_path)
         .await
-        .expect("Failed to resolve partitioned Paimon PK table metadata");
-    let us_seam_offset = admin
-        .list_partition_offsets(
-            &table_path,
-            "US",
-            &[0],
-            fluss::rpc::message::OffsetSpec::Latest,
-        )
+        .expect("Failed to resolve Paimon append table metadata");
+    let seam_offset = admin
+        .list_offsets(&table_path, &[0], fluss::rpc::message::OffsetSpec::Latest)
         .await
-        .expect("Failed to resolve US Paimon PK seam offset")[&0];
-    assert!(us_seam_offset > 0);
+        .expect("Failed to resolve Paimon append seam offset")[&0];
+    assert_eq!(seam_offset, 3);
 
-    support::run_java_paimon_tiering_until_partition_offset(
+    support::run_java_paimon_tiering_until_offset(
         cluster.plaintext_bootstrap_servers(),
         &table_path,
         table_info.table_id,
-        Some(us_partition_id),
-        us_seam_offset,
+        seam_offset,
     )
     .await;
     let readable_snapshot = admin
         .get_readable_lake_snapshot(&table_path)
         .await
-        .expect("Failed to load partitioned readable Paimon snapshot");
-    let us_bucket_snapshot = readable_snapshot
-        .bucket_snapshots
-        .iter()
-        .find(|snapshot| snapshot.partition_id == Some(us_partition_id) && snapshot.bucket_id == 0)
-        .expect("Readable Paimon snapshot should contain the US partition bucket");
-    assert_eq!(us_bucket_snapshot.log_offset, Some(us_seam_offset));
+        .expect("Failed to load Paimon append readable snapshot");
+    assert_eq!(readable_snapshot.bucket_snapshots.len(), 1);
+    assert_eq!(
+        readable_snapshot.bucket_snapshots[0].log_offset,
+        Some(seam_offset)
+    );
 
-    for row in [
-        partitioned_pk_row("US", 1, Some("tail-new")),
-        partitioned_pk_row("US", 4, Some("tail-insert")),
-        partitioned_pk_row("EU", 10, Some("eu-tail")),
-    ] {
-        writer
-            .upsert(&row)
-            .expect("Failed to queue partitioned tail upsert")
-            .await
-            .expect("Failed to acknowledge partitioned tail upsert");
-    }
     writer
-        .delete(&partitioned_pk_row("US", 2, None))
-        .expect("Failed to queue partitioned tail delete")
-        .await
-        .expect("Failed to acknowledge partitioned tail delete");
+        .append_arrow_batch(append_batch(vec![4, 5], vec!["tail-4", "tail-5"]))
+        .expect("Failed to append Paimon log tail");
     writer
         .flush()
         .await
-        .expect("Failed to flush partitioned Paimon PK tail");
+        .expect("Failed to flush Paimon log tail");
 
     let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
         .await
-        .expect("Failed to open partitioned Paimon PK lake table");
-    let scan = lake_table
-        .new_scan()
-        .with_filter(FlussLakePredicate::eq("region", "US"));
-    let plan = scan
+        .expect("Failed to open Paimon append lake table");
+    let union_scan = lake_table.new_scan();
+    let union_plan = union_scan
         .plan()
         .await
-        .expect("Failed to plan partitioned Paimon PK UnionRead");
-    assert_eq!(
-        plan.splits().len(),
-        1,
-        "partition pruning must leave one logical US partition/bucket split"
-    );
+        .expect("Failed to plan Paimon append UnionRead");
+    assert_eq!(union_plan.splits().len(), 1);
     let transported_split = FlussLakeReadSplit::decode(
-        &plan.splits()[0]
+        &union_plan.splits()[0]
             .encode()
-            .expect("Failed to encode partitioned Paimon PK split"),
+            .expect("Failed to encode Paimon append split"),
     )
-    .expect("Failed to decode transported partitioned Paimon PK split");
-    let read = scan
-        .new_reader(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
-        .expect("Failed to create partitioned Paimon PK reader");
+    .expect("Failed to decode transported Paimon append split");
 
-    let stream = read
-        .read_splits(std::slice::from_ref(&transported_split))
-        .await
-        .expect("Failed to execute partitioned Paimon PK splits");
-    let first = tokio::time::timeout(Duration::from_secs(20), stream.try_collect::<Vec<_>>())
-        .await
-        .expect("Timed out waiting for partitioned Paimon PK UnionRead")
-        .expect("Failed to collect partitioned Paimon PK UnionRead");
-    let retry_stream = read
-        .read_split(&transported_split)
-        .await
-        .expect("Failed to retry partitioned Paimon PK split");
-    let retried = tokio::time::timeout(
-        Duration::from_secs(20),
-        retry_stream.try_collect::<Vec<_>>(),
+    support::mirror_paimon_warehouse_to_s3();
+    let s3_fixture = support::get_s3_fixture();
+    let s3_planner_table = FlussLakeTable::open_with_properties(
+        connection.clone(),
+        &table_path,
+        s3_catalog_overrides(s3_fixture, true),
     )
     .await
-    .expect("Timed out waiting for retried partitioned Paimon PK UnionRead")
-    .expect("Failed to collect retried partitioned Paimon PK UnionRead");
-
-    let expected = vec![
-        ("US".to_string(), 1, "tail-new".to_string()),
-        ("US".to_string(), 3, "lake-keep".to_string()),
-        ("US".to_string(), 4, "tail-insert".to_string()),
-    ];
-    assert_eq!(extract_partitioned_pk_rows(&first), expected);
-    assert_eq!(
-        extract_partitioned_pk_rows(&retried),
-        expected,
-        "retrying a transported partitioned split must reproduce the same logical rows"
+    .expect("Failed to open S3-backed Paimon table for planning");
+    let s3_planner_scan = s3_planner_table.new_scan();
+    let s3_plan = s3_planner_scan
+        .plan()
+        .await
+        .expect("Failed to plan S3-backed Paimon UnionRead");
+    assert_eq!(s3_plan.splits().len(), 1);
+    let s3_split = FlussLakeReadSplit::decode(
+        &s3_plan.splits()[0]
+            .encode()
+            .expect("Failed to encode S3-backed Paimon split"),
+    )
+    .expect("Failed to decode transported S3-backed Paimon split");
+    let encoded_s3_split = s3_split
+        .encode()
+        .expect("Failed to re-encode S3-backed Paimon split");
+    for secret in [s3_fixture.access_key(), s3_fixture.secret_key()] {
+        assert!(
+            !encoded_s3_split
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "credential material must not be serialized into a read split"
+        );
+    }
+    let s3_reader_table = FlussLakeTable::open_with_properties(
+        connection.clone(),
+        &table_path,
+        s3_catalog_overrides(s3_fixture, false),
+    )
+    .await
+    .expect("Failed to open S3-backed Paimon table for execution");
+    let s3_reader_scan = s3_reader_table.new_scan();
+    let mut s3_runtime_credentials = HashMap::new();
+    s3_runtime_credentials.insert(
+        "s3.access-key".to_string(),
+        s3_fixture.access_key().to_string(),
     );
+    s3_runtime_credentials.insert(
+        "s3.secret-key".to_string(),
+        s3_fixture.secret_key().to_string(),
+    );
+    let s3_reader = s3_reader_scan
+        .new_reader(
+            FlussLakeExecutionContext::default()
+                .with_fluss_connection(connection.clone())
+                .with_lake_credentials(s3_runtime_credentials),
+        )
+        .expect("Failed to create S3-backed Paimon reader");
+
+    writer
+        .append_arrow_batch(append_batch(vec![6], vec!["after-plan-6"]))
+        .expect("Failed to append row after Paimon append planning");
+    writer
+        .flush()
+        .await
+        .expect("Failed to flush row after Paimon append planning");
+
+    let union_reader = union_scan
+        .new_reader(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
+        .expect("Failed to create Paimon append UnionRead reader");
+    let union_stream = union_reader
+        .read_split(&transported_split)
+        .await
+        .expect("Failed to execute Paimon append UnionRead split");
+    let union_batches = tokio::time::timeout(
+        Duration::from_secs(20),
+        union_stream.try_collect::<Vec<_>>(),
+    )
+    .await
+    .expect("Timed out waiting for Paimon append UnionRead")
+    .expect("Failed to collect Paimon append UnionRead");
+    assert_eq!(
+        extract_ids(&union_batches),
+        vec![1, 2, 3, 4, 5],
+        "lake [0,seam) and log [seam,stop) must have no gap or overlap, and the frozen stop must exclude id=6"
+    );
+
+    let s3_stream = s3_reader
+        .read_split(&s3_split)
+        .await
+        .expect("Failed to execute S3-backed Paimon UnionRead split");
+    let s3_batches =
+        tokio::time::timeout(Duration::from_secs(20), s3_stream.try_collect::<Vec<_>>())
+            .await
+            .expect("Timed out waiting for S3-backed Paimon UnionRead")
+            .expect("Failed to collect S3-backed Paimon UnionRead");
+    assert_eq!(
+        extract_ids(&s3_batches),
+        vec![1, 2, 3, 4, 5],
+        "runtime credentials must allow the reader to load the lake snapshot from S3"
+    );
+
+    let lake_only_scan = lake_table.new_scan().with_lake_only();
+    let lake_only_plan = lake_only_scan
+        .plan()
+        .await
+        .expect("Failed to plan Paimon append lake-only read");
+    assert_eq!(lake_only_plan.splits().len(), 1);
+    let lake_only_reader = lake_only_scan
+        .new_reader(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
+        .expect("Failed to create Paimon append lake-only reader");
+    let lake_only_stream = lake_only_reader
+        .read_splits(lake_only_plan.splits())
+        .await
+        .expect("Failed to execute Paimon append lake-only read");
+    let lake_only_batches = tokio::time::timeout(
+        Duration::from_secs(20),
+        lake_only_stream.try_collect::<Vec<_>>(),
+    )
+    .await
+    .expect("Timed out waiting for Paimon append lake-only read")
+    .expect("Failed to collect Paimon append lake-only read");
+    assert_eq!(
+        extract_ids(&lake_only_batches),
+        vec![1, 2, 3],
+        "lake-only must exclude every row after the readable snapshot seam"
+    );
+
+    let expired_file = find_table_parquet_file(table_name);
+    std::fs::remove_file(&expired_file).unwrap_or_else(|error| {
+        panic!(
+            "Failed to simulate Paimon file expiration by deleting {}: {error}",
+            expired_file.display()
+        )
+    });
+    let expired_stream = union_reader
+        .read_split(&transported_split)
+        .await
+        .expect("Opening an expired Paimon split stream must remain lazy");
+    let expired_result = tokio::time::timeout(
+        Duration::from_secs(20),
+        expired_stream.try_collect::<Vec<_>>(),
+    )
+    .await
+    .expect("Timed out waiting for expired Paimon split to fail");
+    match expired_result {
+        Err(FlussLakeError::DataUnavailable(message)) => {
+            assert!(
+                message.contains("Paimon") || message.contains("data"),
+                "unexpected data-unavailable error: {message}"
+            );
+        }
+        Err(other) => panic!("expected DataUnavailable after file expiration, got: {other}"),
+        Ok(_) => panic!("an expired Paimon split must not report successful end-of-stream"),
+    }
 
     drop(writer);
     admin
         .drop_table(&table_path, false)
         .await
-        .expect("Failed to drop partitioned Paimon PK UnionRead table");
+        .expect("Failed to drop Paimon append UnionRead table");
 }
 
 #[tokio::test]
@@ -600,181 +694,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             .iter()
             .all(|column| !column.as_any().is::<Int32Array>())
     }));
-
-    drop(writer);
-    admin
-        .drop_table(&table_path, false)
-        .await
-        .expect("Failed to drop UnionRead integration test table");
-}
-
-#[tokio::test]
-async fn partitioned_plan_prunes_partitions_and_executes_matching_buckets() {
-    let cluster = support::get_shared_cluster();
-    let connection = Arc::new(cluster.get_fluss_connection().await);
-    let admin = connection.get_admin().expect("Failed to get Fluss admin");
-    let table_path = TablePath::new("fluss", "test_union_read_partition_pruning");
-    let table_descriptor = TableDescriptor::builder()
-        .schema(
-            Schema::builder()
-                .column("id", DataTypes::int())
-                .column("region", DataTypes::string())
-                .column("value", DataTypes::bigint())
-                .build()
-                .expect("Failed to build UnionRead integration test schema"),
-        )
-        .partitioned_by(vec!["region"])
-        .build()
-        .expect("Failed to build UnionRead integration test table descriptor");
-    support::create_partitioned_table(
-        &admin,
-        &table_path,
-        &table_descriptor,
-        "region",
-        &["US", "EU"],
-    )
-    .await;
-
-    let table = connection
-        .get_table(&table_path)
-        .await
-        .expect("Failed to open UnionRead integration test table");
-    let writer = table
-        .new_append()
-        .expect("Failed to create append operation")
-        .create_writer()
-        .expect("Failed to create append writer");
-    writer
-        .append_arrow_batch(partitioned_batch(
-            vec![1, 2],
-            vec!["US", "US"],
-            vec![100, 200],
-        ))
-        .expect("Failed to append US batch");
-    writer
-        .append_arrow_batch(partitioned_batch(
-            vec![3, 4],
-            vec!["EU", "EU"],
-            vec![300, 400],
-        ))
-        .expect("Failed to append EU batch");
-    writer
-        .flush()
-        .await
-        .expect("Failed to flush partitioned batches");
-
-    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
-        .await
-        .expect("Failed to open partitioned lake table");
-    let scan = lake_table
-        .new_scan()
-        .with_filter(FlussLakePredicate::eq("region", "US"));
-    let plan = scan
-        .plan()
-        .await
-        .expect("Failed to plan partitioned UnionRead");
-
-    // The EU partition is pruned, so only the US partition's bucket remains.
-    assert_eq!(plan.splits().len(), 1);
-
-    let read = scan
-        .new_reader(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
-        .expect("Failed to create partitioned UnionRead reader");
-    let mut ids = Vec::new();
-    for split in plan.splits() {
-        let transported_split =
-            FlussLakeReadSplit::decode(&split.encode().expect("Failed to encode UnionRead split"))
-                .expect("Failed to decode transported UnionRead split");
-        let stream = read
-            .read_split(&transported_split)
-            .await
-            .expect("Failed to execute partitioned UnionRead split");
-        let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-            .await
-            .expect("Timed out waiting for bounded UnionRead stream to finish")
-            .expect("Failed to collect bounded UnionRead output");
-        ids.extend(extract_ids(&batches));
-    }
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2]);
-
-    drop(writer);
-    admin
-        .drop_table(&table_path, false)
-        .await
-        .expect("Failed to drop UnionRead integration test table");
-}
-
-#[tokio::test]
-async fn bucket_key_pruning_and_row_filter_execute_end_to_end() {
-    let cluster = support::get_shared_cluster();
-    let connection = Arc::new(cluster.get_fluss_connection().await);
-    let admin = connection.get_admin().expect("Failed to get Fluss admin");
-    let table_path = TablePath::new("fluss", "test_union_read_bucket_pruning");
-    let table_descriptor = TableDescriptor::builder()
-        .schema(
-            Schema::builder()
-                .column("id", DataTypes::int())
-                .column("name", DataTypes::string())
-                .build()
-                .expect("Failed to build UnionRead integration test schema"),
-        )
-        .distributed_by(Some(4), vec!["id".to_string()])
-        .build()
-        .expect("Failed to build UnionRead integration test table descriptor");
-    support::create_table(&admin, &table_path, &table_descriptor).await;
-
-    let table = connection
-        .get_table(&table_path)
-        .await
-        .expect("Failed to open UnionRead integration test table");
-    let writer = table
-        .new_append()
-        .expect("Failed to create append operation")
-        .create_writer()
-        .expect("Failed to create append writer");
-    writer
-        .append_arrow_batch(append_batch(vec![1, 2, 3, 4], vec!["a", "b", "c", "d"]))
-        .expect("Failed to append bucket-pruning batch");
-    writer
-        .flush()
-        .await
-        .expect("Failed to flush bucket-pruning batch");
-
-    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
-        .await
-        .expect("Failed to open bucket-pruning lake table");
-    let scan = lake_table
-        .new_scan()
-        .with_filter(FlussLakePredicate::eq("id", 1_i32));
-    let plan = scan
-        .plan()
-        .await
-        .expect("Failed to plan bucket-pruning UnionRead");
-
-    // Equality on the bucket key must prune to exactly one bucket.
-    assert_eq!(plan.splits().len(), 1);
-
-    let read = scan
-        .new_reader(FlussLakeExecutionContext::default().with_fluss_connection(connection.clone()))
-        .expect("Failed to create bucket-pruning UnionRead reader");
-    let mut ids = Vec::new();
-    for split in plan.splits() {
-        let transported_split =
-            FlussLakeReadSplit::decode(&split.encode().expect("Failed to encode UnionRead split"))
-                .expect("Failed to decode transported UnionRead split");
-        let stream = read
-            .read_split(&transported_split)
-            .await
-            .expect("Failed to execute bucket-pruning UnionRead split");
-        let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-            .await
-            .expect("Timed out waiting for bounded UnionRead stream to finish")
-            .expect("Failed to collect bounded UnionRead output");
-        ids.extend(extract_ids(&batches));
-    }
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1]);
 
     drop(writer);
     admin

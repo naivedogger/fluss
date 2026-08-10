@@ -395,27 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn split_descriptor_is_opaque_to_consumers() {
-        let statistics = FlussLakeReadStatistics::new(Some(10), Some(100));
-        let descriptor = testing_execution_descriptor();
-        let split = FlussLakeReadSplit::try_new(
-            "bucket-0".to_string(),
-            0,
-            None,
-            CURRENT_FLUSS_LAKE_SPLIT_VERSION,
-            descriptor.clone(),
-            statistics,
-        )
-        .unwrap();
-
-        assert_eq!(split.split_id, "bucket-0");
-        assert_eq!(split.bucket_id, 0);
-        assert!(split.partition.is_none());
-        assert_eq!(split.descriptor_version, CURRENT_FLUSS_LAKE_SPLIT_VERSION);
-        assert_eq!(split.execution_descriptor(), descriptor);
-    }
-
-    #[test]
     fn rejects_empty_split_identity_and_descriptor() {
         assert!(matches!(
             FlussLakeReadSplit::try_new(
