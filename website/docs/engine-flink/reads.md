@@ -234,6 +234,31 @@ The server evaluates these predicates against per-batch column statistics and sk
 
 ## Batch Read
 
+### Virtual Table Batch Read
+
+The `$changelog` and `$binlog` virtual tables support bounded batch scans. A batch query starts from the position configured by `scan.startup.mode`, captures the latest offset of each bucket as its stopping offset, and terminates after consuming all bounded splits. Unlike a streaming query, it does not wait for changes written after the stopping offsets are captured.
+
+```sql title="Flink SQL"
+SET 'execution.runtime-mode' = 'batch';
+
+-- Replay changes from a timestamp up to the bounded stopping offsets.
+SELECT _change_type, _log_offset, order_id, amount
+FROM orders$changelog
+/*+ OPTIONS(
+  'scan.startup.mode' = 'timestamp',
+  'scan.startup.timestamp' = '1705312200000'
+) */
+ORDER BY _log_offset;
+
+-- Query before/after images from a primary-key table.
+SELECT _change_type, `before`, `after`
+FROM orders$binlog
+WHERE `after`.order_id = 1001
+LIMIT 100;
+```
+
+`$changelog` is available for Primary Key Tables and Log Tables, while `$binlog` is available only for Primary Key Tables. See [Virtual Tables](/table-design/virtual-tables.md#flink-runtime-modes) for schemas, startup modes, and detailed bounded-read semantics.
+
 ### Limit Read
 The Fluss source supports limiting reads for both primary-key tables and log tables, making it convenient to preview the latest `N` records in a table.
 

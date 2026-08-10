@@ -15,6 +15,39 @@ Fluss supports the following virtual table types:
 | [Changelog](#changelog-table) | `$changelog` | Provides access to the raw changelog stream with metadata | Primary Key Tables, Log Tables |
 | [Binlog](#binlog-table) | `$binlog` | Provides binlog format with before/after metadata         | Primary Key Tables only |
 
+## Flink Runtime Modes
+
+Both `$changelog` and `$binlog` can be queried in Flink streaming or batch runtime.
+
+| Runtime Mode | Behavior |
+|--------------|----------|
+| Streaming | Reads from the configured starting position and continues waiting for new changes. |
+| Batch | Reads a bounded range and terminates after reaching the stopping offset of every bucket. |
+
+For a batch scan, Fluss resolves the starting offset from `scan.startup.mode` and captures the latest offset of each bucket as its stopping offset when the bounded splits are initialized. The scan reads the range `[starting offset, stopping offset)`. Records appended to a bucket after its stopping offset is captured are not included in that batch query.
+
+:::note
+A batch scan does not wait for future changes. Therefore, `scan.startup.mode = 'latest'` is generally useful for streaming queries, but is typically not useful for historical replay in batch runtime.
+
+Virtual tables currently read directly from the Fluss log and do not reconstruct historical changes from lake snapshots. The `full` and `earliest` modes start from the earliest log offset still available in Fluss. Batch scans always use the latest offset captured during split initialization as the stopping offset; a separate stopping offset cannot be configured.
+:::
+
+For example, the following query replays a historical part of a changelog and terminates as a bounded Flink job:
+
+```sql title="Flink SQL"
+SET 'execution.runtime-mode' = 'batch';
+
+SELECT _change_type, _log_offset, order_id, amount
+FROM orders$changelog
+/*+ OPTIONS(
+  'scan.startup.mode' = 'timestamp',
+  'scan.startup.timestamp' = '1705312200000'
+) */
+WHERE _commit_timestamp < TO_TIMESTAMP_LTZ(1705398600000, 3)
+ORDER BY _log_offset
+LIMIT 100;
+```
+
 ## Changelog Table
 
 The `$changelog` virtual table provides read-only access to the raw changelog stream of a table, allowing you to audit and process all data changes with their associated metadata.
@@ -107,18 +140,22 @@ Output:
 
 | Mode | Description |
 |------|-------------|
+| `full` | Start reading from the beginning of the log (default) |
 | `earliest` | Start reading from the beginning of the log |
-| `latest` | Start reading from the current end of the log (only new changes) |
+| `latest` | Use the current end of the log as the starting position |
 | `timestamp` | Start reading from a specific timestamp (milliseconds since epoch) |
 
 
 The changelog table supports different startup modes to control where reading begins:
 
 ```sql title="Flink SQL"
--- Read from the beginning (default)
+-- Read from the beginning (default full mode)
+SELECT * FROM orders$changelog;
+
+-- Explicitly read from the earliest offset
 SELECT * FROM orders$changelog /*+ OPTIONS('scan.startup.mode' = 'earliest') */;
 
--- Read only new changes from now
+-- Use the current log end as the starting position
 SELECT * FROM orders$changelog /*+ OPTIONS('scan.startup.mode' = 'latest') */;
 
 -- Read from a specific timestamp
@@ -224,18 +261,22 @@ WHERE _change_type = 'update';
 
 | Mode | Description |
 |------|-------------|
+| `full` | Start reading from the beginning of the log (default) |
 | `earliest` | Start reading from the beginning of the log |
-| `latest` | Start reading from the current end of the log (only new changes) |
+| `latest` | Use the current end of the log as the starting position |
 | `timestamp` | Start reading from a specific timestamp (milliseconds since epoch) |
 
 
 The binlog table supports different startup modes to control where reading begins:
 
 ```sql title="Flink SQL"
--- Read from the beginning (default)
+-- Read from the beginning (default full mode)
+SELECT * FROM orders$binlog;
+
+-- Explicitly read from the earliest offset
 SELECT * FROM orders$binlog /*+ OPTIONS('scan.startup.mode' = 'earliest') */;
 
--- Read only new changes from now
+-- Use the current log end as the starting position
 SELECT * FROM orders$binlog /*+ OPTIONS('scan.startup.mode' = 'latest') */;
 
 -- Read from a specific timestamp
