@@ -29,10 +29,8 @@ categories = { workspace = true }
 
 [features]
 integration_tests = ["fluss/integration_tests"]
-# Paimon lake reading. Pinned to a compatibility branch of paimon-rust
-# main (contains apache/paimon-rust#374, required for PK dedup semantics)
-# upgraded to arrow 59 with ORC/mosaic reads feature-gated off; see
-# https://github.com/naivedogger/paimon-rust/tree/compat/arrow-59-v2.
+# Paimon lake reading. Pinned to the official Apache release that contains
+# apache/paimon-rust#374 (required for PK dedup semantics).
 # Parquet is the only supported lake data file format for now.
 paimon = ["dep:paimon", "dep:serde_json"]
 
@@ -40,7 +38,7 @@ paimon = ["dep:paimon", "dep:serde_json"]
 arrow = { workspace = true }
 fluss = { package = "fluss-rs", path = "../fluss" }
 futures = "0.3"
-paimon = { git = "https://github.com/naivedogger/paimon-rust.git", rev = "e4402d2f4d63f91fe6970d983623735552bfbc79", default-features = false, features = ["storage-memory", "storage-fs", "storage-oss", "storage-s3"], optional = true }
+paimon = { version = "0.3.0", default-features = false, features = ["storage-memory", "storage-fs", "storage-oss", "storage-s3"], optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror = "1.0"
 # Only the `time` machinery is used (idle-timeout enforcement); the Fluss
