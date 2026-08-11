@@ -48,6 +48,10 @@ ORDER BY _log_offset
 LIMIT 100;
 ```
 
+:::warning
+On Flink 1.18, a predicate on `_commit_timestamp` (or on any other `TIMESTAMP_LTZ` column) returns wrong results when the session time zone is not UTC. Flink 1.18 rebuilds such a predicate using the session time zone instead of UTC after the filter is pushed into the source, which shifts the literal by the zone offset and typically makes the query return no rows. This is [FLINK-35318](https://issues.apache.org/jira/browse/FLINK-35318), fixed in Flink 1.19.2 and 1.20.0 and never backported to 1.18. On Flink 1.18, either avoid `TIMESTAMP_LTZ` predicates or set `table.local-time-zone` to `UTC`.
+:::
+
 ## Changelog Table
 
 The `$changelog` virtual table provides read-only access to the raw changelog stream of a table, allowing you to audit and process all data changes with their associated metadata.

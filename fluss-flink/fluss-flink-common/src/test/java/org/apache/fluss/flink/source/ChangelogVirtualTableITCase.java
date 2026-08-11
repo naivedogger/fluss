@@ -296,27 +296,16 @@ abstract class ChangelogVirtualTableITCase {
         assertThat(primaryKeyFilteredAndLimited)
                 .containsExactly("+I[insert, 0, 1, Alice]", "+I[update_before, 2, 1, Alice]");
 
-        List<String> timestampRangeFiltered =
-                collectBatchRows(
-                        tEnv.executeSql(
-                                        "SELECT _change_type, _log_offset, id, name "
-                                                + "FROM batch_changelog_test$changelog "
-                                                + "WHERE _commit_timestamp >= TO_TIMESTAMP_LTZ(2000, 3) "
-                                                + "AND _commit_timestamp < TO_TIMESTAMP_LTZ(3000, 3) "
-                                                + "ORDER BY _log_offset")
-                                .collect());
-        assertThat(timestampRangeFiltered)
-                .containsExactly(
-                        "+I[update_before, 2, 1, Alice]", "+I[update_after, 3, 1, Alice-updated]");
-
+        // Filters on _commit_timestamp are covered by
+        // testBatchReadChangelogTableWithCommitTimestampFilter, which is disabled on Flink 1.18
+        // (FLINK-35318).
         List<String> metadataFiltered =
                 collectBatchRows(
                         tEnv.executeSql(
                                         "SELECT _change_type, _log_offset, id "
                                                 + "FROM batch_changelog_test$changelog "
                                                 + "WHERE _change_type = 'delete' "
-                                                + "AND _log_offset = 4 "
-                                                + "AND _commit_timestamp = TO_TIMESTAMP_LTZ(3000, 3)")
+                                                + "AND _log_offset = 4")
                                 .collect());
         assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
 
@@ -360,6 +349,59 @@ abstract class ChangelogVirtualTableITCase {
                         "+I[insert, 3, Item-3, eu]",
                         "+I[insert, 1, Item-1, us]",
                         "+I[insert, 2, Item-2, us]");
+    }
+
+    /**
+     * Bounded reads with a predicate on the {@code _commit_timestamp} metadata column.
+     *
+     * <p>This is kept apart from {@code testBatchReadChangelogTable} because Flink 1.18 rebuilds
+     * the remaining TIMESTAMP_LTZ filter using the session time zone instead of UTC after {@code
+     * applyFilters()} (FLINK-35318, fixed in Flink 1.19.2 and 1.20.0), which shifts the literal and
+     * drops all rows in non-UTC environments. The Flink 1.18 subclass therefore disables this test
+     * only, keeping the rest of the batch coverage.
+     */
+    @Test
+    public void testBatchReadChangelogTableWithCommitTimestampFilter() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE batch_changelog_ts_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "batch_changelog_ts_test");
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice"), row(2, "Bob")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice-updated")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        deleteRows(conn, tablePath, Arrays.asList(row(2, "Bob")));
+
+        tEnv = initBatchTableEnvironment();
+
+        List<String> timestampRangeFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, id, name "
+                                                + "FROM batch_changelog_ts_test$changelog "
+                                                + "WHERE _commit_timestamp >= TO_TIMESTAMP_LTZ(2000, 3) "
+                                                + "AND _commit_timestamp < TO_TIMESTAMP_LTZ(3000, 3) "
+                                                + "ORDER BY _log_offset")
+                                .collect());
+        assertThat(timestampRangeFiltered)
+                .containsExactly(
+                        "+I[update_before, 2, 1, Alice]", "+I[update_after, 3, 1, Alice-updated]");
+
+        List<String> metadataFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, id "
+                                                + "FROM batch_changelog_ts_test$changelog "
+                                                + "WHERE _change_type = 'delete' "
+                                                + "AND _log_offset = 4 "
+                                                + "AND _commit_timestamp = TO_TIMESTAMP_LTZ(3000, 3)")
+                                .collect());
+        assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
     }
 
     @Test

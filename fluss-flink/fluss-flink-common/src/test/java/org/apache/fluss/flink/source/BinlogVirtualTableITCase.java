@@ -295,14 +295,16 @@ abstract class BinlogVirtualTableITCase {
                         "+I[insert, null, null, 1, Alice]",
                         "+I[update, 1, Alice, 1, Alice-updated]");
 
+        // Filters on _commit_timestamp are covered by
+        // testBatchReadBinlogTableWithCommitTimestampFilter, which is disabled on Flink 1.18
+        // (FLINK-35318).
         List<String> metadataFiltered =
                 collectBatchRows(
                         tEnv.executeSql(
                                         "SELECT _change_type, _log_offset, before.id "
                                                 + "FROM batch_binlog_test$binlog "
                                                 + "WHERE _change_type = 'delete' "
-                                                + "AND _log_offset = 4 "
-                                                + "AND _commit_timestamp = TO_TIMESTAMP_LTZ(3000, 3)")
+                                                + "AND _log_offset = 4")
                                 .collect());
         assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
 
@@ -317,6 +319,46 @@ abstract class BinlogVirtualTableITCase {
                                                 + "ORDER BY _log_offset")
                                 .collect());
         assertThat(timestampStartup).containsExactly("+I[update, 2]", "+I[delete, 4]");
+    }
+
+    /**
+     * Bounded reads with a predicate on the {@code _commit_timestamp} metadata column.
+     *
+     * <p>This is kept apart from {@code testBatchReadBinlogTable} because Flink 1.18 rebuilds the
+     * remaining TIMESTAMP_LTZ filter using the session time zone instead of UTC after {@code
+     * applyFilters()} (FLINK-35318, fixed in Flink 1.19.2 and 1.20.0), which shifts the literal and
+     * drops all rows in non-UTC environments. The Flink 1.18 subclass therefore disables this test
+     * only, keeping the rest of the batch coverage.
+     */
+    @Test
+    public void testBatchReadBinlogTableWithCommitTimestampFilter() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE batch_binlog_ts_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "batch_binlog_ts_test");
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice"), row(2, "Bob")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        writeRows(conn, tablePath, Arrays.asList(row(1, "Alice-updated")), false);
+        CLOCK.advanceTime(Duration.ofMillis(1000));
+        deleteRows(conn, tablePath, Arrays.asList(row(2, "Bob")));
+
+        tEnv = initBatchTableEnvironment();
+
+        List<String> metadataFiltered =
+                collectBatchRows(
+                        tEnv.executeSql(
+                                        "SELECT _change_type, _log_offset, before.id "
+                                                + "FROM batch_binlog_ts_test$binlog "
+                                                + "WHERE _change_type = 'delete' "
+                                                + "AND _log_offset = 4 "
+                                                + "AND _commit_timestamp = TO_TIMESTAMP_LTZ(3000, 3)")
+                                .collect());
+        assertThat(metadataFiltered).containsExactly("+I[delete, 4, 2]");
     }
 
     @Test
