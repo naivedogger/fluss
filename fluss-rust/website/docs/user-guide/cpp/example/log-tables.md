@@ -144,6 +144,80 @@ for (size_t i = 0; i < batches.Size(); ++i) {
 }
 ```
 
+## Bounded Arrow RecordBatch Reading
+
+Use `RecordBatchLogReader` when the scan should finish after reaching a fixed offset for every
+bucket. Starting offsets are configured by subscribing the scanner. Stopping offsets can be
+queried once and passed explicitly:
+
+```cpp
+auto info = table.GetTableInfo();
+
+std::vector<int32_t> bucket_ids;
+for (int32_t bucket_id = 0; bucket_id < info.num_buckets; ++bucket_id) {
+    bucket_ids.push_back(bucket_id);
+}
+
+std::unordered_map<int32_t, int64_t> latest_offsets;
+admin.ListOffsets(table_path, bucket_ids, fluss::OffsetSpec::Latest(), latest_offsets);
+
+fluss::LogScanner scanner;
+table.NewScan().CreateRecordBatchLogScanner(scanner);
+
+std::vector<fluss::ReaderStopOffset> stopping_offsets;
+for (int32_t bucket_id : bucket_ids) {
+    scanner.Subscribe(bucket_id, 0);
+    stopping_offsets.push_back(
+        {fluss::TableBucket{info.table_id, bucket_id}, latest_offsets.at(bucket_id)});
+}
+
+fluss::RecordBatchLogReader reader;
+scanner.CreateRecordBatchLogReaderUntilOffsets(stopping_offsets, reader);
+
+while (true) {
+    fluss::ArrowRecordBatches batches;
+    fluss::BoundedReadStatus status;
+    reader.NextBatch(1000, batches, status);
+    if (status == fluss::BoundedReadStatus::TimedOut) {
+        continue;  // Check query cancellation before retrying.
+    }
+    if (status == fluss::BoundedReadStatus::Finished) {
+        break;
+    }
+
+    for (const auto& batch : batches) {
+        std::cout << "bucket=" << batch->GetBucketId()
+                  << " base_offset=" << batch->GetBaseOffset()
+                  << " last_offset=" << batch->GetLastOffset()
+                  << " rows=" << batch->NumRows() << std::endl;
+    }
+}
+```
+
+`TimedOut` does not exhaust the reader. It lets a query engine periodically check cancellation
+or deadlines before retrying. `Finished` means all stopping offsets have been reached.
+
+For the common case where the client should read everything currently available, let the
+reader query the latest offsets:
+
+```cpp
+fluss::LogScanner latest_scanner;
+table.NewScan().CreateRecordBatchLogScanner(latest_scanner);
+for (int32_t bucket_id : bucket_ids) {
+    latest_scanner.Subscribe(bucket_id, 0);
+}
+
+fluss::RecordBatchLogReader latest_reader;
+latest_scanner.CreateRecordBatchLogReaderUntilLatest(admin, latest_reader);
+
+fluss::ArrowRecordBatches batches;
+latest_reader.CollectAllBatches(batches);
+```
+
+Subscribe every bucket assigned to the reader before creating it. Do not call `PollRecordBatch()`
+or create a second reader concurrently on the same scanner. Destroy the reader before reusing
+that scanner.
+
 ## Column Projection
 
 ```cpp

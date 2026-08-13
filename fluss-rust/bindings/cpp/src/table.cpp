@@ -1858,6 +1858,126 @@ Result LogScanner::PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out) 
 }
 
 // ============================================================================
+// RecordBatchLogReader
+// ============================================================================
+
+Result LogScanner::CreateRecordBatchLogReaderUntilLatest(const Admin& admin,
+                                                         RecordBatchLogReader& out) {
+    if (!Available()) {
+        return utils::make_client_error("LogScanner not available");
+    }
+    if (!admin.Available()) {
+        return utils::make_client_error("Admin not available");
+    }
+
+    auto ffi_result = scanner_->create_record_batch_log_reader_until_latest(*admin.admin_);
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.Destroy();
+        out.reader_ = utils::ptr_from_ffi<ffi::RecordBatchLogReader>(ffi_result);
+    }
+    return result;
+}
+
+Result LogScanner::CreateRecordBatchLogReaderUntilOffsets(
+    const std::vector<ReaderStopOffset>& offsets, RecordBatchLogReader& out) {
+    if (!Available()) {
+        return utils::make_client_error("LogScanner not available");
+    }
+
+    rust::Vec<ffi::FfiReaderStopOffset> ffi_offsets;
+    for (const auto& offset : offsets) {
+        ffi::FfiReaderStopOffset ffi_offset;
+        ffi_offset.table_id = offset.bucket.table_id;
+        ffi_offset.has_partition_id = offset.bucket.partition_id.has_value();
+        ffi_offset.partition_id = offset.bucket.partition_id.value_or(0);
+        ffi_offset.bucket_id = offset.bucket.bucket_id;
+        ffi_offset.offset = offset.offset;
+        ffi_offsets.push_back(ffi_offset);
+    }
+
+    auto ffi_result =
+        scanner_->create_record_batch_log_reader_until_offsets(std::move(ffi_offsets));
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.Destroy();
+        out.reader_ = utils::ptr_from_ffi<ffi::RecordBatchLogReader>(ffi_result);
+    }
+    return result;
+}
+
+RecordBatchLogReader::RecordBatchLogReader() noexcept = default;
+
+RecordBatchLogReader::RecordBatchLogReader(ffi::RecordBatchLogReader* reader) noexcept
+    : reader_(reader) {}
+
+RecordBatchLogReader::~RecordBatchLogReader() noexcept { Destroy(); }
+
+void RecordBatchLogReader::Destroy() noexcept {
+    if (reader_) {
+        ffi::delete_record_batch_log_reader(reader_);
+        reader_ = nullptr;
+    }
+}
+
+RecordBatchLogReader::RecordBatchLogReader(RecordBatchLogReader&& other) noexcept
+    : reader_(other.reader_) {
+    other.reader_ = nullptr;
+}
+
+RecordBatchLogReader& RecordBatchLogReader::operator=(RecordBatchLogReader&& other) noexcept {
+    if (this != &other) {
+        Destroy();
+        reader_ = other.reader_;
+        other.reader_ = nullptr;
+    }
+    return *this;
+}
+
+bool RecordBatchLogReader::Available() const { return reader_ != nullptr; }
+
+Result RecordBatchLogReader::NextBatch(int64_t timeout_ms, ArrowRecordBatches& out,
+                                       BoundedReadStatus& status) {
+    if (!Available()) {
+        return utils::make_client_error("RecordBatchLogReader not available");
+    }
+
+    auto ffi_result = reader_->record_batch_log_reader_next_batch(timeout_ms);
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (!result.Ok()) {
+        return result;
+    }
+    switch (ffi_result.status) {
+        case 0:
+            status = BoundedReadStatus::BatchAvailable;
+            break;
+        case 1:
+            status = BoundedReadStatus::TimedOut;
+            break;
+        case 2:
+            status = BoundedReadStatus::Finished;
+            break;
+        default:
+            return utils::make_client_error("Unknown bounded read status: " +
+                                            std::to_string(ffi_result.status));
+    }
+    return detail::ArrowBatchImporter::Import(ffi_result.arrow_batches, out);
+}
+
+Result RecordBatchLogReader::CollectAllBatches(ArrowRecordBatches& out) {
+    if (!Available()) {
+        return utils::make_client_error("RecordBatchLogReader not available");
+    }
+
+    auto ffi_result = reader_->record_batch_log_reader_collect_all_batches();
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (!result.Ok()) {
+        return result;
+    }
+    return detail::ArrowBatchImporter::Import(ffi_result.arrow_batches, out);
+}
+
+// ============================================================================
 // BatchScanner
 // ============================================================================
 

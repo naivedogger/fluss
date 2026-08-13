@@ -41,9 +41,20 @@ use arrow_schema::SchemaRef;
 use futures::Stream;
 use log::warn;
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Outcome of a bounded record-batch read with a caller-supplied timeout.
+#[derive(Debug)]
+pub enum RecordBatchReadOutcome {
+    /// A batch is available.
+    Batch(ScanBatch),
+    /// No batch became available before the timeout elapsed.
+    TimedOut,
+    /// Every subscribed bucket reached its stopping offset.
+    Finished,
+}
 
 /// Bounded log reader that consumes log data up to specified stopping offsets.
 ///
@@ -174,18 +185,42 @@ impl RecordBatchLogReader {
     /// network traffic on data the reader will discard.
     pub async fn next_batch(&mut self) -> Result<Option<ScanBatch>> {
         loop {
+            match self.next_batch_with_timeout(DEFAULT_POLL_TIMEOUT).await? {
+                RecordBatchReadOutcome::Batch(batch) => return Ok(Some(batch)),
+                RecordBatchReadOutcome::TimedOut => continue,
+                RecordBatchReadOutcome::Finished => return Ok(None),
+            }
+        }
+    }
+
+    /// Fetch the next [`ScanBatch`] while waiting for at most `timeout`.
+    ///
+    /// Unlike [`next_batch`](Self::next_batch), this method returns
+    /// [`RecordBatchReadOutcome::TimedOut`] when no data becomes available
+    /// before the timeout. The reader remains valid and the caller may retry.
+    pub async fn next_batch_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<RecordBatchReadOutcome> {
+        let start = Instant::now();
+        loop {
             if let Some(batch) = self.buffer.pop_front() {
-                return Ok(Some(batch));
+                return Ok(RecordBatchReadOutcome::Batch(batch));
             }
 
             if self.stopping_offsets.is_empty() {
-                return Ok(None);
+                return Ok(RecordBatchReadOutcome::Finished);
             }
 
-            let scan_batches = self.scanner.poll(DEFAULT_POLL_TIMEOUT).await?;
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Ok(RecordBatchReadOutcome::TimedOut);
+            }
+
+            let scan_batches = self.scanner.poll(timeout - elapsed).await?;
 
             if scan_batches.is_empty() {
-                continue;
+                return Ok(RecordBatchReadOutcome::TimedOut);
             }
 
             let completed =

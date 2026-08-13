@@ -47,6 +47,7 @@ struct Table;
 struct AppendWriter;
 struct WriteResult;
 struct LogScanner;
+struct RecordBatchLogReader;
 struct BatchScanner;
 struct UpsertWriter;
 struct Lookuper;
@@ -1235,6 +1236,19 @@ struct PartitionBucketSubscription {
     int64_t offset;
 };
 
+/// Stopping offset for one bucket subscribed on a record-batch log scanner.
+struct ReaderStopOffset {
+    TableBucket bucket;
+    int64_t offset;
+};
+
+/// Outcome of a bounded record-batch read.
+enum class BoundedReadStatus {
+    BatchAvailable = 0,
+    TimedOut = 1,
+    Finished = 2,
+};
+
 struct LakeSnapshot {
     int64_t snapshot_id;
     std::vector<BucketOffset> bucket_offsets;
@@ -1338,6 +1352,7 @@ class Lookuper;
 class PrefixLookuper;
 class WriteResult;
 class LogScanner;
+class RecordBatchLogReader;
 class BatchScanner;
 class Admin;
 class Table;
@@ -1502,6 +1517,7 @@ class Admin {
                          const std::string* partition_name = nullptr);
 
     friend class Connection;
+    friend class LogScanner;
     Admin(ffi::Admin* admin) noexcept;
 
     void Destroy() noexcept;
@@ -1793,6 +1809,17 @@ class LogScanner {
     Result Poll(int64_t timeout_ms, ScanRecords& out);
     Result PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out);
 
+    /// Creates a bounded reader using the latest offsets observed during this call.
+    /// Subscribe the record-batch scanner at the desired starting offsets before
+    /// calling this method.
+    Result CreateRecordBatchLogReaderUntilLatest(const Admin& admin, RecordBatchLogReader& out);
+
+    /// Creates a bounded reader using explicit stopping offsets.
+    /// Starting offsets come from the scanner subscriptions. Every stopping
+    /// offset must correspond to a bucket already subscribed on this scanner.
+    Result CreateRecordBatchLogReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets,
+                                                  RecordBatchLogReader& out);
+
    private:
     friend class Table;
     friend class TableScan;
@@ -1800,6 +1827,36 @@ class LogScanner {
 
     void Destroy() noexcept;
     ffi::LogScanner* scanner_{nullptr};
+};
+
+/// Bounded Arrow batch reader created from a subscribed record-batch log scanner.
+/// Only one reader or polling operation may consume the scanner at a time.
+class RecordBatchLogReader {
+   public:
+    RecordBatchLogReader() noexcept;
+    ~RecordBatchLogReader() noexcept;
+
+    RecordBatchLogReader(const RecordBatchLogReader&) = delete;
+    RecordBatchLogReader& operator=(const RecordBatchLogReader&) = delete;
+    RecordBatchLogReader(RecordBatchLogReader&& other) noexcept;
+    RecordBatchLogReader& operator=(RecordBatchLogReader&& other) noexcept;
+
+    bool Available() const;
+
+    /// Waits up to timeout_ms for the next batch.
+    /// TimedOut leaves the reader valid for a later retry; Finished means every
+    /// subscribed bucket reached its stopping offset.
+    Result NextBatch(int64_t timeout_ms, ArrowRecordBatches& out, BoundedReadStatus& status);
+
+    /// Drains all remaining batches until every stopping offset is reached.
+    Result CollectAllBatches(ArrowRecordBatches& out);
+
+   private:
+    friend class LogScanner;
+    explicit RecordBatchLogReader(ffi::RecordBatchLogReader* reader) noexcept;
+
+    void Destroy() noexcept;
+    ffi::RecordBatchLogReader* reader_{nullptr};
 };
 
 // One-shot bounded scan of a single bucket, from TableScan::CreateBucketBatchScanner.

@@ -369,6 +369,50 @@ int main() {
         std::cout << "  Bucket " << bucket_id << ": offset=" << offset << std::endl;
     }
 
+    // 8.1) Bounded Arrow record batch scan with explicit stopping offsets
+    std::cout << "\n=== Bounded Arrow Record Batch Scan ===" << std::endl;
+    fluss::LogScanner bounded_scanner;
+    check("new_bounded_record_batch_scanner",
+          table.NewScan().CreateRecordBatchLogScanner(bounded_scanner));
+
+    std::vector<fluss::ReaderStopOffset> stopping_offsets;
+    for (int32_t bucket_id : all_bucket_ids) {
+        const int64_t starting_offset = earliest_offsets.at(bucket_id);
+        const int64_t stopping_offset = latest_offsets.at(bucket_id);
+        if (starting_offset >= stopping_offset) {
+            continue;
+        }
+        check("subscribe_bounded", bounded_scanner.Subscribe(bucket_id, starting_offset));
+        stopping_offsets.push_back({fluss::TableBucket{info.table_id, bucket_id}, stopping_offset});
+    }
+
+    if (!stopping_offsets.empty()) {
+        fluss::RecordBatchLogReader bounded_reader;
+        check("create_bounded_reader", bounded_scanner.CreateRecordBatchLogReaderUntilOffsets(
+                                           stopping_offsets, bounded_reader));
+
+        int64_t bounded_row_count = 0;
+        while (true) {
+            fluss::ArrowRecordBatches bounded_batches;
+            fluss::BoundedReadStatus status;
+            check("bounded_next_batch", bounded_reader.NextBatch(1000, bounded_batches, status));
+            if (status == fluss::BoundedReadStatus::TimedOut) {
+                continue;
+            }
+            if (status == fluss::BoundedReadStatus::Finished) {
+                break;
+            }
+            for (const auto& bounded_batch : bounded_batches) {
+                bounded_row_count += bounded_batch->NumRows();
+                std::cout << "  bucket=" << bounded_batch->GetBucketId()
+                          << " base_offset=" << bounded_batch->GetBaseOffset()
+                          << " last_offset=" << bounded_batch->GetLastOffset()
+                          << " rows=" << bounded_batch->NumRows() << std::endl;
+            }
+        }
+        std::cout << "Bounded scan completed with " << bounded_row_count << " rows" << std::endl;
+    }
+
     auto now = std::chrono::system_clock::now();
     auto one_hour_ago = now - std::chrono::hours(1);
     auto timestamp_ms =
