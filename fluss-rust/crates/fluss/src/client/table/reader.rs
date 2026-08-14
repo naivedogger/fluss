@@ -136,18 +136,26 @@ impl RecordBatchLogReader {
     /// Create a reader with explicit stopping offsets per bucket.
     ///
     /// # NOTE: Every key in `stopping_offsets` **must** correspond to a bucket that is
-    /// currently subscribed on the `scanner`. If a stopping offset refers to a
-    /// bucket that will never appear in polled batches, the reader will loop
-    /// indefinitely waiting for data that never arrives.
+    /// currently subscribed on the `scanner`; construction fails otherwise.
+    /// Concrete subscriptions that already meet their stop point are treated
+    /// as empty ranges and complete immediately.
     ///
     /// Use [`new_until_latest`](Self::new_until_latest) for the common case;
     /// it queries the server and builds a validated stopping-offset map
     /// automatically.
     pub fn new_until_offsets(
         scanner: RecordBatchLogScanner,
-        stopping_offsets: HashMap<TableBucket, i64>,
+        mut stopping_offsets: HashMap<TableBucket, i64>,
     ) -> Result<Self> {
         scanner.try_set_reader_active()?;
+
+        if let Err(error) =
+            validate_stopping_offsets(scanner.get_subscribed_buckets(), &mut stopping_offsets)
+        {
+            scanner.clear_reader_active();
+            return Err(error);
+        }
+
         let schema = scanner.schema();
         Ok(Self {
             scanner,
@@ -358,6 +366,34 @@ impl arrow::record_batch::RecordBatchReader for SyncRecordBatchLogReader {
     }
 }
 
+fn validate_stopping_offsets(
+    subscriptions: Vec<(TableBucket, i64)>,
+    stopping_offsets: &mut HashMap<TableBucket, i64>,
+) -> Result<()> {
+    let subscribed: HashMap<TableBucket, i64> = subscriptions.into_iter().collect();
+    for bucket in stopping_offsets.keys() {
+        if !subscribed.contains_key(bucket) {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Stopping offset for {bucket:?} has no matching scanner subscription."
+                ),
+            });
+        }
+    }
+
+    // A concrete subscription that already meets the stop point is an empty
+    // range. Remove it up front so the reader can finish without waiting for a
+    // server batch that may never arrive. Negative offsets are symbolic values
+    // such as EARLIEST_OFFSET and cannot be compared until the server resolves
+    // them.
+    stopping_offsets.retain(|bucket, stop| {
+        subscribed
+            .get(bucket)
+            .is_none_or(|start| *start < 0 || start < stop)
+    });
+    Ok(())
+}
+
 /// Query latest offsets for all subscribed buckets, handling both partitioned
 /// and non-partitioned tables.
 ///
@@ -566,6 +602,35 @@ mod tests {
 
     fn bucket(id: i32) -> TableBucket {
         TableBucket::new(1, id)
+    }
+
+    #[test]
+    fn validate_stopping_offsets_rejects_unsubscribed_bucket() {
+        let mut offsets = HashMap::from([(bucket(1), 10)]);
+        let result = validate_stopping_offsets(vec![(bucket(0), 0)], &mut offsets);
+
+        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
+    }
+
+    #[test]
+    fn validate_stopping_offsets_prunes_completed_range() {
+        let mut offsets = HashMap::from([(bucket(0), 10), (bucket(1), 20)]);
+        validate_stopping_offsets(vec![(bucket(0), 10), (bucket(1), 15)], &mut offsets).unwrap();
+
+        assert!(!offsets.contains_key(&bucket(0)));
+        assert_eq!(offsets.get(&bucket(1)), Some(&20));
+    }
+
+    #[test]
+    fn validate_stopping_offsets_keeps_symbolic_start() {
+        let mut offsets = HashMap::from([(bucket(0), 0)]);
+        validate_stopping_offsets(
+            vec![(bucket(0), crate::client::EARLIEST_OFFSET)],
+            &mut offsets,
+        )
+        .unwrap();
+
+        assert_eq!(offsets.get(&bucket(0)), Some(&0));
     }
 
     #[test]

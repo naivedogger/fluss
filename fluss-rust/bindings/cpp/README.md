@@ -46,9 +46,9 @@ See [ci.sh](ci.sh) for the CI build sequence.
   [C++ API reference](../../website/docs/user-guide/cpp/api-reference.md) and
   [log-table examples](../../website/docs/user-guide/cpp/example/log-tables.md).
 
-For a bounded log scan, first subscribe the record-batch scanner at the desired starting
-offsets, then create a `RecordBatchLogReader` with either explicit stopping offsets or the
-latest offsets observed at reader creation:
+For a bounded log scan, pass the per-bucket offset ranges directly to `TableScan`. The returned
+reader yields one Arrow batch at a time until every `[starting_offset, stopping_offset)` range
+is complete:
 
 ```cpp
 auto info = table.GetTableInfo();
@@ -60,38 +60,41 @@ for (int32_t bucket_id = 0; bucket_id < info.num_buckets; ++bucket_id) {
 std::unordered_map<int32_t, int64_t> latest_offsets;
 admin.ListOffsets(table_path, bucket_ids, fluss::OffsetSpec::Latest(), latest_offsets);
 
-fluss::LogScanner scanner;
-table.NewScan().CreateRecordBatchLogScanner(scanner);
-
-std::vector<fluss::ReaderStopOffset> stopping_offsets;
+std::vector<fluss::RecordBatchLogReadRange> ranges;
 for (int32_t bucket_id : bucket_ids) {
-    scanner.Subscribe(bucket_id, 0);
-    stopping_offsets.push_back(
-        {fluss::TableBucket{info.table_id, bucket_id}, latest_offsets.at(bucket_id)});
+    ranges.push_back(
+        {fluss::TableBucket{info.table_id, bucket_id}, 0, latest_offsets.at(bucket_id)});
 }
 
 fluss::RecordBatchLogReader reader;
-scanner.CreateRecordBatchLogReaderUntilOffsets(stopping_offsets, reader);
+table.NewScan().CreateRecordBatchLogReader(ranges, reader);
 
 while (true) {
-    fluss::ArrowRecordBatches batches;
-    fluss::BoundedReadStatus status;
-    reader.NextBatch(1000, batches, status);
-    if (status == fluss::BoundedReadStatus::TimedOut) {
+    fluss::RecordBatchReadResult result;
+    reader.NextBatch(1000, result);
+    if (result.status == fluss::BoundedReadStatus::TimedOut) {
         continue;  // Check query cancellation before retrying.
     }
-    if (status == fluss::BoundedReadStatus::Finished) {
+    if (result.status == fluss::BoundedReadStatus::Finished) {
         break;
     }
-    for (const auto& batch : batches) {
-        process(batch->GetArrowRecordBatch());
-    }
+    process(result.batch->GetArrowRecordBatch());
 }
+```
+
+Timestamp-bounded reads use the same iterator after resolving the timestamps independently for
+each bucket:
+
+```cpp
+fluss::RecordBatchLogReader timestamp_reader;
+table.NewScan().CreateRecordBatchLogReader(
+    admin, table_buckets,
+    fluss::TimestampRange{starting_timestamp_ms, stopping_timestamp_ms}, timestamp_reader);
 ```
 
 `CollectAllBatches()` is available when materializing the complete bounded result is
 preferred. `NextBatch()` reports timeout separately from completion so engines can periodically
-check cancellation. Use only one active reader or polling operation for a scanner at a time.
+check cancellation.
 
 ## TODO
 

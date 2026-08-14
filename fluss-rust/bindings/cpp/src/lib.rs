@@ -2274,18 +2274,20 @@ impl LogScanner {
             return client_err_ptr("Batch-based scanner not available".to_string());
         };
 
-        let stopping_offsets = offsets
-            .into_iter()
-            .map(|offset| {
-                let partition_id = offset.has_partition_id.then_some(offset.partition_id);
-                let bucket = fcore::metadata::TableBucket::new_with_partition(
-                    offset.table_id,
-                    partition_id,
-                    offset.bucket_id,
+        let mut stopping_offsets = HashMap::with_capacity(offsets.len());
+        for offset in offsets {
+            let partition_id = offset.has_partition_id.then_some(offset.partition_id);
+            let bucket = fcore::metadata::TableBucket::new_with_partition(
+                offset.table_id,
+                partition_id,
+                offset.bucket_id,
+            );
+            if stopping_offsets.insert(bucket, offset.offset).is_some() {
+                return client_err_ptr(
+                    "Duplicate bucket in bounded reader stopping offsets".to_string(),
                 );
-                (bucket, offset.offset)
-            })
-            .collect();
+            }
+        }
 
         match fcore::client::RecordBatchLogReader::new_until_offsets(
             scanner.new_shared_handle(),

@@ -152,7 +152,9 @@ Complete API reference for the Fluss C++ client.
 | `ProjectByName(std::vector<std::string> column_names) -> TableScan&` | Project columns by name                       |
 | `Limit(int32_t row_number) -> TableScan&`                            | Set a positive row limit (enables `CreateBucketBatchScanner`; rejected by log scanners) |
 | `CreateLogScanner(LogScanner& out) -> Result`                        | Create a record-based log scanner; on a primary-key table, subscribes to its CDC changelog (per-record `change_type`) |
-| `CreateRecordBatchLogScanner(LogScanner& out) -> Result`             | Create an Arrow RecordBatch-based log scanner (log tables only — no per-record change types) |
+| `CreateRecordBatchLogScanner(RecordBatchLogScanner& out) -> Result`  | Create a strongly typed Arrow RecordBatch scanner |
+| `CreateRecordBatchLogReader(const std::vector<RecordBatchLogReadRange>& ranges, RecordBatchLogReader& out) -> Result` | Create a bounded reader directly from per-bucket offset ranges |
+| `CreateRecordBatchLogReader(Admin& admin, const std::vector<TableBucket>& buckets, const TimestampRange& range, RecordBatchLogReader& out) -> Result` | Resolve a timestamp range per bucket and create a bounded reader |
 | `CreateBucketBatchScanner(const TableBucket& bucket, BatchScanner& out) -> Result` | Bounded scan of one bucket (requires `Limit`) |
 
 ## `AppendWriter`
@@ -204,14 +206,46 @@ Performs prefix (bucket-key) lookups, returning all rows whose primary key start
 | `Unsubscribe(int32_t bucket_id) -> Result`                                                           | Unsubscribe from a non-partitioned bucket |
 | `UnsubscribePartition(int64_t partition_id, int32_t bucket_id) -> Result`                            | Unsubscribe from a partition bucket       |
 | `Poll(int64_t timeout_ms, ScanRecords& out) -> Result`                                               | Poll individual records                   |
-| `PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out) -> Result`                             | Poll Arrow RecordBatches                  |
-| `CreateRecordBatchLogReaderUntilLatest(const Admin& admin, RecordBatchLogReader& out) -> Result`     | Create a bounded reader using the latest offsets observed during the call |
-| `CreateRecordBatchLogReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets, RecordBatchLogReader& out) -> Result` | Create a bounded reader using explicit stopping offsets |
+| `PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out) -> Result`                             | Legacy Arrow RecordBatch polling API      |
 
-The reader methods require a scanner created by
-`TableScan::CreateRecordBatchLogScanner()`. Subscribe every bucket assigned to this reader first;
-subscriptions provide the starting offsets, while `ReaderStopOffset` provides the stopping offset
-for each bucket. Only one reader or polling operation may consume a scanner at a time.
+## `RecordBatchLogScanner`
+
+Strongly typed unbounded Arrow RecordBatch scanner. Its subscribe and unsubscribe methods mirror
+`LogScanner`; `Poll()` returns Arrow batches.
+
+| Method                                                                                               | Description                              |
+|------------------------------------------------------------------------------------------------------|------------------------------------------|
+| `Subscribe(int32_t bucket_id, int64_t offset) -> Result`                                             | Subscribe to a single bucket             |
+| `Subscribe(const std::vector<BucketSubscription>& bucket_offsets) -> Result`                         | Subscribe to multiple buckets            |
+| `SubscribePartitionBuckets(const std::vector<PartitionBucketSubscription>& subscriptions) -> Result` | Subscribe to multiple partition buckets |
+| `Poll(int64_t timeout_ms, ArrowRecordBatches& out) -> Result`                                        | Poll Arrow RecordBatches                 |
+| `CreateRecordBatchLogReaderUntilLatest(const Admin& admin, RecordBatchLogReader& out) && -> Result`  | Move the scanner into a reader bounded by current latest offsets |
+| `CreateRecordBatchLogReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets, RecordBatchLogReader& out) && -> Result` | Move the scanner into a reader using explicit stops |
+
+Prefer `TableScan::CreateRecordBatchLogReader()` for query engines. The scanner-level methods are
+useful when subscriptions need to be configured incrementally.
+
+## `RecordBatchLogReadRange`
+
+| Field             | Type          | Description                         |
+|-------------------|---------------|-------------------------------------|
+| `bucket`          | `TableBucket` | Bucket assigned to this reader      |
+| `starting_offset` | `int64_t`     | Inclusive starting offset           |
+| `stopping_offset` | `int64_t`     | Exclusive stopping offset           |
+
+## `TimestampRange`
+
+| Field                     | Type      | Description                                  |
+|---------------------------|-----------|----------------------------------------------|
+| `starting_timestamp_ms`   | `int64_t` | Starting log timestamp in epoch milliseconds |
+| `stopping_timestamp_ms`   | `int64_t` | Stopping log timestamp in epoch milliseconds |
+
+## `RecordBatchReadResult`
+
+| Field    | Type                                | Description                                      |
+|----------|-------------------------------------|--------------------------------------------------|
+| `status` | `BoundedReadStatus`                 | Batch available, timed out, or finished          |
+| `batch`  | `std::unique_ptr<ArrowRecordBatch>` | Present only when `status` is `BatchAvailable`   |
 
 ## `ReaderStopOffset`
 
@@ -222,20 +256,24 @@ for each bucket. Only one reader or polling operation may consume a scanner at a
 
 ## `RecordBatchLogReader`
 
-Bounded Arrow record-batch reader created from a subscribed `LogScanner`.
+Bounded Arrow record-batch reader. It can manage multiple buckets, each with its own stopping
+offset, and returns one batch per successful `NextBatch()` call.
 
-| Method                                                                                             | Description                                                    |
-|----------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
-| `Available() -> bool`                                                                              | Check whether the reader is valid                              |
-| `NextBatch(int64_t timeout_ms, ArrowRecordBatches& out, BoundedReadStatus& status) -> Result`       | Wait up to the timeout for a batch, timeout, or completion     |
-| `CollectAllBatches(ArrowRecordBatches& out) -> Result`                                             | Drain all batches until every stopping offset has been reached |
+| Method                                                                                                        | Description                                                    |
+|---------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
+| `Available() -> bool`                                                                                         | Check whether the reader is valid                              |
+| `NextBatch(int64_t timeout_ms, RecordBatchReadResult& out) -> Result` | Wait up to the timeout for one batch, timeout, or completion   |
+| `CollectAllBatches(ArrowRecordBatches& out) -> Result`                | Drain all batches until every stopping offset has been reached |
 
 `BoundedReadStatus` is `BatchAvailable`, `TimedOut`, or `Finished`. A timeout does not exhaust
 the reader; callers may check cancellation and invoke `NextBatch()` again.
 
-`CreateRecordBatchLogReaderUntilLatest()` queries the latest offset of every subscribed bucket
-when the reader is created. `CreateRecordBatchLogReaderUntilOffsets()` is useful when a
-coordinator has already selected offsets and needs multiple workers to use the same boundary.
+`RecordBatchReadResult::batch` is non-null only when `status` is `BatchAvailable`.
+
+`TableScan::CreateRecordBatchLogReader()` accepts resolved per-bucket ranges, which is useful when
+a coordinator has selected globally consistent offsets for multiple workers. The timestamp
+overload resolves both timestamps with `OffsetSpec::Timestamp` for every requested bucket before
+reading.
 
 ## `BatchScanner`
 

@@ -1242,11 +1242,31 @@ struct ReaderStopOffset {
     int64_t offset;
 };
 
+/// One bounded log range. Records are returned for
+/// [starting_offset, stopping_offset).
+struct RecordBatchLogReadRange {
+    TableBucket bucket;
+    int64_t starting_offset;
+    int64_t stopping_offset;
+};
+
+/// A log timestamp range in epoch milliseconds. Each requested bucket resolves
+/// the two timestamps to offsets before the reader is created.
+struct TimestampRange {
+    int64_t starting_timestamp_ms;
+    int64_t stopping_timestamp_ms;
+};
+
 /// Outcome of a bounded record-batch read.
 enum class BoundedReadStatus {
     BatchAvailable = 0,
     TimedOut = 1,
     Finished = 2,
+};
+
+struct RecordBatchReadResult {
+    BoundedReadStatus status{BoundedReadStatus::TimedOut};
+    std::unique_ptr<ArrowRecordBatch> batch;
 };
 
 struct LakeSnapshot {
@@ -1352,6 +1372,7 @@ class Lookuper;
 class PrefixLookuper;
 class WriteResult;
 class LogScanner;
+class RecordBatchLogScanner;
 class RecordBatchLogReader;
 class BatchScanner;
 class Admin;
@@ -1648,7 +1669,25 @@ class TableScan {
     /// path carries no per-record change types; read a primary-key table's
     /// changelog with `CreateLogScanner()` instead. Requires the ARROW log
     /// format.
+    Result CreateRecordBatchLogScanner(RecordBatchLogScanner& out);
+
+    /// Legacy overload. Prefer the strongly typed RecordBatchLogScanner.
     Result CreateRecordBatchLogScanner(LogScanner& out);
+
+    /// Creates a bounded reader directly from per-bucket offset ranges.
+    ///
+    /// This is the preferred API for query engines: it subscribes every bucket
+    /// at its starting offset, installs the corresponding stopping offset, and
+    /// transfers scanner ownership to the returned reader.
+    Result CreateRecordBatchLogReader(const std::vector<RecordBatchLogReadRange>& ranges,
+                                      RecordBatchLogReader& out);
+
+    /// Creates a bounded reader for a timestamp range over requested buckets.
+    ///
+    /// The timestamps are resolved independently for every requested bucket,
+    /// then read with [starting_offset, stopping_offset) semantics.
+    Result CreateRecordBatchLogReader(Admin& admin, const std::vector<TableBucket>& buckets,
+                                      const TimestampRange& range, RecordBatchLogReader& out);
 
     Result CreateBucketBatchScanner(const TableBucket& bucket, BatchScanner& out);
 
@@ -1658,6 +1697,9 @@ class TableScan {
 
     std::vector<size_t> ResolveNameProjection() const;
     Result DoCreateScanner(LogScanner& out, bool is_record_batch);
+    Result ResolveTimestampRanges(Admin& admin, const std::vector<TableBucket>& buckets,
+                                  const TimestampRange& range,
+                                  std::vector<RecordBatchLogReadRange>& out) const;
 
     ffi::Table* table_{nullptr};
     std::vector<size_t> projection_;
@@ -1809,6 +1851,14 @@ class LogScanner {
     Result Poll(int64_t timeout_ms, ScanRecords& out);
     Result PollRecordBatch(int64_t timeout_ms, ArrowRecordBatches& out);
 
+   private:
+    friend class Table;
+    friend class TableScan;
+    friend class RecordBatchLogScanner;
+    LogScanner(ffi::LogScanner* scanner) noexcept;
+
+    void Destroy() noexcept;
+
     /// Creates a bounded reader using the latest offsets observed during this call.
     /// Subscribe the record-batch scanner at the desired starting offsets before
     /// calling this method.
@@ -1820,13 +1870,46 @@ class LogScanner {
     Result CreateRecordBatchLogReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets,
                                                   RecordBatchLogReader& out);
 
-   private:
-    friend class Table;
-    friend class TableScan;
-    LogScanner(ffi::LogScanner* scanner) noexcept;
-
-    void Destroy() noexcept;
     ffi::LogScanner* scanner_{nullptr};
+};
+
+/// Strongly typed Arrow record-batch log scanner.
+///
+/// Use this type for unbounded batch polling, or move it into a bounded reader.
+class RecordBatchLogScanner {
+   public:
+    RecordBatchLogScanner() noexcept;
+    ~RecordBatchLogScanner() noexcept;
+
+    RecordBatchLogScanner(const RecordBatchLogScanner&) = delete;
+    RecordBatchLogScanner& operator=(const RecordBatchLogScanner&) = delete;
+    RecordBatchLogScanner(RecordBatchLogScanner&& other) noexcept;
+    RecordBatchLogScanner& operator=(RecordBatchLogScanner&& other) noexcept;
+
+    bool Available() const;
+
+    Result Subscribe(int32_t bucket_id, int64_t start_offset);
+    Result Subscribe(const std::vector<BucketSubscription>& bucket_offsets);
+    Result SubscribePartitionBuckets(int64_t partition_id, int32_t bucket_id, int64_t start_offset);
+    Result SubscribePartitionBuckets(const std::vector<PartitionBucketSubscription>& subscriptions);
+    Result Unsubscribe(int32_t bucket_id);
+    Result UnsubscribePartition(int64_t partition_id, int32_t bucket_id);
+    Result Poll(int64_t timeout_ms, ArrowRecordBatches& out);
+
+    /// Transfers this scanner into a reader bounded by the latest offsets
+    /// observed during the call. The scanner becomes unavailable on success.
+    Result CreateRecordBatchLogReaderUntilLatest(const Admin& admin, RecordBatchLogReader& out) &&;
+
+    /// Transfers this scanner into a reader with explicit stopping offsets.
+    /// The scanner becomes unavailable on success.
+    Result CreateRecordBatchLogReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets,
+                                                  RecordBatchLogReader& out) &&;
+
+   private:
+    friend class TableScan;
+    explicit RecordBatchLogScanner(ffi::LogScanner* scanner) noexcept;
+
+    LogScanner scanner_;
 };
 
 /// Bounded Arrow batch reader created from a subscribed record-batch log scanner.
@@ -1846,13 +1929,15 @@ class RecordBatchLogReader {
     /// Waits up to timeout_ms for the next batch.
     /// TimedOut leaves the reader valid for a later retry; Finished means every
     /// subscribed bucket reached its stopping offset.
-    Result NextBatch(int64_t timeout_ms, ArrowRecordBatches& out, BoundedReadStatus& status);
+    Result NextBatch(int64_t timeout_ms, RecordBatchReadResult& out);
 
     /// Drains all remaining batches until every stopping offset is reached.
     Result CollectAllBatches(ArrowRecordBatches& out);
 
    private:
     friend class LogScanner;
+    friend class RecordBatchLogScanner;
+    friend class TableScan;
     explicit RecordBatchLogReader(ffi::RecordBatchLogReader* reader) noexcept;
 
     void Destroy() noexcept;

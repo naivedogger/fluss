@@ -371,44 +371,34 @@ int main() {
 
     // 8.1) Bounded Arrow record batch scan with explicit stopping offsets
     std::cout << "\n=== Bounded Arrow Record Batch Scan ===" << std::endl;
-    fluss::LogScanner bounded_scanner;
-    check("new_bounded_record_batch_scanner",
-          table.NewScan().CreateRecordBatchLogScanner(bounded_scanner));
-
-    std::vector<fluss::ReaderStopOffset> stopping_offsets;
+    std::vector<fluss::RecordBatchLogReadRange> bounded_ranges;
     for (int32_t bucket_id : all_bucket_ids) {
         const int64_t starting_offset = earliest_offsets.at(bucket_id);
         const int64_t stopping_offset = latest_offsets.at(bucket_id);
-        if (starting_offset >= stopping_offset) {
-            continue;
-        }
-        check("subscribe_bounded", bounded_scanner.Subscribe(bucket_id, starting_offset));
-        stopping_offsets.push_back({fluss::TableBucket{info.table_id, bucket_id}, stopping_offset});
+        bounded_ranges.push_back(
+            {fluss::TableBucket{info.table_id, bucket_id}, starting_offset, stopping_offset});
     }
 
-    if (!stopping_offsets.empty()) {
+    if (!bounded_ranges.empty()) {
         fluss::RecordBatchLogReader bounded_reader;
-        check("create_bounded_reader", bounded_scanner.CreateRecordBatchLogReaderUntilOffsets(
-                                           stopping_offsets, bounded_reader));
+        check("create_bounded_reader",
+              table.NewScan().CreateRecordBatchLogReader(bounded_ranges, bounded_reader));
 
         int64_t bounded_row_count = 0;
         while (true) {
-            fluss::ArrowRecordBatches bounded_batches;
-            fluss::BoundedReadStatus status;
-            check("bounded_next_batch", bounded_reader.NextBatch(1000, bounded_batches, status));
-            if (status == fluss::BoundedReadStatus::TimedOut) {
+            fluss::RecordBatchReadResult result;
+            check("bounded_next_batch", bounded_reader.NextBatch(1000, result));
+            if (result.status == fluss::BoundedReadStatus::TimedOut) {
                 continue;
             }
-            if (status == fluss::BoundedReadStatus::Finished) {
+            if (result.status == fluss::BoundedReadStatus::Finished) {
                 break;
             }
-            for (const auto& bounded_batch : bounded_batches) {
-                bounded_row_count += bounded_batch->NumRows();
-                std::cout << "  bucket=" << bounded_batch->GetBucketId()
-                          << " base_offset=" << bounded_batch->GetBaseOffset()
-                          << " last_offset=" << bounded_batch->GetLastOffset()
-                          << " rows=" << bounded_batch->NumRows() << std::endl;
-            }
+            bounded_row_count += result.batch->NumRows();
+            std::cout << "  bucket=" << result.batch->GetBucketId()
+                      << " base_offset=" << result.batch->GetBaseOffset()
+                      << " last_offset=" << result.batch->GetLastOffset()
+                      << " rows=" << result.batch->NumRows() << std::endl;
         }
         std::cout << "Bounded scan completed with " << bounded_row_count << " rows" << std::endl;
     }
@@ -418,6 +408,8 @@ int main() {
     auto timestamp_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(one_hour_ago.time_since_epoch())
             .count();
+    auto now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
     std::unordered_map<int32_t, int64_t> timestamp_offsets;
     check("list_timestamp_offsets",
@@ -426,6 +418,30 @@ int main() {
     std::cout << "Offsets for timestamp " << timestamp_ms << " (1 hour ago):" << std::endl;
     for (const auto& [bucket_id, offset] : timestamp_offsets) {
         std::cout << "  Bucket " << bucket_id << ": offset=" << offset << std::endl;
+    }
+
+    // 8.2) Bounded Arrow record batch scan by timestamp range
+    std::vector<fluss::TableBucket> table_buckets;
+    for (int32_t bucket_id : all_bucket_ids) {
+        table_buckets.push_back({info.table_id, bucket_id});
+    }
+
+    fluss::RecordBatchLogReader timestamp_reader;
+    check("create_timestamp_reader",
+          table.NewScan().CreateRecordBatchLogReader(
+              admin, table_buckets, fluss::TimestampRange{timestamp_ms, now_ms}, timestamp_reader));
+
+    while (true) {
+        fluss::RecordBatchReadResult result;
+        check("timestamp_next_batch", timestamp_reader.NextBatch(1000, result));
+        if (result.status == fluss::BoundedReadStatus::TimedOut) {
+            continue;
+        }
+        if (result.status == fluss::BoundedReadStatus::Finished) {
+            break;
+        }
+        std::cout << "Timestamp range batch: bucket=" << result.batch->GetBucketId()
+                  << " rows=" << result.batch->NumRows() << std::endl;
     }
 
     // 9) Batch subscribe
@@ -471,7 +487,7 @@ int main() {
     // 10) Arrow record batch polling
     std::cout << "\n=== Testing Arrow Record Batch Polling ===" << std::endl;
 
-    fluss::LogScanner arrow_scanner;
+    fluss::RecordBatchLogScanner arrow_scanner;
     check("new_record_batch_log_scanner",
           table.NewScan().CreateRecordBatchLogScanner(arrow_scanner));
 
@@ -480,7 +496,7 @@ int main() {
     }
 
     fluss::ArrowRecordBatches arrow_batches;
-    check("poll_record_batch", arrow_scanner.PollRecordBatch(5000, arrow_batches));
+    check("poll_record_batch", arrow_scanner.Poll(5000, arrow_batches));
 
     std::cout << "Polled " << arrow_batches.Size() << " Arrow record batches" << std::endl;
     for (size_t i = 0; i < arrow_batches.Size(); ++i) {
@@ -496,7 +512,7 @@ int main() {
     // 11) Arrow record batch polling with projection
     std::cout << "\n=== Testing Arrow Record Batch Polling with Projection ===" << std::endl;
 
-    fluss::LogScanner projected_arrow_scanner;
+    fluss::RecordBatchLogScanner projected_arrow_scanner;
     check("new_record_batch_log_scanner_with_projection",
           table.NewScan()
               .ProjectByIndex(projected_columns)
@@ -508,7 +524,7 @@ int main() {
 
     fluss::ArrowRecordBatches projected_arrow_batches;
     check("poll_projected_record_batch",
-          projected_arrow_scanner.PollRecordBatch(5000, projected_arrow_batches));
+          projected_arrow_scanner.Poll(5000, projected_arrow_batches));
 
     std::cout << "Polled " << projected_arrow_batches.Size() << " projected Arrow record batches"
               << std::endl;
