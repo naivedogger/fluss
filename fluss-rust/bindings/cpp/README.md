@@ -71,7 +71,15 @@ table.NewScan().CreateRecordBatchLogReader(ranges, reader);
 
 while (true) {
     fluss::RecordBatchReadResult result;
-    reader.NextBatch(1000, result);
+    auto read_result = reader.NextBatch(1000, result);
+    if (!read_result.Ok()) {
+        // Bail out on unretriable failures (auth, invalid table, ...); the
+        // reader's status field is only meaningful when `Ok()` is true.
+        if (!read_result.IsRetriable()) {
+            throw std::runtime_error(read_result.error_message);
+        }
+        continue;  // Retriable: check query cancellation before retrying.
+    }
     if (result.status == fluss::BoundedReadStatus::TimedOut) {
         continue;  // Check query cancellation before retrying.
     }
@@ -92,9 +100,11 @@ table.NewScan().CreateRecordBatchLogReader(
     fluss::TimestampRange{starting_timestamp_ms, stopping_timestamp_ms}, timestamp_reader);
 ```
 
-`CollectAllBatches()` is available when materializing the complete bounded result is
-preferred. `NextBatch()` reports timeout separately from completion so engines can periodically
-check cancellation.
+`CollectAllBatches(timeout_ms, out)` is available when materializing the complete bounded result
+is preferred; it appends to `out` within the supplied budget, returning a retriable
+`REQUEST_TIME_OUT` `Result` if the budget elapses before every stopping offset is reached — call
+it again with the same `out` to resume. `NextBatch()` reports timeout separately from completion
+so engines can periodically check cancellation.
 
 ## TODO
 

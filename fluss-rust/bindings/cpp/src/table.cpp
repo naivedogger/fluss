@@ -20,6 +20,7 @@
 #include <arrow/c/bridge.h>
 
 #include <cassert>
+#include <chrono>
 #include <ctime>
 #include <map>
 #include <set>
@@ -2234,55 +2235,87 @@ RecordBatchLogReader& RecordBatchLogReader::operator=(RecordBatchLogReader&& oth
 bool RecordBatchLogReader::Available() const { return reader_ != nullptr; }
 
 Result RecordBatchLogReader::NextBatch(int64_t timeout_ms, RecordBatchReadResult& out) {
+    // Default to Finished so that a caller which ignores the returned Result
+    // and only inspects out.status still terminates instead of spinning on a
+    // stale TimedOut value. Only a fully successful call writes the real
+    // terminal status back to `out`.
+    out.status = BoundedReadStatus::Finished;
+    out.batch.reset();
+
     if (!Available()) {
         return utils::make_client_error("RecordBatchLogReader not available");
     }
 
-    out.status = BoundedReadStatus::TimedOut;
-    out.batch.reset();
     auto ffi_result = reader_->record_batch_log_reader_next_batch(timeout_ms);
     auto result = utils::from_ffi_result(ffi_result.result);
     if (!result.Ok()) {
         return result;
     }
+    BoundedReadStatus status;
     switch (ffi_result.status) {
         case 0:
-            out.status = BoundedReadStatus::BatchAvailable;
+            status = BoundedReadStatus::BatchAvailable;
             break;
         case 1:
-            out.status = BoundedReadStatus::TimedOut;
+            status = BoundedReadStatus::TimedOut;
             break;
         case 2:
-            out.status = BoundedReadStatus::Finished;
+            status = BoundedReadStatus::Finished;
             break;
         default:
             return utils::make_client_error("Unknown bounded read status: " +
                                             std::to_string(ffi_result.status));
     }
-    result = detail::ArrowBatchImporter::ImportOne(ffi_result.arrow_batches, out.batch);
+    std::unique_ptr<ArrowRecordBatch> batch;
+    result = detail::ArrowBatchImporter::ImportOne(ffi_result.arrow_batches, batch);
     if (!result.Ok()) {
         return result;
     }
-    if (out.status == BoundedReadStatus::BatchAvailable && !out.batch) {
+    if (status == BoundedReadStatus::BatchAvailable && !batch) {
         return utils::make_client_error("Bounded reader reported a batch without returning one");
     }
-    if (out.status != BoundedReadStatus::BatchAvailable && out.batch) {
+    if (status != BoundedReadStatus::BatchAvailable && batch) {
         return utils::make_client_error("Bounded reader returned a batch for a terminal status");
     }
+    out.status = status;
+    out.batch = std::move(batch);
     return utils::make_ok();
 }
 
-Result RecordBatchLogReader::CollectAllBatches(ArrowRecordBatches& out) {
+Result RecordBatchLogReader::CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out) {
     if (!Available()) {
         return utils::make_client_error("RecordBatchLogReader not available");
     }
 
-    auto ffi_result = reader_->record_batch_log_reader_collect_all_batches();
-    auto result = utils::from_ffi_result(ffi_result.result);
-    if (!result.Ok()) {
-        return result;
+    const auto timeout = std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        int64_t remaining_ms = 0;
+        if (elapsed < timeout) {
+            remaining_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(timeout - elapsed).count();
+        }
+        RecordBatchReadResult step;
+        auto result = NextBatch(remaining_ms, step);
+        if (!result.Ok()) {
+            return result;
+        }
+        if (step.status == BoundedReadStatus::Finished) {
+            return utils::make_ok();
+        }
+        if (step.status == BoundedReadStatus::TimedOut) {
+            // Budget exhausted before completion. Already-collected batches
+            // remain in `out`; the reader stays valid so callers can resume.
+            return utils::make_error(ErrorCode::REQUEST_TIME_OUT,
+                                     "CollectAllBatches timed out before every stopping offset was "
+                                     "reached");
+        }
+        // BatchAvailable
+        if (step.batch) {
+            out.batches.push_back(std::move(step.batch));
+        }
     }
-    return detail::ArrowBatchImporter::Import(ffi_result.arrow_batches, out);
 }
 
 // ============================================================================

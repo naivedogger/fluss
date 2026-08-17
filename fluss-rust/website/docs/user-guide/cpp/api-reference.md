@@ -263,10 +263,18 @@ offset, and returns one batch per successful `NextBatch()` call.
 |---------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
 | `Available() -> bool`                                                                                         | Check whether the reader is valid                              |
 | `NextBatch(int64_t timeout_ms, RecordBatchReadResult& out) -> Result` | Wait up to the timeout for one batch, timeout, or completion   |
-| `CollectAllBatches(ArrowRecordBatches& out) -> Result`                | Drain all batches until every stopping offset has been reached |
+| `CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out) -> Result`                | Drain batches until every stopping offset is reached or the budget elapses |
 
-`BoundedReadStatus` is `BatchAvailable`, `TimedOut`, or `Finished`. A timeout does not exhaust
-the reader; callers may check cancellation and invoke `NextBatch()` again.
+`BoundedReadStatus` is `BatchAvailable`, `TimedOut`, or `Finished`. Inspect `out.status` only
+when the returned `Result` is `Ok()`; on a non-Ok `Result` the status is reset to `Finished`,
+so a caller that skips the error check terminates instead of retrying a failed read
+forever. A timeout does not exhaust the reader; callers may check cancellation and invoke
+`NextBatch()` again.
+
+`CollectAllBatches()` takes a total budget and *appends* to `out`. If the budget elapses before
+completion, the reader stays valid and it returns a retriable `REQUEST_TIME_OUT` `Result`, so
+calling it again with the same `out` resumes the drain instead of blocking forever on an
+unreachable stopping offset (e.g. during a tablet server outage).
 
 `RecordBatchReadResult::batch` is non-null only when `status` is `BatchAvailable`.
 

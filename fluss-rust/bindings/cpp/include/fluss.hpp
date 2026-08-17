@@ -1264,8 +1264,12 @@ enum class BoundedReadStatus {
     Finished = 2,
 };
 
+/// Outcome of one bounded record-batch read. Meaningful only when the
+/// accompanying `Result` is `Ok()`; on a non-Ok `Result` the status is reset to
+/// `Finished` so callers that skip the error check terminate instead of
+/// retrying a failed read forever.
 struct RecordBatchReadResult {
-    BoundedReadStatus status{BoundedReadStatus::TimedOut};
+    BoundedReadStatus status{BoundedReadStatus::Finished};
     std::unique_ptr<ArrowRecordBatch> batch;
 };
 
@@ -1927,12 +1931,17 @@ class RecordBatchLogReader {
     bool Available() const;
 
     /// Waits up to timeout_ms for the next batch.
+    /// Read `out.status` only when the returned `Result` is `Ok()`.
     /// TimedOut leaves the reader valid for a later retry; Finished means every
     /// subscribed bucket reached its stopping offset.
     Result NextBatch(int64_t timeout_ms, RecordBatchReadResult& out);
 
-    /// Drains all remaining batches until every stopping offset is reached.
-    Result CollectAllBatches(ArrowRecordBatches& out);
+    /// Drains remaining batches until every stopping offset is reached or the
+    /// total budget of timeout_ms elapses. Batches are *appended* to `out`, so a
+    /// timed-out call can be resumed by calling again with the same `out`.
+    /// On timeout the reader stays valid and the returned `Result` is a
+    /// retriable REQUEST_TIME_OUT, so callers can resume or cancel.
+    Result CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out);
 
    private:
     friend class LogScanner;

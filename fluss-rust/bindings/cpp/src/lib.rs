@@ -730,9 +730,6 @@ mod ffi {
             self: &RecordBatchLogReader,
             timeout_ms: i64,
         ) -> FfiBoundedReadResult;
-        fn record_batch_log_reader_collect_all_batches(
-            self: &RecordBatchLogReader,
-        ) -> FfiArrowRecordBatchesResult;
 
         // BatchScanner
         unsafe fn delete_batch_scanner(scanner: *mut BatchScanner);
@@ -2333,14 +2330,6 @@ impl RecordBatchLogReader {
                 empty_bounded_read_result(ok_result(), FINISHED)
             }
             Err(e) => empty_bounded_read_result(err_from_core_error(&e), FINISHED),
-        }
-    }
-
-    fn record_batch_log_reader_collect_all_batches(&self) -> ffi::FfiArrowRecordBatchesResult {
-        let mut reader = self.inner.lock().unwrap();
-        match RUNTIME.block_on(reader.collect_all_batches()) {
-            Ok(batches) => arrow_batches_result(types::core_scan_batches_to_ffi(&batches)),
-            Err(e) => empty_arrow_batches_result(err_from_core_error(&e)),
         }
     }
 }

@@ -276,6 +276,51 @@ TEST_F(LogTableTest, RecordBatchLogReaderUntilOffsets) {
         ASSERT_OK(waiting_reader.NextBatch(100, timeout_result));
         EXPECT_EQ(timeout_result.batch, nullptr);
         EXPECT_EQ(timeout_result.status, fluss::BoundedReadStatus::TimedOut);
+
+        // CollectAllBatches must honour its budget instead of blocking until the
+        // stopping offset becomes reachable, which may never happen (e.g. a
+        // tablet server outage).
+        fluss::ArrowRecordBatches partial;
+        auto collect_result = waiting_reader.CollectAllBatches(200, partial);
+        EXPECT_FALSE(collect_result.Ok());
+        EXPECT_EQ(collect_result.error_code, fluss::ErrorCode::REQUEST_TIME_OUT);
+        EXPECT_TRUE(collect_result.IsRetriable());
+        // The reader survives the timeout, so callers may resume or cancel.
+        EXPECT_TRUE(waiting_reader.Available());
+    }
+
+    // An unavailable reader must not report TimedOut: callers that only inspect
+    // the status would otherwise retry an unretriable failure forever.
+    {
+        fluss::RecordBatchLogReader unavailable_reader;
+        ASSERT_FALSE(unavailable_reader.Available());
+
+        fluss::RecordBatchReadResult result;
+        result.status = fluss::BoundedReadStatus::BatchAvailable;
+        auto next_result = unavailable_reader.NextBatch(100, result);
+        EXPECT_FALSE(next_result.Ok());
+        EXPECT_EQ(result.status, fluss::BoundedReadStatus::Finished);
+        EXPECT_EQ(result.batch, nullptr);
+    }
+
+    // CollectAllBatches appends to the output, preserving previously collected
+    // batches when a caller resumes after a timeout.
+    {
+        const std::vector<fluss::RecordBatchLogReadRange> bucket_range = {
+            {fluss::TableBucket{table_id, 0}, 1, latest_offsets.at(0)}};
+
+        fluss::ArrowRecordBatches accumulated;
+        fluss::RecordBatchLogReader first_reader;
+        ASSERT_OK(table.NewScan().CreateRecordBatchLogReader(bucket_range, first_reader));
+        ASSERT_OK(first_reader.CollectAllBatches(30000, accumulated));
+        const size_t after_first = accumulated.Size();
+        ASSERT_GT(after_first, 0u);
+
+        fluss::RecordBatchLogReader second_reader;
+        ASSERT_OK(table.NewScan().CreateRecordBatchLogReader(bucket_range, second_reader));
+        ASSERT_OK(second_reader.CollectAllBatches(30000, accumulated));
+        EXPECT_GT(accumulated.Size(), after_first)
+            << "CollectAllBatches must append to out, not overwrite it";
     }
 
     ASSERT_OK(adm.DropTable(table_path, false));
@@ -1242,7 +1287,7 @@ TEST_F(LogTableTest, PartitionedTableAppendScan) {
         ASSERT_OK(bounded_table.NewScan().CreateRecordBatchLogReader(ranges, reader));
 
         fluss::ArrowRecordBatches batches;
-        ASSERT_OK(reader.CollectAllBatches(batches));
+        ASSERT_OK(reader.CollectAllBatches(30000, batches));
 
         std::vector<int32_t> ids;
         for (const auto& bounded_batch : batches) {
@@ -1272,7 +1317,7 @@ TEST_F(LogTableTest, PartitionedTableAppendScan) {
             reader));
 
         fluss::ArrowRecordBatches batches;
-        ASSERT_OK(reader.CollectAllBatches(batches));
+        ASSERT_OK(reader.CollectAllBatches(30000, batches));
 
         std::vector<int32_t> ids;
         for (const auto& bounded_batch : batches) {

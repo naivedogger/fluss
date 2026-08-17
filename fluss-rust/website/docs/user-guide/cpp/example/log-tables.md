@@ -171,7 +171,13 @@ table.NewScan().CreateRecordBatchLogReader(ranges, reader);
 
 while (true) {
     fluss::RecordBatchReadResult result;
-    reader.NextBatch(1000, result);
+    auto read_result = reader.NextBatch(1000, result);
+    if (!read_result.Ok()) {
+        if (!read_result.IsRetriable()) {
+            throw std::runtime_error(read_result.error_message);
+        }
+        continue;  // Retriable: check query cancellation before retrying.
+    }
     if (result.status == fluss::BoundedReadStatus::TimedOut) {
         continue;  // Check query cancellation before retrying.
     }
@@ -186,8 +192,9 @@ while (true) {
 }
 ```
 
-`TimedOut` does not exhaust the reader. It lets a query engine periodically check cancellation
-or deadlines before retrying. `Finished` means all stopping offsets have been reached.
+Inspect `result.status` only when `NextBatch()` returns an `Ok()` result. `TimedOut` does not
+exhaust the reader; it lets a query engine periodically check cancellation or deadlines before
+retrying. `Finished` means all stopping offsets have been reached.
 
 To read a log timestamp range, pass the assigned buckets and timestamps. Fluss resolves both
 timestamps with `OffsetSpec::Timestamp` for every bucket, then uses the same bounded offset reader:
@@ -200,7 +207,13 @@ table.NewScan().CreateRecordBatchLogReader(
 
 while (true) {
     fluss::RecordBatchReadResult result;
-    reader.NextBatch(1000, result);
+    auto read_result = reader.NextBatch(1000, result);
+    if (!read_result.Ok()) {
+        if (!read_result.IsRetriable()) {
+            throw std::runtime_error(read_result.error_message);
+        }
+        continue;
+    }
     if (result.status == fluss::BoundedReadStatus::TimedOut) {
         continue;
     }
@@ -225,11 +238,22 @@ fluss::RecordBatchLogReader latest_reader;
 std::move(latest_scanner).CreateRecordBatchLogReaderUntilLatest(admin, latest_reader);
 
 fluss::ArrowRecordBatches batches;
-latest_reader.CollectAllBatches(batches);
+while (true) {
+    auto collect_result = latest_reader.CollectAllBatches(30000, batches);
+    if (collect_result.Ok()) {
+        break;
+    }
+    if (!collect_result.IsRetriable()) {
+        throw std::runtime_error(collect_result.error_message);
+    }
+    // Check query cancellation, then call again with the same `batches` to resume.
+}
 ```
 
 The scanner-level creation methods transfer ownership on success, so the scanner becomes
-unavailable after it is moved into the reader.
+unavailable after it is moved into the reader. `CollectAllBatches()` uses a total timeout budget
+and appends to its output, so it cannot block forever on an unreachable stopping offset and can
+resume without losing batches already returned.
 
 ## Column Projection
 
