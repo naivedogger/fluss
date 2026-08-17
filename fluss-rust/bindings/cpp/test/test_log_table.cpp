@@ -178,6 +178,7 @@ TEST_F(LogTableTest, RecordBatchLogReaderUntilOffsets) {
     auto& conn = connection();
 
     constexpr int32_t kNumBuckets = 3;
+    constexpr int64_t kCollectAllTimeoutMs = 200;
     fluss::TablePath table_path("fluss", "test_record_batch_log_reader_offsets_cpp");
     auto schema = fluss::Schema::NewBuilder()
                       .AddColumn("c1", DataType::Int())
@@ -277,11 +278,11 @@ TEST_F(LogTableTest, RecordBatchLogReaderUntilOffsets) {
         EXPECT_EQ(timeout_result.batch, nullptr);
         EXPECT_EQ(timeout_result.status, fluss::BoundedReadStatus::TimedOut);
 
-        // CollectAllBatches must honour its budget instead of blocking until the
-        // stopping offset becomes reachable, which may never happen (e.g. a
-        // tablet server outage).
+        // The stopping offset cannot be reached without another append.
+        // CollectAllBatches must return when its timeout budget expires.
         fluss::ArrowRecordBatches partial;
-        auto collect_result = waiting_reader.CollectAllBatches(200, partial);
+        auto collect_result =
+            waiting_reader.CollectAllBatches(kCollectAllTimeoutMs, partial);
         EXPECT_FALSE(collect_result.Ok());
         EXPECT_EQ(collect_result.error_code, fluss::ErrorCode::REQUEST_TIME_OUT);
         EXPECT_TRUE(collect_result.IsRetriable());
