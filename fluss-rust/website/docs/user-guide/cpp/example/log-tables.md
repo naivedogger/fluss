@@ -238,22 +238,37 @@ fluss::RecordBatchLogReader latest_reader;
 std::move(latest_scanner).CreateRecordBatchLogReaderUntilLatest(admin, latest_reader);
 
 fluss::ArrowRecordBatches batches;
-while (true) {
-    auto collect_result = latest_reader.CollectAllBatches(30000, batches);
+const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+bool completed = false;
+while (!query_cancelled() && std::chrono::steady_clock::now() < deadline) {
+    auto collect_result = latest_reader.CollectAllBatches(1000, batches);
     if (collect_result.Ok()) {
+        completed = true;
         break;
     }
-    if (!collect_result.IsRetriable()) {
+    if (collect_result.error_code != fluss::ErrorCode::REQUEST_TIME_OUT) {
         throw std::runtime_error(collect_result.error_message);
     }
-    // Check query cancellation, then call again with the same `batches` to resume.
+    // The per-call timeout returned control; the next iteration may resume.
+}
+if (!completed) {
+    throw std::runtime_error("Bounded read cancelled or exceeded its overall deadline");
 }
 ```
 
 The scanner-level creation methods transfer ownership on success, so the scanner becomes
-unavailable after it is moved into the reader. `CollectAllBatches()` uses a total timeout budget
-and appends to its output, so it cannot block forever on an unreachable stopping offset and can
-resume without losing batches already returned.
+unavailable after it is moved into the reader.
+
+:::caution Partial results on timeout
+
+`CollectAllBatches()` is not all-or-nothing. It appends complete batches to its output while
+reading, so a `REQUEST_TIME_OUT` result may leave `batches` partially populated. Only an `Ok()`
+result means all stopping offsets have been reached. The timeout never splits an individual Arrow
+batch, and retrying with the same reader and output continues after the batches already returned.
+The timeout applies to one `CollectAllBatches()` invocation, not the whole retry loop, so every
+retry loop must have an overall deadline or cancellation condition.
+
+:::
 
 ## Column Projection
 

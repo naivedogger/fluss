@@ -101,10 +101,14 @@ table.NewScan().CreateRecordBatchLogReader(
 ```
 
 `CollectAllBatches(timeout_ms, out)` is available when materializing the complete bounded result
-is preferred; it appends to `out` within the supplied budget, returning a retriable
-`REQUEST_TIME_OUT` `Result` if the budget elapses before every stopping offset is reached — call
-it again with the same `out` to resume. `NextBatch()` reports timeout separately from completion
-so engines can periodically check cancellation.
+is preferred. This operation is not atomic: it appends complete batches to `out` as they arrive,
+so `out` may contain a partial result when the supplied budget elapses. In that case it returns a
+retriable `REQUEST_TIME_OUT`; only an `Ok()` result means every stopping offset has been reached.
+The timeout never splits an individual Arrow batch, and calling the method again with the same
+reader and `out` resumes after the batches already returned. The timeout applies to one invocation
+only; callers that retry must enforce an overall query deadline or cancellation condition, since
+unconditional retries can continue forever. `NextBatch()` reports timeout separately from
+completion so engines can periodically check cancellation.
 
 ## TODO
 

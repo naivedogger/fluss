@@ -271,10 +271,20 @@ so a caller that skips the error check terminates instead of retrying a failed r
 forever. A timeout does not exhaust the reader; callers may check cancellation and invoke
 `NextBatch()` again.
 
-`CollectAllBatches()` takes a total budget and *appends* to `out`. If the budget elapses before
-completion, the reader stays valid and it returns a retriable `REQUEST_TIME_OUT` `Result`, so
-calling it again with the same `out` resumes the drain instead of blocking forever on an
-unreachable stopping offset (e.g. during a tablet server outage).
+:::caution Partial results on timeout
+
+`CollectAllBatches()` is not atomic. It takes a total timeout budget and appends complete batches
+to `out` as they arrive. If the budget elapses, `out` may therefore contain only part of the
+bounded result and the method returns a retriable `REQUEST_TIME_OUT`. Only an `Ok()` result means
+every stopping offset has been reached.
+
+The timeout never splits an individual Arrow batch. The reader remains valid, and calling the
+method again with the same reader and `out` continues after the batches already returned instead
+of reading them again. The timeout budget applies to one invocation only. Retrying is optional;
+callers that retry must enforce an overall query deadline or cancellation condition because an
+unconditional retry loop can run forever if the stopping offsets remain unreachable.
+
+:::
 
 `RecordBatchReadResult::batch` is non-null only when `status` is `BatchAvailable`.
 

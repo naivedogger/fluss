@@ -1939,8 +1939,13 @@ class RecordBatchLogReader {
     /// Drains remaining batches until every stopping offset is reached or the
     /// total budget of timeout_ms elapses. Batches are *appended* to `out`, so a
     /// timed-out call can be resumed by calling again with the same `out`.
-    /// On timeout the reader stays valid and the returned `Result` is a
-    /// retriable REQUEST_TIME_OUT, so callers can resume or cancel.
+    /// This operation is not atomic: on timeout, `out` may contain a partial set
+    /// of complete batches. Only an `Ok()` result means every stopping offset has
+    /// been reached. The timeout never splits a returned Arrow batch; the reader
+    /// stays valid and a retry continues after the batches already appended.
+    /// The timeout result is a retriable REQUEST_TIME_OUT. `timeout_ms` bounds
+    /// one invocation only; callers that retry must enforce their own overall
+    /// deadline or cancellation condition to avoid retrying indefinitely.
     Result CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out);
 
    private:
