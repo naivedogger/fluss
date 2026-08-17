@@ -263,7 +263,7 @@ offset, and returns one batch per successful `NextBatch()` call.
 |---------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------|
 | `Available() -> bool`                                                                                         | Check whether the reader is valid                              |
 | `NextBatch(int64_t timeout_ms, RecordBatchReadResult& out) -> Result` | Wait up to the timeout for one batch, timeout, or completion   |
-| `CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out) -> Result`                | Drain batches until every stopping offset is reached or the budget elapses |
+| `CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out) -> Result`                | Drain batches using one whole-operation timeout budget       |
 
 `BoundedReadStatus` is `BatchAvailable`, `TimedOut`, or `Finished`. Inspect `out.status` only
 when the returned `Result` is `Ok()`; on a non-Ok `Result` the status is reset to `Finished`,
@@ -273,16 +273,17 @@ forever. A timeout does not exhaust the reader; callers may check cancellation a
 
 :::caution Partial results on timeout
 
-`CollectAllBatches()` is not atomic. It takes a total timeout budget and appends complete batches
-to `out` as they arrive. If the budget elapses, `out` may therefore contain only part of the
-bounded result and the method returns a retriable `REQUEST_TIME_OUT`. Only an `Ok()` result means
-every stopping offset has been reached.
+`CollectAllBatches()` uses `timeout_ms` as the total execution budget for the whole invocation.
+Callers should normally pass the query's remaining execution time and invoke the method once. It
+appends complete batches to `out` as they arrive. If the budget expires, collection stops,
+`out` may contain only part of the bounded result, and the method returns a retriable
+`REQUEST_TIME_OUT`. Only an `Ok()` result means every stopping offset has been reached.
 
-The timeout never splits an individual Arrow batch. The reader remains valid, and calling the
-method again with the same reader and `out` continues after the batches already returned instead
-of reading them again. The timeout budget applies to one invocation only. Retrying is optional;
-callers that retry must enforce an overall query deadline or cancellation condition because an
-unconditional retry loop can run forever if the stopping offsets remain unreachable.
+The timeout is checked between complete Arrow batches and never splits a batch already being
+returned. The method does not internally retry after the budget is exhausted. The reader remains
+valid, so an application may explicitly resume with the same reader and `out`, but the normal
+whole-query behavior is to propagate the timeout/incomplete result rather than start an
+unconditional retry loop.
 
 :::
 

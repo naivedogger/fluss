@@ -371,6 +371,7 @@ int main() {
 
     // 8.1) Bounded Arrow record batch scan with explicit stopping offsets
     std::cout << "\n=== Bounded Arrow Record Batch Scan ===" << std::endl;
+    constexpr int64_t kBoundedReadTimeoutMs = 30000;
     std::vector<fluss::RecordBatchLogReadRange> bounded_ranges;
     for (int32_t bucket_id : all_bucket_ids) {
         const int64_t starting_offset = earliest_offsets.at(bucket_id);
@@ -384,21 +385,24 @@ int main() {
         check("create_bounded_reader",
               table.NewScan().CreateRecordBatchLogReader(bounded_ranges, bounded_reader));
 
+        fluss::ArrowRecordBatches bounded_batches;
+        auto collect_result =
+            bounded_reader.CollectAllBatches(kBoundedReadTimeoutMs, bounded_batches);
+        if (!collect_result.Ok()) {
+            std::cerr << "collect_bounded_batches failed after collecting "
+                      << bounded_batches.Size()
+                      << " partial batches: code=" << collect_result.error_code
+                      << " msg=" << collect_result.error_message << std::endl;
+            return 1;
+        }
+
         int64_t bounded_row_count = 0;
-        while (true) {
-            fluss::RecordBatchReadResult result;
-            check("bounded_next_batch", bounded_reader.NextBatch(1000, result));
-            if (result.status == fluss::BoundedReadStatus::TimedOut) {
-                continue;
-            }
-            if (result.status == fluss::BoundedReadStatus::Finished) {
-                break;
-            }
-            bounded_row_count += result.batch->NumRows();
-            std::cout << "  bucket=" << result.batch->GetBucketId()
-                      << " base_offset=" << result.batch->GetBaseOffset()
-                      << " last_offset=" << result.batch->GetLastOffset()
-                      << " rows=" << result.batch->NumRows() << std::endl;
+        for (const auto& batch : bounded_batches) {
+            bounded_row_count += batch->NumRows();
+            std::cout << "  bucket=" << batch->GetBucketId()
+                      << " base_offset=" << batch->GetBaseOffset()
+                      << " last_offset=" << batch->GetLastOffset()
+                      << " rows=" << batch->NumRows() << std::endl;
         }
         std::cout << "Bounded scan completed with " << bounded_row_count << " rows" << std::endl;
     }
@@ -431,17 +435,19 @@ int main() {
           table.NewScan().CreateRecordBatchLogReader(
               admin, table_buckets, fluss::TimestampRange{timestamp_ms, now_ms}, timestamp_reader));
 
-    while (true) {
-        fluss::RecordBatchReadResult result;
-        check("timestamp_next_batch", timestamp_reader.NextBatch(1000, result));
-        if (result.status == fluss::BoundedReadStatus::TimedOut) {
-            continue;
-        }
-        if (result.status == fluss::BoundedReadStatus::Finished) {
-            break;
-        }
-        std::cout << "Timestamp range batch: bucket=" << result.batch->GetBucketId()
-                  << " rows=" << result.batch->NumRows() << std::endl;
+    fluss::ArrowRecordBatches timestamp_batches;
+    auto timestamp_collect_result =
+        timestamp_reader.CollectAllBatches(kBoundedReadTimeoutMs, timestamp_batches);
+    if (!timestamp_collect_result.Ok()) {
+        std::cerr << "collect_timestamp_batches failed after collecting "
+                  << timestamp_batches.Size()
+                  << " partial batches: code=" << timestamp_collect_result.error_code
+                  << " msg=" << timestamp_collect_result.error_message << std::endl;
+        return 1;
+    }
+    for (const auto& batch : timestamp_batches) {
+        std::cout << "Timestamp range batch: bucket=" << batch->GetBucketId()
+                  << " rows=" << batch->NumRows() << std::endl;
     }
 
     // 9) Batch subscribe

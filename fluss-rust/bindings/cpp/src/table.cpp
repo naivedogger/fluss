@@ -2289,31 +2289,39 @@ Result RecordBatchLogReader::CollectAllBatches(int64_t timeout_ms, ArrowRecordBa
 
     const auto timeout = std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
     const auto start = std::chrono::steady_clock::now();
+    const auto timeout_result = [] {
+        return utils::make_error(
+            ErrorCode::REQUEST_TIME_OUT,
+            "CollectAllBatches timed out before every stopping offset was reached");
+    };
     while (true) {
         const auto elapsed = std::chrono::steady_clock::now() - start;
-        int64_t remaining_ms = 0;
-        if (elapsed < timeout) {
-            remaining_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(timeout - elapsed).count();
+        if (elapsed >= timeout) {
+            return timeout_result();
         }
+
+        const int64_t remaining_ms =
+            std::chrono::ceil<std::chrono::milliseconds>(timeout - elapsed).count();
         RecordBatchReadResult step;
         auto result = NextBatch(remaining_ms, step);
         if (!result.Ok()) {
             return result;
         }
         if (step.status == BoundedReadStatus::Finished) {
+            if (std::chrono::steady_clock::now() - start >= timeout) {
+                return timeout_result();
+            }
             return utils::make_ok();
         }
         if (step.status == BoundedReadStatus::TimedOut) {
-            // Budget exhausted before completion. Already-collected batches
-            // remain in `out`; the reader stays valid so callers can resume.
-            return utils::make_error(ErrorCode::REQUEST_TIME_OUT,
-                                     "CollectAllBatches timed out before every stopping offset was "
-                                     "reached");
+            return timeout_result();
         }
         // BatchAvailable
         if (step.batch) {
             out.batches.push_back(std::move(step.batch));
+        }
+        if (std::chrono::steady_clock::now() - start >= timeout) {
+            return timeout_result();
         }
     }
 }

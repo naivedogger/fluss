@@ -69,7 +69,9 @@ for (int32_t bucket_id : bucket_ids) {
 fluss::RecordBatchLogReader reader;
 table.NewScan().CreateRecordBatchLogReader(ranges, reader);
 
-while (true) {
+const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+bool finished = false;
+while (std::chrono::steady_clock::now() < deadline) {
     fluss::RecordBatchReadResult result;
     auto read_result = reader.NextBatch(1000, result);
     if (!read_result.Ok()) {
@@ -78,15 +80,19 @@ while (true) {
         if (!read_result.IsRetriable()) {
             throw std::runtime_error(read_result.error_message);
         }
-        continue;  // Retriable: check query cancellation before retrying.
+        continue;
     }
     if (result.status == fluss::BoundedReadStatus::TimedOut) {
-        continue;  // Check query cancellation before retrying.
+        continue;
     }
     if (result.status == fluss::BoundedReadStatus::Finished) {
+        finished = true;
         break;
     }
     process(result.batch->GetArrowRecordBatch());
+}
+if (!finished) {
+    throw std::runtime_error("Bounded read exceeded its execution deadline");
 }
 ```
 
@@ -101,14 +107,15 @@ table.NewScan().CreateRecordBatchLogReader(
 ```
 
 `CollectAllBatches(timeout_ms, out)` is available when materializing the complete bounded result
-is preferred. This operation is not atomic: it appends complete batches to `out` as they arrive,
-so `out` may contain a partial result when the supplied budget elapses. In that case it returns a
-retriable `REQUEST_TIME_OUT`; only an `Ok()` result means every stopping offset has been reached.
-The timeout never splits an individual Arrow batch, and calling the method again with the same
-reader and `out` resumes after the batches already returned. The timeout applies to one invocation
-only; callers that retry must enforce an overall query deadline or cancellation condition, since
-unconditional retries can continue forever. `NextBatch()` reports timeout separately from
-completion so engines can periodically check cancellation.
+is preferred. `timeout_ms` is the total execution budget for the whole call, so callers should
+normally pass the query's remaining execution time and call the method once. It appends complete
+batches to `out` as they arrive. If the budget expires before every stopping offset is reached, it
+stops collecting and returns a retriable `REQUEST_TIME_OUT`; `out` may contain a partial result,
+and only an `Ok()` result means the bounded result is complete. The timeout is checked between
+complete Arrow batches and never splits a batch already being returned. The reader remains valid
+after timeout if a caller has an explicit resume policy, but unconditional retry is not the
+intended usage. `NextBatch()` remains the per-poll API for engines that need to check cancellation
+between batches.
 
 ## TODO
 

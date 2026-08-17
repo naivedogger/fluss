@@ -178,6 +178,8 @@ TEST_F(LogTableTest, RecordBatchLogReaderUntilOffsets) {
     auto& conn = connection();
 
     constexpr int32_t kNumBuckets = 3;
+    // The stopping offset below is deliberately unreachable, so this only
+    // controls how quickly the timeout path is exercised.
     constexpr int64_t kCollectAllTimeoutMs = 200;
     fluss::TablePath table_path("fluss", "test_record_batch_log_reader_offsets_cpp");
     auto schema = fluss::Schema::NewBuilder()
@@ -304,8 +306,8 @@ TEST_F(LogTableTest, RecordBatchLogReaderUntilOffsets) {
         EXPECT_EQ(result.batch, nullptr);
     }
 
-    // CollectAllBatches appends to the output, preserving previously collected
-    // batches when a caller resumes after a timeout.
+    // CollectAllBatches appends to the output instead of clearing batches that
+    // the caller collected earlier.
     {
         const std::vector<fluss::RecordBatchLogReadRange> bucket_range = {
             {fluss::TableBucket{table_id, 0}, 1, latest_offsets.at(0)}};

@@ -169,19 +169,22 @@ for (int32_t bucket_id : bucket_ids) {
 fluss::RecordBatchLogReader reader;
 table.NewScan().CreateRecordBatchLogReader(ranges, reader);
 
-while (true) {
+const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+bool finished = false;
+while (std::chrono::steady_clock::now() < deadline) {
     fluss::RecordBatchReadResult result;
     auto read_result = reader.NextBatch(1000, result);
     if (!read_result.Ok()) {
         if (!read_result.IsRetriable()) {
             throw std::runtime_error(read_result.error_message);
         }
-        continue;  // Retriable: check query cancellation before retrying.
+        continue;
     }
     if (result.status == fluss::BoundedReadStatus::TimedOut) {
-        continue;  // Check query cancellation before retrying.
+        continue;
     }
     if (result.status == fluss::BoundedReadStatus::Finished) {
+        finished = true;
         break;
     }
 
@@ -189,6 +192,9 @@ while (true) {
               << " base_offset=" << result.batch->GetBaseOffset()
               << " last_offset=" << result.batch->GetLastOffset()
               << " rows=" << result.batch->NumRows() << std::endl;
+}
+if (!finished) {
+    throw std::runtime_error("Bounded read exceeded its execution deadline");
 }
 ```
 
@@ -205,7 +211,9 @@ table.NewScan().CreateRecordBatchLogReader(
     admin, assigned_buckets,
     fluss::TimestampRange{starting_timestamp_ms, stopping_timestamp_ms}, reader);
 
-while (true) {
+const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+bool finished = false;
+while (std::chrono::steady_clock::now() < deadline) {
     fluss::RecordBatchReadResult result;
     auto read_result = reader.NextBatch(1000, result);
     if (!read_result.Ok()) {
@@ -218,9 +226,13 @@ while (true) {
         continue;
     }
     if (result.status == fluss::BoundedReadStatus::Finished) {
+        finished = true;
         break;
     }
     process(result.batch->GetArrowRecordBatch());
+}
+if (!finished) {
+    throw std::runtime_error("Bounded read exceeded its execution deadline");
 }
 ```
 
@@ -238,21 +250,12 @@ fluss::RecordBatchLogReader latest_reader;
 std::move(latest_scanner).CreateRecordBatchLogReaderUntilLatest(admin, latest_reader);
 
 fluss::ArrowRecordBatches batches;
-const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-bool completed = false;
-while (!query_cancelled() && std::chrono::steady_clock::now() < deadline) {
-    auto collect_result = latest_reader.CollectAllBatches(1000, batches);
-    if (collect_result.Ok()) {
-        completed = true;
-        break;
-    }
-    if (collect_result.error_code != fluss::ErrorCode::REQUEST_TIME_OUT) {
-        throw std::runtime_error(collect_result.error_message);
-    }
-    // The per-call timeout returned control; the next iteration may resume.
-}
-if (!completed) {
-    throw std::runtime_error("Bounded read cancelled or exceeded its overall deadline");
+// Use the remaining query execution time as the budget for the whole collection.
+auto collect_result = latest_reader.CollectAllBatches(30000, batches);
+if (!collect_result.Ok()) {
+    // `batches` may be partial. Propagate the timeout/error instead of treating
+    // it as a complete bounded result or retrying unconditionally.
+    throw std::runtime_error(collect_result.error_message);
 }
 ```
 
@@ -263,10 +266,15 @@ unavailable after it is moved into the reader.
 
 `CollectAllBatches()` is not all-or-nothing. It appends complete batches to its output while
 reading, so a `REQUEST_TIME_OUT` result may leave `batches` partially populated. Only an `Ok()`
-result means all stopping offsets have been reached. The timeout never splits an individual Arrow
-batch, and retrying with the same reader and output continues after the batches already returned.
-The timeout applies to one `CollectAllBatches()` invocation, not the whole retry loop, so every
-retry loop must have an overall deadline or cancellation condition.
+result means all stopping offsets have been reached.
+
+The supplied timeout is the total execution budget for the whole `CollectAllBatches()` call, not a
+per-batch polling timeout. Once the budget expires, the method stops collecting and returns
+`REQUEST_TIME_OUT`; it does not internally retry with a fresh budget. The timeout is checked
+between complete Arrow batches and never splits a batch already being returned. The reader remains
+valid after timeout, but applications should normally propagate the incomplete result. Resuming
+with the same reader and output should only be done as an explicit higher-level policy with its own
+deadline.
 
 :::
 

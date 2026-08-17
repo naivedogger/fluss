@@ -1936,16 +1936,18 @@ class RecordBatchLogReader {
     /// subscribed bucket reached its stopping offset.
     Result NextBatch(int64_t timeout_ms, RecordBatchReadResult& out);
 
-    /// Drains remaining batches until every stopping offset is reached or the
-    /// total budget of timeout_ms elapses. Batches are *appended* to `out`, so a
-    /// timed-out call can be resumed by calling again with the same `out`.
-    /// This operation is not atomic: on timeout, `out` may contain a partial set
-    /// of complete batches. Only an `Ok()` result means every stopping offset has
-    /// been reached. The timeout never splits a returned Arrow batch; the reader
-    /// stays valid and a retry continues after the batches already appended.
-    /// The timeout result is a retriable REQUEST_TIME_OUT. `timeout_ms` bounds
-    /// one invocation only; callers that retry must enforce their own overall
-    /// deadline or cancellation condition to avoid retrying indefinitely.
+    /// Drains remaining batches using timeout_ms as the total execution budget
+    /// for this invocation. Callers should normally pass the query's remaining
+    /// execution time and invoke this method once.
+    /// Batches are *appended* to `out`. If the budget expires before every
+    /// stopping offset is reached, the method stops collecting and returns a
+    /// retriable REQUEST_TIME_OUT; `out` may then contain a partial set of
+    /// complete batches. Only an `Ok()` result means the bounded result is
+    /// complete. The timeout is checked between complete Arrow batches and never
+    /// splits a batch already being returned.
+    /// The reader remains valid after timeout, but retrying is an explicit caller
+    /// policy rather than part of this operation; callers should not retry
+    /// indefinitely.
     Result CollectAllBatches(int64_t timeout_ms, ArrowRecordBatches& out);
 
    private:
