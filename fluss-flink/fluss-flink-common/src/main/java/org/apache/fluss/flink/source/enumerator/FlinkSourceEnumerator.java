@@ -665,6 +665,7 @@ public class FlinkSourceEnumerator
             addSplitToPendingAssignments(unassignedSplits);
         }
 
+        boolean restoredBoundedPartitionSet = bounded && initialDiscoveryFinished;
         if (isPartitioned) {
             if (streaming) {
                 if (lakeSource != null) {
@@ -680,7 +681,12 @@ public class FlinkSourceEnumerator
                     }
                 }
 
-                if (isPeriodicPartitionDiscoveryEnabled()) {
+                if (restoredBoundedPartitionSet) {
+                    LOG.info(
+                            "Skipping partition discovery for restored bounded source of table {}.",
+                            tablePath);
+                    assignPendingSplits(context.registeredReaders().keySet());
+                } else if (isPeriodicPartitionDiscoveryEnabled()) {
                     // should do partition discovery
                     LOG.info(
                             "Starting the FlussSourceEnumerator for table {} "

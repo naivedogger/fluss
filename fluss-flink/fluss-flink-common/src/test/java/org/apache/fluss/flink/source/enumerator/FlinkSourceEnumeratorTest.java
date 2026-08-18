@@ -1339,12 +1339,17 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     }
 
     @Test
-    void testBoundedStreamingRestoreSignalsNoMoreSplits() throws Throwable {
+    void testBoundedStreamingRestoreSkipsPartitionDiscovery() throws Throwable {
         int numSubtasks = 3;
         createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        Map<Long, String> partitions =
-                waitUntilPartitions(
-                        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), DEFAULT_TABLE_PATH);
+        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        Map<Long, String> partitions = waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
+
+        // Simulate a partition created after the checkpoint represented by the restored state.
+        createPartitions(
+                zooKeeperClient,
+                DEFAULT_TABLE_PATH,
+                Collections.singletonList("created-after-checkpoint"));
 
         try (MockSplitEnumeratorContext<SourceSplitBase> context =
                         new MockSplitEnumeratorContext<>(numSubtasks);
@@ -1378,9 +1383,8 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                 assertThat(context.hasNoMoreSplits(i)).isTrue();
             }
 
-            // The restored partition set has not changed. The one-time discovery must not clear
-            // the restored terminal state.
-            workExecutor.runNextOneTimeCallable();
+            assertThat(workExecutor.getOneTimeCallables()).isEmpty();
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
             for (int i = 0; i < numSubtasks; i++) {
                 assertThat(context.hasNoMoreSplits(i)).isTrue();
             }
