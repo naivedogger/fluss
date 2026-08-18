@@ -289,7 +289,7 @@ public class FlinkConnectorOptionsUtils {
         public long startupTimestampMs;
     }
 
-    /** Fluss bounded options. * */
+    /** Fluss bounded options. */
     public static class BoundedOptions {
         public ScanBoundedMode boundedMode;
         public long boundedTimestampMs;

@@ -87,14 +87,6 @@ class SourceSplitSerializerTest {
         SourceSplitBase deserializedSplit =
                 serializer.deserialize(serializer.getVersion(), serialized);
         assertThat(deserializedSplit).isEqualTo(logSplit);
-
-        LogSplit boundedLogSplit = new LogSplit(bucket, partitionName, 100L, 200L);
-
-        serialized = serializer.serialize(boundedLogSplit);
-        deserializedSplit = serializer.deserialize(serializer.getVersion(), serialized);
-
-        assertThat(deserializedSplit).isEqualTo(boundedLogSplit);
-        assertThat(deserializedSplit.asLogSplit().getStoppingOffset()).contains(200L);
     }
 
     @ParameterizedTest

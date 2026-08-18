@@ -137,14 +137,14 @@ Bounded reads are supported for log tables and the changelog of primary key tabl
 **Example:**
 ```java
 // Replay a bounded time range of the log: from one hour ago up to now
-FlussSource<Order> source = FlussSource.<Order>builder()
+FlussSource<Order> timeRangeSource = FlussSource.<Order>builder()
     .setStartingOffsets(OffsetsInitializer.timestamp(System.currentTimeMillis() - 3600 * 1000))
     .setBounded(OffsetsInitializer.timestamp(System.currentTimeMillis()))
     // other configuration...
     .build();
 
 // Read up to the latest offsets captured at startup and then finish
-FlussSource<Order> source = FlussSource.<Order>builder()
+FlussSource<Order> latestSource = FlussSource.<Order>builder()
     .setStartingOffsets(OffsetsInitializer.earliest())
     .setBounded(OffsetsInitializer.latest())
     // other configuration...

@@ -744,11 +744,7 @@ abstract class BinlogVirtualTableITCase {
                                         + "'scan.bounded.timestamp' = '%d') */",
                                 boundedTimestamp);
         try (CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect()) {
-            List<String> results = new ArrayList<>();
-            while (rowIter.hasNext()) {
-                results.add(rowIter.next().toString());
-            }
-            assertThat(results)
+            assertThat(collectBatchRows(rowIter))
                     .containsExactly(
                             "+I[insert, null, null, 1, Item-1]",
                             "+I[insert, null, null, 2, Item-2]",

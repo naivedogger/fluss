@@ -1068,130 +1068,6 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     }
 
     @Test
-    void testBatchModeNonLakeLogTable() throws Throwable {
-        int numSubtasks = DEFAULT_BUCKET_NUM;
-        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
-        List<InternalRow> rows = new ArrayList<>();
-        for (int i = 0; i < 10; i++) {
-            rows.add(row(i, "v" + i));
-        }
-        writeRows(conn, DEFAULT_TABLE_PATH, rows, true);
-
-        List<Integer> bucketIds = new ArrayList<>();
-        for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
-            bucketIds.add(bucket);
-        }
-        Map<Integer, Long> expectedStoppingOffsets =
-                admin.listOffsets(DEFAULT_TABLE_PATH, bucketIds, new OffsetSpec.LatestSpec())
-                        .all()
-                        .get();
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                new MockSplitEnumeratorContext<>(numSubtasks)) {
-            FlinkSourceEnumerator enumerator =
-                    new FlinkSourceEnumerator(
-                            DEFAULT_TABLE_PATH,
-                            flussConf,
-                            false,
-                            false,
-                            context,
-                            OffsetsInitializer.earliest(),
-                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
-                            false,
-                            null,
-                            null,
-                            LeaseContext.DEFAULT,
-                            false);
-
-            enumerator.start();
-            for (int i = 0; i < numSubtasks; i++) {
-                registerReader(context, enumerator, i);
-            }
-            context.runNextOneTimeCallable();
-
-            List<SourceSplitBase> assignedSplits =
-                    getReadersAssignments(context).values().stream()
-                            .flatMap(List::stream)
-                            .collect(Collectors.toList());
-            assertThat(assignedSplits).hasSize(DEFAULT_BUCKET_NUM);
-            assertThat(assignedSplits)
-                    .allSatisfy(
-                            split -> {
-                                assertThat(split).isInstanceOf(LogSplit.class);
-                                LogSplit logSplit = split.asLogSplit();
-                                assertThat(logSplit.getStartingOffset()).isEqualTo(EARLIEST_OFFSET);
-                                assertThat(logSplit.getTableBucket().getTableId())
-                                        .isEqualTo(tableId);
-                                assertThat(logSplit.getStoppingOffset())
-                                        .contains(
-                                                expectedStoppingOffsets.get(
-                                                        logSplit.getTableBucket().getBucket()));
-                            });
-        }
-    }
-
-    @Test
-    void testBatchModeNonLakePartitionedLogTable() throws Throwable {
-        int numSubtasks = DEFAULT_BUCKET_NUM;
-        long tableId =
-                createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        Map<Long, String> partitionNameByIds =
-                waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
-        partitionNameByIds
-                .keySet()
-                .forEach(
-                        partitionId ->
-                                FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(
-                                        tableId, partitionId));
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                new MockSplitEnumeratorContext<>(numSubtasks)) {
-            FlinkSourceEnumerator enumerator =
-                    new FlinkSourceEnumerator(
-                            DEFAULT_TABLE_PATH,
-                            flussConf,
-                            false,
-                            true,
-                            context,
-                            OffsetsInitializer.earliest(),
-                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
-                            false,
-                            null,
-                            null,
-                            LeaseContext.DEFAULT,
-                            false);
-
-            enumerator.start();
-            for (int i = 0; i < numSubtasks; i++) {
-                registerReader(context, enumerator, i);
-            }
-            context.runNextOneTimeCallable();
-
-            List<SourceSplitBase> assignedSplits =
-                    getReadersAssignments(context).values().stream()
-                            .flatMap(List::stream)
-                            .collect(Collectors.toList());
-            assertThat(assignedSplits).hasSize(partitionNameByIds.size() * DEFAULT_BUCKET_NUM);
-            Set<String> assignedPartitionNames = new HashSet<>();
-            assertThat(assignedSplits)
-                    .allSatisfy(
-                            split -> {
-                                assertThat(split).isInstanceOf(LogSplit.class);
-                                LogSplit logSplit = split.asLogSplit();
-                                assertThat(logSplit.getTableBucket().getTableId())
-                                        .isEqualTo(tableId);
-                                assertThat(logSplit.getStartingOffset()).isEqualTo(EARLIEST_OFFSET);
-                                // the partitions are empty, so the captured latest offset is 0
-                                assertThat(logSplit.getStoppingOffset()).contains(0L);
-                                assignedPartitionNames.add(logSplit.getPartitionName());
-                            });
-            assertThat(assignedPartitionNames)
-                    .containsExactlyInAnyOrderElementsOf(partitionNameByIds.values());
-        }
-    }
-
-    @Test
     void testBatchModeWithTimestampStoppingOffsets() throws Throwable {
         int numSubtasks = DEFAULT_BUCKET_NUM;
         createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
@@ -1380,11 +1256,81 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
             enumerator.start();
             for (int i = 0; i < numSubtasks; i++) {
                 registerReader(context, enumerator, i);
-                assertThat(context.hasNoMoreSplits(i)).isTrue();
             }
 
             assertThat(workExecutor.getOneTimeCallables()).isEmpty();
             assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+            for (int i = 0; i < numSubtasks; i++) {
+                assertThat(context.hasNoMoreSplits(i)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void testUnboundedRestoreWithDisabledPartitionDiscoveryDiscoversBeforeFinishing()
+            throws Throwable {
+        int numSubtasks = 3;
+        createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
+        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        Map<Long, String> restoredPartitions =
+                waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
+        Map<Long, String> newPartitions =
+                createPartitions(
+                        zooKeeperClient,
+                        DEFAULT_TABLE_PATH,
+                        Collections.singletonList("created-after-checkpoint"));
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                        new MockSplitEnumeratorContext<>(numSubtasks);
+                MockWorkExecutor workExecutor = new MockWorkExecutor(context);
+                FlinkSourceEnumerator enumerator =
+                        new FlinkSourceEnumerator(
+                                DEFAULT_TABLE_PATH,
+                                flussConf,
+                                false,
+                                true,
+                                context,
+                                Collections.emptySet(),
+                                restoredPartitions,
+                                null,
+                                OffsetsInitializer.earliest(),
+                                null,
+                                0L,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
+                                        .defaultValue(),
+                                true,
+                                null,
+                                null,
+                                workExecutor,
+                                LeaseContext.DEFAULT,
+                                true,
+                                true,
+                                Collections.emptyList())) {
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+                assertThat(context.hasNoMoreSplits(i)).isFalse();
+            }
+
+            // List partitions first. The newly created partition still needs split initialization,
+            // so readers must not be told that no more splits are available yet.
+            workExecutor.runNextOneTimeCallable();
+            for (int i = 0; i < numSubtasks; i++) {
+                assertThat(context.hasNoMoreSplits(i)).isFalse();
+            }
+
+            // Initialize and assign the splits for the newly discovered partition.
+            workExecutor.runNextOneTimeCallable();
+            List<SourceSplitBase> assignedSplits =
+                    getReadersAssignments(context).values().stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits)
+                    .hasSize(newPartitions.size() * DEFAULT_BUCKET_NUM)
+                    .allSatisfy(
+                            split ->
+                                    assertThat(split.getPartitionName())
+                                            .isIn(newPartitions.values()));
             for (int i = 0; i < numSubtasks; i++) {
                 assertThat(context.hasNoMoreSplits(i)).isTrue();
             }

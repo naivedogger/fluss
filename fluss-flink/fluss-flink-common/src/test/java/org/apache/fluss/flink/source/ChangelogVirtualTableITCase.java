@@ -463,11 +463,7 @@ abstract class ChangelogVirtualTableITCase {
                 "SELECT _change_type, id, name FROM bounded_changelog_test$changelog "
                         + "/*+ OPTIONS('scan.bounded.mode' = 'latest-offset') */";
         try (CloseableIterator<Row> rowIter = tEnv.executeSql(query).collect()) {
-            List<String> results = new ArrayList<>();
-            while (rowIter.hasNext()) {
-                results.add(rowIter.next().toString());
-            }
-            assertThat(results)
+            assertThat(collectBatchRows(rowIter))
                     .containsExactly(
                             "+I[insert, 1, Alice]",
                             "+I[insert, 2, Bob]",

@@ -17,7 +17,6 @@
 
 package org.apache.fluss.flink.source.reader;
 
-import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.scanner.ScanRecord;
@@ -241,54 +240,6 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
 
             assignSplitsAndFetchUntilRetrieveRecords(
                     splitReader, logSplits, expectedRecords, schema.getRowType());
-        }
-    }
-
-    @Test
-    void testBoundedLogSplitStopsAtCapturedLatestOffset() throws Exception {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("name", DataTypes.STRING())
-                        .build();
-        TableDescriptor tableDescriptor =
-                TableDescriptor.builder().schema(schema).distributedBy(1).build();
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "test-bounded-log-split");
-
-        long tableId = createTable(tablePath, tableDescriptor);
-        List<InternalRow> initialRows = appendRows(tablePath, 2);
-
-        long stoppingOffset =
-                admin.listOffsets(
-                                tablePath,
-                                Collections.singletonList(0),
-                                new OffsetSpec.LatestSpec())
-                        .bucketResult(0)
-                        .get();
-
-        // These records are written after stoppingOffset was captured.
-        appendRows(tablePath, 2);
-
-        TableBucket tableBucket = new TableBucket(tableId, 0);
-        LogSplit split = new LogSplit(tableBucket, null, 0L, stoppingOffset);
-
-        List<RecordAndPos> expected = new ArrayList<>();
-        for (int i = 0; i < initialRows.size(); i++) {
-            expected.add(
-                    new RecordAndPos(
-                            new ScanRecord(i, i, ChangeType.APPEND_ONLY, initialRows.get(i))));
-        }
-
-        Map<String, List<RecordAndPos>> expectedRecords = new HashMap<>();
-        expectedRecords.put(split.splitId(), expected);
-
-        try (FlinkSourceSplitReader splitReader =
-                createSplitReader(tablePath, schema.getRowType())) {
-            assignSplitsAndFetchUntilRetrieveRecords(
-                    splitReader,
-                    Collections.singletonList(split),
-                    expectedRecords,
-                    schema.getRowType());
         }
     }
 

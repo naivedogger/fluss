@@ -619,7 +619,7 @@ public class FlinkSourceEnumerator
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.initialDiscoveryFinished = initialDiscoveryFinished;
         this.unassignedSplits = new ArrayList<>(unassignedSplits);
-        this.noMoreNewSplits = initialDiscoveryFinished && hasFiniteSplitSet();
+        this.noMoreNewSplits = initialDiscoveryFinished && isBoundedStreamingRead();
     }
 
     @Override
@@ -665,7 +665,7 @@ public class FlinkSourceEnumerator
             addSplitToPendingAssignments(unassignedSplits);
         }
 
-        boolean restoredBoundedPartitionSet = bounded && initialDiscoveryFinished;
+        boolean restoredBoundedPartitionSet = isBoundedStreamingRead() && initialDiscoveryFinished;
         if (isPartitioned) {
             if (streaming) {
                 if (lakeSource != null) {
@@ -772,7 +772,10 @@ public class FlinkSourceEnumerator
                             + "{} splits already restored from checkpoint state.",
                     tablePath,
                     pendingSplitAssignment.values().stream().mapToInt(List::size).sum());
-            markInitialDiscoveryFinished();
+            initialDiscoveryFinished = true;
+            if (isBoundedStreamingRead()) {
+                noMoreNewSplits = true;
+            }
             return;
         }
 
@@ -861,13 +864,13 @@ public class FlinkSourceEnumerator
             return;
         }
         if (t != null) {
-            if (isPeriodicPartitionDiscoveryEnabled()) {
-                LOG.warn("Failed to list partitions for {}. Will retry.", tablePath, t);
-                return;
+            if (isBoundedStreamingRead()) {
+                throw new FlinkRuntimeException(
+                        String.format("Failed to list partitions for %s", tablePath),
+                        ExceptionUtils.stripCompletionException(t));
             }
-            throw new FlinkRuntimeException(
-                    String.format("Failed to list partitions for %s", tablePath),
-                    ExceptionUtils.stripCompletionException(t));
+            LOG.error("Failed to list partitions for {}", tablePath, t);
+            return;
         }
 
         LOG.debug(
@@ -883,9 +886,10 @@ public class FlinkSourceEnumerator
             // to track), mark initial discovery as finished immediately since there are
             // no splits that need to be persisted in state first.
             if (!initialDiscoveryFinished) {
-                markInitialDiscoveryFinished();
+                initialDiscoveryFinished = true;
             }
-            if (noMoreNewSplits) {
+            if (isBoundedStreamingRead()) {
+                noMoreNewSplits = true;
                 assignPendingSplits(context.registeredReaders().keySet());
             }
             LOG.debug("No partition changes detected for table {}", tablePath);
@@ -1331,13 +1335,8 @@ public class FlinkSourceEnumerator
         return isPartitioned && streaming && !bounded && scanPartitionDiscoveryIntervalMs > 0;
     }
 
-    private boolean hasFiniteSplitSet() {
-        return !isPeriodicPartitionDiscoveryEnabled();
-    }
-
-    private void markInitialDiscoveryFinished() {
-        initialDiscoveryFinished = true;
-        noMoreNewSplits = hasFiniteSplitSet();
+    private boolean isBoundedStreamingRead() {
+        return streaming && bounded;
     }
 
     private void handleSplitsAdd(List<SourceSplitBase> splits, Throwable t) {
@@ -1345,7 +1344,7 @@ public class FlinkSourceEnumerator
             if (isPeriodicPartitionDiscoveryEnabled()) {
                 // it means continuously read new partition splits, not throw exception, temporally
                 // warn it to avoid job fail. TODO: fix me in #288
-                LOG.warn("Failed to list splits for {}. Will retry.", tablePath, t);
+                LOG.warn("Failed to list splits for {}.", tablePath, t);
                 return;
             } else {
                 throw new FlinkRuntimeException(
@@ -1354,7 +1353,7 @@ public class FlinkSourceEnumerator
             }
         }
 
-        markInitialDiscoveryFinished();
+        initialDiscoveryFinished = true;
         if (pendingHybridLakeFlussSplits != null) {
             // removed from the pendingHybridLakeFlussSplits since this split already be moved to
             // unassignedSplits
@@ -1373,6 +1372,16 @@ public class FlinkSourceEnumerator
                         ? "null"
                         : pendingHybridLakeFlussSplits.size());
 
+        if (isPartitioned) {
+            if (!streaming || bounded || scanPartitionDiscoveryIntervalMs <= 0) {
+                // A batch or bounded streaming read has a finite split set. An unbounded streaming
+                // read also has a finite split set when periodic partition discovery is disabled.
+                noMoreNewSplits = true;
+            }
+        } else {
+            // A non-partitioned table only adds splits once.
+            noMoreNewSplits = true;
+        }
         doHandleSplitsAdd(splits);
     }
 
