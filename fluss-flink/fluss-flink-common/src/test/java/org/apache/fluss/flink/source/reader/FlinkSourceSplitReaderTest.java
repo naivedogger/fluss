@@ -387,15 +387,13 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
         long tableId =
                 createTable(
                         tablePath,
-                        TableDescriptor.builder().schema(schema).distributedBy(4).build());
+                        TableDescriptor.builder().schema(schema).distributedBy(3).build());
 
-        // create three bounded empty splits and one unbounded split
+        // create two empty splits with log start offset equal to end offset
         LogSplit split1 = new LogSplit(new TableBucket(tableId, 0), null, 0, 0);
         LogSplit split2 = new LogSplit(new TableBucket(tableId, 1), null, 0, 0);
-        LogSplit split3 = new LogSplit(new TableBucket(tableId, 2), null, EARLIEST_OFFSET, 0);
-        LogSplit split4 = new LogSplit(new TableBucket(tableId, 3), null, EARLIEST_OFFSET);
-
-        List<SourceSplitBase> subscribeSplits = Arrays.asList(split1, split2, split3, split4);
+        LogSplit split3 = new LogSplit(new TableBucket(tableId, 2), null, EARLIEST_OFFSET);
+        List<SourceSplitBase> subscribeSplits = Arrays.asList(split1, split2, split3);
 
         try (FlinkSourceSplitReader splitReader =
                 createSplitReader(tablePath, schema.getRowType())) {
@@ -403,10 +401,9 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
 
             // fetch records
             RecordsWithSplitIds<RecordAndPos> records = splitReader.fetch();
-            // finished splits should be split1, split2, split3
+            // finished splits should be split1,split2
             assertThat(records.finishedSplits())
-                    .containsExactlyInAnyOrder(
-                            split1.splitId(), split2.splitId(), split3.splitId());
+                    .containsExactlyInAnyOrder(split1.splitId(), split2.splitId());
         }
     }
 

@@ -258,7 +258,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
             Optional<Long> stoppingOffsetOpt = logSplit.getStoppingOffset();
             if (stoppingOffsetOpt.isPresent()) {
                 Long stoppingOffset = stoppingOffsetOpt.get();
-                if (stoppingOffset == 0 || startingOffset >= stoppingOffset) {
+                if (startingOffset >= stoppingOffset) {
                     // is empty log splits as no log record can be fetched
                     emptyLogSplits.add(split.splitId());
                     isEmptyLogSplit = true;
@@ -468,25 +468,19 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
             splitIdByTableBucket.put(scanBucket, splitId);
             tableScanBuckets.add(scanBucket);
             List<ScanRecord> bucketScanRecords = scanRecords.records(scanBucket);
-            ScanRecord lastRecord = null;
             if (!bucketScanRecords.isEmpty()) {
-                lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
+                final ScanRecord lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
                 // We keep the maximum message timestamp in the fetch for calculating lags
                 maxConsumerRecordTimestampInFetch =
                         Math.max(maxConsumerRecordTimestampInFetch, lastRecord.timestamp());
-            }
 
-            Long consumedUpToOffset = scanRecords.consumedUpToOffset(scanBucket);
-            boolean reachedStoppingOffset =
-                    consumedUpToOffset != null
-                            ? consumedUpToOffset >= stoppingOffset
-                            : lastRecord != null && lastRecord.logOffset() >= stoppingOffset - 1;
-            // After consuming up to the stopping offset, the split reader should not continue
-            // fetching because the record at the stopping offset is outside this split and may not
-            // exist. This also handles batches whose records are all filtered out.
-            if (reachedStoppingOffset) {
-                stoppingOffsets.put(scanBucket, stoppingOffset);
-                finishedSplits.add(splitId);
+                // After processing a record with offset of "stoppingOffset - 1", the split reader
+                // should not continue fetching because the record with stoppingOffset may not
+                // exist. Keep polling will just block forever
+                if (lastRecord.logOffset() >= stoppingOffset - 1) {
+                    stoppingOffsets.put(scanBucket, stoppingOffset);
+                    finishedSplits.add(splitId);
+                }
             }
             splitRecords.put(splitId, toRecordAndPos(bucketScanRecords.iterator()));
         }

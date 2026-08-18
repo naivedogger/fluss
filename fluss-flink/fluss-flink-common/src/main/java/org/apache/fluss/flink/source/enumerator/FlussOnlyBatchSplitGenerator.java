@@ -146,10 +146,9 @@ final class FlussOnlyBatchSplitGenerator {
 
             Long logStoppingOffset = stoppingOffsets.get(bucketId);
             checkState(
-                    logStoppingOffset != null && logStoppingOffset >= 0,
-                    "Stopping offset for bucket %s must be non-negative, but was %s.",
-                    bucketId,
-                    logStoppingOffset);
+                    logStoppingOffset != null,
+                    "Stopping offset should be present for bucket %s.",
+                    bucketId);
             splits.add(
                     new HybridSnapshotLogSplit(
                             tableBucket,
@@ -191,10 +190,9 @@ final class FlussOnlyBatchSplitGenerator {
                         "Starting offset should be present for bucket %s.",
                         bucketId);
                 checkState(
-                        stoppingOffset != null && stoppingOffset >= 0,
-                        "Stopping offset for bucket %s must be non-negative, but was %s.",
-                        bucketId,
-                        stoppingOffset);
+                        stoppingOffset != null,
+                        "Stopping offset should be present for bucket %s.",
+                        bucketId);
                 splits.add(
                         new LogSplit(
                                 new TableBucket(tableInfo.getTableId(), partitionId, bucketId),
