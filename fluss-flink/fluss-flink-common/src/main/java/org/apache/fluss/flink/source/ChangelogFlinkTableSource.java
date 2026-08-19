@@ -225,7 +225,7 @@ public class ChangelogFlinkTableSource
 
         // Create the source with the changelog deserialization schema
         OffsetsInitializer stoppingOffsetsInitializer =
-                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions);
+                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(streaming, boundedOptions);
         FlinkSource<RowData> source =
                 new FlinkSource<>(
                         flussConfig,
@@ -241,6 +241,7 @@ public class ChangelogFlinkTableSource
                         logRecordBatchFilter,
                         offsetsInitializer,
                         stoppingOffsetsInitializer,
+                        FlinkConnectorOptionsUtils.toBoundedness(streaming, boundedOptions),
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
                         new ChangelogDeserializationSchema(),

@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.source;
 
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
@@ -75,10 +76,11 @@ public class FlinkSource<OUT>
     @Nullable private final FlinkRecordEmitter.OutputProjection<OUT> outputProjection;
     @Nullable private final int[] projectedFields;
     protected final OffsetsInitializer offsetsInitializer;
-    @Nullable protected final OffsetsInitializer stoppingOffsetsInitializer;
+    protected final OffsetsInitializer stoppingOffsetsInitializer;
     protected final long scanPartitionDiscoveryIntervalMs;
     protected final int splitPerAssignmentBatchSize;
     private final boolean streaming;
+    private final Boundedness boundedness;
     private final FlussDeserializationSchema<OUT> deserializationSchema;
     @Nullable private final Predicate partitionFilters;
     @Nullable private final LakeSource<LakeSplit> lakeSource;
@@ -209,7 +211,8 @@ public class FlinkSource<OUT>
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
@@ -245,7 +248,8 @@ public class FlinkSource<OUT>
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
@@ -265,7 +269,8 @@ public class FlinkSource<OUT>
             @Nullable int[] projectedFields,
             @Nullable Predicate logRecordBatchFilter,
             OffsetsInitializer offsetsInitializer,
-            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            OffsetsInitializer stoppingOffsetsInitializer,
+            Boundedness boundedness,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             FlussDeserializationSchema<OUT> deserializationSchema,
@@ -283,6 +288,7 @@ public class FlinkSource<OUT>
         this.logRecordBatchFilter = logRecordBatchFilter;
         this.offsetsInitializer = offsetsInitializer;
         this.stoppingOffsetsInitializer = stoppingOffsetsInitializer;
+        this.boundedness = boundedness;
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.deserializationSchema = deserializationSchema;
@@ -296,12 +302,7 @@ public class FlinkSource<OUT>
 
     @Override
     public Boundedness getBoundedness() {
-        // User-supplied stopping offsets make the source bounded even in streaming execution
-        // mode (bounded streaming read), so that the job finishes once all splits reach their
-        // stopping offsets.
-        return (streaming && stoppingOffsetsInitializer == null)
-                ? Boundedness.CONTINUOUS_UNBOUNDED
-                : Boundedness.BOUNDED;
+        return boundedness;
     }
 
     @Override
@@ -315,6 +316,7 @@ public class FlinkSource<OUT>
                 splitEnumeratorContext,
                 offsetsInitializer,
                 stoppingOffsetsInitializer,
+                boundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -347,6 +349,7 @@ public class FlinkSource<OUT>
                 remainingHybridLakeFlussSplits,
                 offsetsInitializer,
                 stoppingOffsetsInitializer,
+                boundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,

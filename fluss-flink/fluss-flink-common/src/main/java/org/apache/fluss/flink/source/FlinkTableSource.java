@@ -454,6 +454,7 @@ public class FlinkTableSource
                         logRecordBatchFilter,
                         offsetsInitializer,
                         stoppingOffsetsInitializer,
+                        FlinkConnectorOptionsUtils.toBoundedness(streaming, boundedOptions),
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
                         new RowDataDeserializationSchema(),
@@ -505,19 +506,12 @@ public class FlinkTableSource
         }
     }
 
-    /**
-     * Creates the stopping offsets initializer from the configured bounded options, or returns null
-     * to fall back to the default behavior, i.e. no stopping offsets in streaming execution mode
-     * and the latest offsets captured at startup in batch execution mode.
-     */
-    @Nullable
+    /** Creates the stopping offsets initializer from the configured bounded options. */
     private OffsetsInitializer createStoppingOffsetsInitializer() {
-        OffsetsInitializer stoppingOffsetsInitializer =
-                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions);
-        if (stoppingOffsetsInitializer != null) {
+        if (boundedOptions.boundedMode != FlinkConnectorOptions.ScanBoundedMode.UNBOUNDED) {
             validateBoundedModeSupported();
         }
-        return stoppingOffsetsInitializer;
+        return FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(streaming, boundedOptions);
     }
 
     private void validateBoundedModeSupported() {

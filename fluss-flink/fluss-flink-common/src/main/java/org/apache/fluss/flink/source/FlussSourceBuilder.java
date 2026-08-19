@@ -21,6 +21,7 @@ import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.initializer.LatestOffsetsInitializer;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.client.initializer.TimestampOffsetsInitializer;
@@ -36,6 +37,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.types.RowType;
 
+import org.apache.flink.api.connector.source.Boundedness;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,8 +88,13 @@ public class FlussSourceBuilder<OUT> {
     private Long scanPartitionDiscoveryIntervalMs;
     private Integer splitPerAssignmentBatchSize;
     private OffsetsInitializer offsetsInitializer;
-    private OffsetsInitializer stoppingOffsetsInitializer;
+    private OffsetsInitializer stoppingOffsetsInitializer = new NoStoppingOffsetsInitializer();
+
+    // This flag preserves the execution semantics of the legacy no-argument setBounded(), which
+    // switches the source to batch mode. The parameterized setBounded(OffsetsInitializer) keeps
+    // streaming execution semantics and only makes the source bounded.
     private boolean bounded;
+    private Boundedness boundedness = Boundedness.CONTINUOUS_UNBOUNDED;
     private FlussDeserializationSchema<OUT> deserializationSchema;
 
     private String bootstrapServers;
@@ -180,12 +187,17 @@ public class FlussSourceBuilder<OUT> {
      * Builds a bounded source for batch execution. The source reads up to the latest offsets at job
      * startup and then finishes; combined with the default {@link OffsetsInitializer#full()} on a
      * datalake-enabled table this performs a bounded union read of the lake snapshot and the Fluss
-     * log. If not called, the source is unbounded (streaming).
+     * log.
+     *
+     * <p>This overload is retained for compatibility and switches the source to batch execution
+     * semantics. Use {@link #setBounded(OffsetsInitializer)} for a bounded streaming read.
      *
      * @return this builder
      */
     public FlussSourceBuilder<OUT> setBounded() {
         this.bounded = true;
+        this.boundedness = Boundedness.BOUNDED;
+        this.stoppingOffsetsInitializer = OffsetsInitializer.latest();
         return this;
     }
 
@@ -211,6 +223,7 @@ public class FlussSourceBuilder<OUT> {
                         + "supported as stopping offsets, but was %s.",
                 checkedStoppingOffsetsInitializer.getClass().getName());
         this.stoppingOffsetsInitializer = checkedStoppingOffsetsInitializer;
+        this.boundedness = Boundedness.BOUNDED;
         return this;
     }
 
@@ -398,7 +411,7 @@ public class FlussSourceBuilder<OUT> {
         //    reading phase has no bounded end.
         //  - The datalake union read (full startup mode on a datalake-enabled table) is not
         //    supported, because lake splits have no bounded end.
-        if (stoppingOffsetsInitializer != null) {
+        if (!bounded && boundedness == Boundedness.BOUNDED) {
             if (hasPrimaryKey && fullStartup) {
                 throw new IllegalArgumentException(
                         String.format(
@@ -452,6 +465,7 @@ public class FlussSourceBuilder<OUT> {
                 logRecordBatchFilter,
                 offsetsInitializer,
                 stoppingOffsetsInitializer,
+                boundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,

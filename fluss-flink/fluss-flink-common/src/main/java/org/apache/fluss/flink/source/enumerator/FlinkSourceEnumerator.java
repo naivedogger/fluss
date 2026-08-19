@@ -56,6 +56,7 @@ import org.apache.fluss.utils.PartitionUtils;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
@@ -151,15 +152,9 @@ public class FlinkSourceEnumerator
     private final long scanPartitionDiscoveryIntervalMs;
 
     private final boolean streaming;
+    private final Boundedness boundedness;
     private final OffsetsInitializer startingOffsetsInitializer;
     private final OffsetsInitializer stoppingOffsetsInitializer;
-
-    /**
-     * Whether this read is bounded, i.e. batch execution mode or a bounded streaming read with
-     * user-supplied stopping offsets. A bounded read only performs a one-time partition discovery,
-     * since partitions created after startup are outside the bounded range captured at startup.
-     */
-    private final boolean bounded;
 
     /**
      * The offsets initializer used for partitions discovered after the initial startup. Following
@@ -275,7 +270,8 @@ public class FlinkSourceEnumerator
                 isPartitioned,
                 context,
                 startingOffsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                 streaming,
@@ -306,7 +302,8 @@ public class FlinkSourceEnumerator
                 isPartitioned,
                 context,
                 startingOffsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -323,7 +320,8 @@ public class FlinkSourceEnumerator
             boolean isPartitioned,
             SplitEnumeratorContext<SourceSplitBase> context,
             OffsetsInitializer startingOffsetsInitializer,
-            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            OffsetsInitializer stoppingOffsetsInitializer,
+            Boundedness boundedness,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             boolean streaming,
@@ -342,6 +340,7 @@ public class FlinkSourceEnumerator
                 null,
                 startingOffsetsInitializer,
                 stoppingOffsetsInitializer,
+                boundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -422,7 +421,8 @@ public class FlinkSourceEnumerator
                 assignedPartitions,
                 pendingHybridLakeFlussSplits,
                 startingOffsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -445,7 +445,8 @@ public class FlinkSourceEnumerator
             Map<Long, String> assignedPartitions,
             List<SourceSplitBase> pendingHybridLakeFlussSplits,
             OffsetsInitializer startingOffsetsInitializer,
-            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            OffsetsInitializer stoppingOffsetsInitializer,
+            Boundedness boundedness,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             boolean streaming,
@@ -466,6 +467,7 @@ public class FlinkSourceEnumerator
                 pendingHybridLakeFlussSplits,
                 startingOffsetsInitializer,
                 stoppingOffsetsInitializer,
+                boundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -505,7 +507,8 @@ public class FlinkSourceEnumerator
                 assignedPartitions,
                 pendingHybridLakeFlussSplits,
                 startingOffsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                 streaming,
@@ -548,7 +551,8 @@ public class FlinkSourceEnumerator
                 assignedPartitions,
                 pendingHybridLakeFlussSplits,
                 startingOffsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 streaming,
@@ -571,7 +575,8 @@ public class FlinkSourceEnumerator
             Map<Long, String> assignedPartitions,
             List<SourceSplitBase> pendingHybridLakeFlussSplits,
             OffsetsInitializer startingOffsetsInitializer,
-            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            OffsetsInitializer stoppingOffsetsInitializer,
+            Boundedness boundedness,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             boolean streaming,
@@ -602,16 +607,9 @@ public class FlinkSourceEnumerator
         this.newDiscoveryOffsetsInitializer = OffsetsInitializer.earliest();
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
         this.streaming = streaming;
+        this.boundedness = checkNotNull(boundedness);
         this.partitionFilters = partitionFilters;
-        // The read is bounded if it runs in batch execution mode, or if the user supplied
-        // stopping offsets for a bounded streaming read.
-        this.bounded = !streaming || stoppingOffsetsInitializer != null;
-        this.stoppingOffsetsInitializer =
-                stoppingOffsetsInitializer != null
-                        ? stoppingOffsetsInitializer
-                        : (streaming
-                                ? new NoStoppingOffsetsInitializer()
-                                : OffsetsInitializer.latest());
+        this.stoppingOffsetsInitializer = checkNotNull(stoppingOffsetsInitializer);
         this.lakeSource = lakeSource;
         this.workerExecutor = workerExecutor;
         this.leaseContext = leaseContext;
@@ -619,7 +617,6 @@ public class FlinkSourceEnumerator
         this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.initialDiscoveryFinished = initialDiscoveryFinished;
         this.unassignedSplits = new ArrayList<>(unassignedSplits);
-        this.noMoreNewSplits = initialDiscoveryFinished && isBoundedStreamingRead();
     }
 
     @Override
@@ -665,7 +662,6 @@ public class FlinkSourceEnumerator
             addSplitToPendingAssignments(unassignedSplits);
         }
 
-        boolean restoredBoundedPartitionSet = isBoundedStreamingRead() && initialDiscoveryFinished;
         if (isPartitioned) {
             if (streaming) {
                 if (lakeSource != null) {
@@ -681,12 +677,7 @@ public class FlinkSourceEnumerator
                     }
                 }
 
-                if (restoredBoundedPartitionSet) {
-                    LOG.info(
-                            "Skipping partition discovery for restored bounded source of table {}.",
-                            tablePath);
-                    assignPendingSplits(context.registeredReaders().keySet());
-                } else if (isPeriodicPartitionDiscoveryEnabled()) {
+                if (isPeriodicPartitionDiscoveryEnabled()) {
                     // should do partition discovery
                     LOG.info(
                             "Starting the FlussSourceEnumerator for table {} "
@@ -700,9 +691,7 @@ public class FlinkSourceEnumerator
                             0,
                             scanPartitionDiscoveryIntervalMs);
                 } else {
-                    // Call once for a bounded read or when partition discovery is disabled. For
-                    // a bounded read, partitions created after startup are outside the bounded
-                    // range captured at startup, so continuous discovery is not needed.
+                    // Call once for a bounded read or when partition discovery is disabled.
                     LOG.info(
                             "Starting the FlussSourceEnumerator for table {} without partition discovery.",
                             tablePath);
@@ -773,7 +762,7 @@ public class FlinkSourceEnumerator
                     tablePath,
                     pendingSplitAssignment.values().stream().mapToInt(List::size).sum());
             initialDiscoveryFinished = true;
-            if (isBoundedStreamingRead()) {
+            if (!isPeriodicPartitionDiscoveryEnabled()) {
                 noMoreNewSplits = true;
             }
             return;
@@ -864,11 +853,6 @@ public class FlinkSourceEnumerator
             return;
         }
         if (t != null) {
-            if (isBoundedStreamingRead()) {
-                throw new FlinkRuntimeException(
-                        String.format("Failed to list partitions for %s", tablePath),
-                        ExceptionUtils.stripCompletionException(t));
-            }
             LOG.error("Failed to list partitions for {}", tablePath, t);
             return;
         }
@@ -888,7 +872,7 @@ public class FlinkSourceEnumerator
             if (!initialDiscoveryFinished) {
                 initialDiscoveryFinished = true;
             }
-            if (isBoundedStreamingRead()) {
+            if (!isPeriodicPartitionDiscoveryEnabled()) {
                 noMoreNewSplits = true;
                 assignPendingSplits(context.registeredReaders().keySet());
             }
@@ -1332,11 +1316,10 @@ public class FlinkSourceEnumerator
     }
 
     private boolean isPeriodicPartitionDiscoveryEnabled() {
-        return isPartitioned && streaming && !bounded && scanPartitionDiscoveryIntervalMs > 0;
-    }
-
-    private boolean isBoundedStreamingRead() {
-        return streaming && bounded;
+        return isPartitioned
+                && streaming
+                && boundedness == Boundedness.CONTINUOUS_UNBOUNDED
+                && scanPartitionDiscoveryIntervalMs > 0;
     }
 
     private void handleSplitsAdd(List<SourceSplitBase> splits, Throwable t) {
@@ -1372,14 +1355,7 @@ public class FlinkSourceEnumerator
                         ? "null"
                         : pendingHybridLakeFlussSplits.size());
 
-        if (isPartitioned) {
-            if (!streaming || bounded || scanPartitionDiscoveryIntervalMs <= 0) {
-                // A batch or bounded streaming read has a finite split set. An unbounded streaming
-                // read also has a finite split set when periodic partition discovery is disabled.
-                noMoreNewSplits = true;
-            }
-        } else {
-            // A non-partitioned table only adds splits once.
+        if (!isPeriodicPartitionDiscoveryEnabled()) {
             noMoreNewSplits = true;
         }
         doHandleSplitsAdd(splits);

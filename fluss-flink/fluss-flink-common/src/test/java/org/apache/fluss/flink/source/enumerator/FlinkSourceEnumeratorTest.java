@@ -58,13 +58,13 @@ import org.apache.fluss.shaded.guava32.com.google.common.collect.ImmutableMap;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 
+import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.ReaderInfo;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitsAssignment;
 import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -83,8 +83,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
@@ -152,6 +150,9 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
 
             Map<Integer, List<SourceSplitBase>> actualAssignment = getReadersAssignments(context);
             assertThat(actualAssignment).isEqualTo(expectedAssignment);
+            for (int i = 0; i < numSubtasks; i++) {
+                assertThat(context.hasNoMoreSplits(i)).isTrue();
+            }
         }
     }
 
@@ -1107,6 +1108,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                             context,
                             OffsetsInitializer.earliest(),
                             OffsetsInitializer.timestamp(stoppingTimestamp),
+                            Boundedness.BOUNDED,
                             DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
                             FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                             false,
@@ -1166,6 +1168,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                             context,
                             OffsetsInitializer.earliest(),
                             OffsetsInitializer.latest(),
+                            Boundedness.BOUNDED,
                             DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
                             FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                             true,
@@ -1215,168 +1218,6 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     }
 
     @Test
-    void testBoundedStreamingRestoreSkipsPartitionDiscovery() throws Throwable {
-        int numSubtasks = 3;
-        createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        Map<Long, String> partitions = waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
-
-        // Simulate a partition created after the checkpoint represented by the restored state.
-        createPartitions(
-                zooKeeperClient,
-                DEFAULT_TABLE_PATH,
-                Collections.singletonList("created-after-checkpoint"));
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                        new MockSplitEnumeratorContext<>(numSubtasks);
-                MockWorkExecutor workExecutor = new MockWorkExecutor(context);
-                FlinkSourceEnumerator enumerator =
-                        new FlinkSourceEnumerator(
-                                DEFAULT_TABLE_PATH,
-                                flussConf,
-                                false,
-                                true,
-                                context,
-                                Collections.emptySet(),
-                                partitions,
-                                null,
-                                OffsetsInitializer.earliest(),
-                                OffsetsInitializer.latest(),
-                                DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
-                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
-                                        .defaultValue(),
-                                true,
-                                null,
-                                null,
-                                workExecutor,
-                                LeaseContext.DEFAULT,
-                                true,
-                                true,
-                                Collections.emptyList())) {
-            enumerator.start();
-            for (int i = 0; i < numSubtasks; i++) {
-                registerReader(context, enumerator, i);
-            }
-
-            assertThat(workExecutor.getOneTimeCallables()).isEmpty();
-            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
-            for (int i = 0; i < numSubtasks; i++) {
-                assertThat(context.hasNoMoreSplits(i)).isTrue();
-            }
-        }
-    }
-
-    @Test
-    void testUnboundedRestoreWithDisabledPartitionDiscoveryDiscoversBeforeFinishing()
-            throws Throwable {
-        int numSubtasks = 3;
-        createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        Map<Long, String> restoredPartitions =
-                waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
-        Map<Long, String> newPartitions =
-                createPartitions(
-                        zooKeeperClient,
-                        DEFAULT_TABLE_PATH,
-                        Collections.singletonList("created-after-checkpoint"));
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                        new MockSplitEnumeratorContext<>(numSubtasks);
-                MockWorkExecutor workExecutor = new MockWorkExecutor(context);
-                FlinkSourceEnumerator enumerator =
-                        new FlinkSourceEnumerator(
-                                DEFAULT_TABLE_PATH,
-                                flussConf,
-                                false,
-                                true,
-                                context,
-                                Collections.emptySet(),
-                                restoredPartitions,
-                                null,
-                                OffsetsInitializer.earliest(),
-                                null,
-                                0L,
-                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
-                                        .defaultValue(),
-                                true,
-                                null,
-                                null,
-                                workExecutor,
-                                LeaseContext.DEFAULT,
-                                true,
-                                true,
-                                Collections.emptyList())) {
-            enumerator.start();
-            for (int i = 0; i < numSubtasks; i++) {
-                registerReader(context, enumerator, i);
-                assertThat(context.hasNoMoreSplits(i)).isFalse();
-            }
-
-            // List partitions first. The newly created partition still needs split initialization,
-            // so readers must not be told that no more splits are available yet.
-            workExecutor.runNextOneTimeCallable();
-            for (int i = 0; i < numSubtasks; i++) {
-                assertThat(context.hasNoMoreSplits(i)).isFalse();
-            }
-
-            // Initialize and assign the splits for the newly discovered partition.
-            workExecutor.runNextOneTimeCallable();
-            List<SourceSplitBase> assignedSplits =
-                    getReadersAssignments(context).values().stream()
-                            .flatMap(List::stream)
-                            .collect(Collectors.toList());
-            assertThat(assignedSplits)
-                    .hasSize(newPartitions.size() * DEFAULT_BUCKET_NUM)
-                    .allSatisfy(
-                            split ->
-                                    assertThat(split.getPartitionName())
-                                            .isIn(newPartitions.values()));
-            for (int i = 0; i < numSubtasks; i++) {
-                assertThat(context.hasNoMoreSplits(i)).isTrue();
-            }
-        }
-    }
-
-    @Test
-    void testBoundedNonPartitionedRestoreSignalsNoMoreSplits() throws Exception {
-        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_LOG_TABLE_DESCRIPTOR);
-        LogSplit restoredSplit = new LogSplit(new TableBucket(tableId, 0), null, 0L, 0L);
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                        new MockSplitEnumeratorContext<>(1);
-                MockWorkExecutor workExecutor = new MockWorkExecutor(context);
-                FlinkSourceEnumerator enumerator =
-                        new FlinkSourceEnumerator(
-                                DEFAULT_TABLE_PATH,
-                                flussConf,
-                                false,
-                                false,
-                                context,
-                                Collections.emptySet(),
-                                Collections.emptyMap(),
-                                null,
-                                OffsetsInitializer.earliest(),
-                                OffsetsInitializer.latest(),
-                                DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
-                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
-                                        .defaultValue(),
-                                true,
-                                null,
-                                null,
-                                workExecutor,
-                                LeaseContext.DEFAULT,
-                                true,
-                                true,
-                                Collections.singletonList(restoredSplit))) {
-            enumerator.start();
-            registerReader(context, enumerator, 0);
-
-            assertThat(getReadersAssignments(context).get(0)).containsExactly(restoredSplit);
-            assertThat(context.hasNoMoreSplits(0)).isTrue();
-        }
-    }
-
-    @Test
     void testBoundedStreamingReadWithNoPartitionsSignalsNoMoreSplits() throws Throwable {
         TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded-empty-partition-table");
         Schema schema =
@@ -1403,6 +1244,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                 context,
                                 OffsetsInitializer.earliest(),
                                 OffsetsInitializer.latest(),
+                                Boundedness.BOUNDED,
                                 DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
                                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
                                         .defaultValue(),
@@ -1420,69 +1262,6 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
             assertThat(context.getSplitsAssignmentSequence()).isEmpty();
             assertThat(context.hasNoMoreSplits(0)).isTrue();
             assertThat(context.hasNoMoreSplits(1)).isTrue();
-        }
-    }
-
-    @Test
-    void testBoundedPartitionDiscoveryFailureFailsJob() throws Exception {
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded-partition-discovery-failure");
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("partition_col", DataTypes.STRING())
-                        .build();
-        TableDescriptor tableDescriptor =
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .partitionedBy("partition_col")
-                        .distributedBy(DEFAULT_BUCKET_NUM, "id")
-                        .build();
-        createTable(tablePath, tableDescriptor);
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                new MockSplitEnumeratorContext<>(1)) {
-            WorkerExecutor failingWorkerExecutor =
-                    new WorkerExecutor(context) {
-                        @Override
-                        public <T> void callAsync(
-                                Callable<T> callable, BiConsumer<T, Throwable> handler) {
-                            context.callAsync(
-                                    () -> {
-                                        throw new FlinkRuntimeException(
-                                                "expected partition discovery failure");
-                                    },
-                                    handler);
-                        }
-                    };
-
-            try (FlinkSourceEnumerator enumerator =
-                    new FlinkSourceEnumerator(
-                            tablePath,
-                            flussConf,
-                            false,
-                            true,
-                            context,
-                            Collections.emptySet(),
-                            Collections.emptyMap(),
-                            null,
-                            OffsetsInitializer.earliest(),
-                            OffsetsInitializer.latest(),
-                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
-                            FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
-                            true,
-                            null,
-                            null,
-                            failingWorkerExecutor,
-                            LeaseContext.DEFAULT,
-                            false,
-                            false,
-                            Collections.emptyList())) {
-                enumerator.start();
-
-                assertThatThrownBy(context::runNextOneTimeCallable)
-                        .isInstanceOf(FlinkRuntimeException.class)
-                        .hasMessage("Failed to list partitions for " + tablePath);
-            }
         }
     }
 

@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.utils;
 
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
@@ -25,6 +26,7 @@ import org.apache.fluss.flink.FlinkConnectorOptions.ScanStartupMode;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.metadata.MergeEngineType;
 
+import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.api.ValidationException;
@@ -128,15 +130,11 @@ public class FlinkConnectorOptionsUtils {
         return options;
     }
 
-    /**
-     * Creates the stopping offsets initializer from the given bounded options, or returns null for
-     * the unbounded mode.
-     */
-    @Nullable
+    /** Creates the stopping offsets initializer from the given bounded options. */
     public static OffsetsInitializer toStoppingOffsetsInitializer(BoundedOptions boundedOptions) {
         switch (boundedOptions.boundedMode) {
             case UNBOUNDED:
-                return null;
+                return new NoStoppingOffsetsInitializer();
             case LATEST_OFFSET:
                 return OffsetsInitializer.latest();
             case TIMESTAMP:
@@ -145,6 +143,27 @@ public class FlinkConnectorOptionsUtils {
                 throw new IllegalArgumentException(
                         "Unsupported bounded mode: " + boundedOptions.boundedMode);
         }
+    }
+
+    /**
+     * Creates the stopping offsets initializer for the execution mode and bounded options.
+     *
+     * <p>Batch execution remains bounded by the latest offsets when no explicit bounded mode is
+     * configured.
+     */
+    public static OffsetsInitializer toStoppingOffsetsInitializer(
+            boolean streaming, BoundedOptions boundedOptions) {
+        if (!streaming && boundedOptions.boundedMode == ScanBoundedMode.UNBOUNDED) {
+            return OffsetsInitializer.latest();
+        }
+        return toStoppingOffsetsInitializer(boundedOptions);
+    }
+
+    /** Returns the Flink source boundedness for the execution mode and bounded options. */
+    public static Boundedness toBoundedness(boolean streaming, BoundedOptions boundedOptions) {
+        return streaming && boundedOptions.boundedMode == ScanBoundedMode.UNBOUNDED
+                ? Boundedness.CONTINUOUS_UNBOUNDED
+                : Boundedness.BOUNDED;
     }
 
     public static List<String> getBucketKeys(ReadableConfig tableOptions) {

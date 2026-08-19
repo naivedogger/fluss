@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.source;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.config.Configuration;
@@ -29,6 +30,8 @@ import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.types.RowType;
+
+import org.apache.flink.api.connector.source.Boundedness;
 
 import javax.annotation.Nullable;
 
@@ -115,7 +118,8 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
-                null,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
@@ -132,7 +136,8 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
             @Nullable int[] projectedFields,
             @Nullable Predicate logRecordBatchFilter,
             OffsetsInitializer offsetsInitializer,
-            @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+            OffsetsInitializer stoppingOffsetsInitializer,
+            Boundedness boundedness,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
             FlussDeserializationSchema<OUT> deserializationSchema,
@@ -149,6 +154,7 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 logRecordBatchFilter,
                 validateBatchStartupMode(offsetsInitializer, hasPrimaryKey, streaming, tablePath),
                 stoppingOffsetsInitializer,
+                boundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,

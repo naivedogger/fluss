@@ -169,7 +169,7 @@ public class BinlogFlinkTableSource
 
         // Create the source with the binlog deserialization schema
         OffsetsInitializer stoppingOffsetsInitializer =
-                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(boundedOptions);
+                FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(streaming, boundedOptions);
         FlinkSource<RowData> source =
                 new FlinkSource<>(
                         flussConfig,
@@ -181,6 +181,7 @@ public class BinlogFlinkTableSource
                         null,
                         offsetsInitializer,
                         stoppingOffsetsInitializer,
+                        FlinkConnectorOptionsUtils.toBoundedness(streaming, boundedOptions),
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,
                         new BinlogDeserializationSchema(),
