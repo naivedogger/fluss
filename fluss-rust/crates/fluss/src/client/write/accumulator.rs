@@ -286,7 +286,7 @@ impl RecordAccumulator {
         let schema_id = table_info.schema_id;
 
         let mut batch: WriteBatch = match record.record() {
-            Record::Log(_) => ArrowLog(ArrowLogWriteBatch::new(
+            Record::Log(_) => ArrowLog(ArrowLogWriteBatch::new_with_statistics(
                 self.batch_id.fetch_add(1, Ordering::Relaxed),
                 Arc::clone(physical_table_path),
                 schema_id,
@@ -296,6 +296,7 @@ impl RecordAccumulator {
                 matches!(&record.record, Record::Log(LogWriteRecord::RecordBatch(_))),
                 alloc_size,
                 compression_ratio_estimator,
+                table_info.get_statistics_column_indexes()?,
             )?),
             Record::Kv(kv_record) => Kv(KvWriteBatch::new(
                 self.batch_id.fetch_add(1, Ordering::Relaxed),

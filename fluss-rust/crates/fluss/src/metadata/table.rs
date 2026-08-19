@@ -1144,6 +1144,13 @@ pub struct TableConfig {
     pub properties: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatisticsColumns {
+    Disabled,
+    All,
+    Specified(Vec<String>),
+}
+
 impl TableConfig {
     pub fn from_properties(properties: HashMap<String, String>) -> Self {
         TableConfig { properties }
@@ -1194,6 +1201,21 @@ impl TableConfig {
             .map(String::as_str)
             .unwrap_or(DEFAULT_LOG_FORMAT);
         LogFormat::parse(log_format)
+    }
+
+    pub(crate) fn get_statistics_columns(&self) -> StatisticsColumns {
+        match self.properties.get("table.statistics.columns") {
+            None => StatisticsColumns::Disabled,
+            Some(columns) if columns == "*" => StatisticsColumns::All,
+            Some(columns) => StatisticsColumns::Specified(
+                columns
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|column| !column.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+        }
     }
 
     pub fn get_auto_partition_strategy(&self) -> AutoPartitionStrategy {
@@ -1357,6 +1379,48 @@ impl TableInfo {
 
     pub fn get_table_config(&self) -> &TableConfig {
         &self.table_config
+    }
+
+    pub(crate) fn get_statistics_column_indexes(&self) -> Result<Option<Vec<usize>>> {
+        let indexes = match self.table_config.get_statistics_columns() {
+            StatisticsColumns::Disabled => return Ok(None),
+            StatisticsColumns::All => self
+                .row_type
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, field)| {
+                    field
+                        .data_type()
+                        .is_supported_statistics_type()
+                        .then_some(index)
+                })
+                .collect(),
+            StatisticsColumns::Specified(columns) => {
+                if columns.is_empty() {
+                    return Err(Error::invalid_table(
+                        "Statistics columns configuration cannot be empty".to_string(),
+                    ));
+                }
+                let mut indexes = Vec::with_capacity(columns.len());
+                for column in columns {
+                    let index = self.row_type.get_field_index(&column).ok_or_else(|| {
+                        Error::invalid_table(format!(
+                            "Statistics column '{column}' does not exist in the table schema"
+                        ))
+                    })?;
+                    let data_type = self.row_type.fields()[index].data_type();
+                    if !data_type.is_supported_statistics_type() {
+                        return Err(Error::invalid_table(format!(
+                            "Statistics column '{column}' of type {data_type} is not supported"
+                        )));
+                    }
+                    indexes.push(index);
+                }
+                indexes
+            }
+        };
+        Ok(Some(indexes))
     }
 
     pub fn get_custom_properties(&self) -> &HashMap<String, String> {
@@ -1671,5 +1735,88 @@ mod tests {
             0,
         );
         assert!(table_info.is_auto_partitioned());
+    }
+
+    fn statistics_table_info(statistics_columns: Option<&str>) -> TableInfo {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .column("tags", DataTypes::array(DataTypes::string()))
+            .build()
+            .unwrap();
+        let mut descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), vec![]);
+        if let Some(columns) = statistics_columns {
+            descriptor = descriptor.property("table.statistics.columns", columns);
+        }
+        TableInfo::of(
+            TablePath::new("db".to_string(), "statistics_table".to_string()),
+            1,
+            1,
+            descriptor.build().unwrap(),
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn test_statistics_columns_disabled() {
+        assert_eq!(
+            statistics_table_info(None)
+                .get_statistics_column_indexes()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_statistics_columns_all_excludes_unsupported_types() {
+        assert_eq!(
+            statistics_table_info(Some("*"))
+                .get_statistics_column_indexes()
+                .unwrap(),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn test_statistics_columns_specified() {
+        assert_eq!(
+            statistics_table_info(Some(" name, id "))
+                .get_statistics_column_indexes()
+                .unwrap(),
+            Some(vec![1, 0])
+        );
+    }
+
+    #[test]
+    fn test_statistics_columns_reject_invalid_configuration() {
+        let empty = statistics_table_info(Some(" , "))
+            .get_statistics_column_indexes()
+            .unwrap_err();
+        assert!(
+            empty
+                .to_string()
+                .contains("Statistics columns configuration cannot be empty")
+        );
+
+        let unknown = statistics_table_info(Some("unknown"))
+            .get_statistics_column_indexes()
+            .unwrap_err();
+        assert!(
+            unknown
+                .to_string()
+                .contains("Statistics column 'unknown' does not exist")
+        );
+
+        let unsupported = statistics_table_info(Some("tags"))
+            .get_statistics_column_indexes()
+            .unwrap_err();
+        assert!(
+            unsupported
+                .to_string()
+                .contains("Statistics column 'tags' of type ARRAY<STRING> is not supported")
+        );
     }
 }

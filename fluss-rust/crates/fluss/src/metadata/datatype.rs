@@ -94,6 +94,26 @@ impl DataType {
         }
     }
 
+    pub(crate) fn is_supported_statistics_type(&self) -> bool {
+        matches!(
+            self,
+            DataType::Boolean(_)
+                | DataType::TinyInt(_)
+                | DataType::SmallInt(_)
+                | DataType::Int(_)
+                | DataType::BigInt(_)
+                | DataType::Float(_)
+                | DataType::Double(_)
+                | DataType::String(_)
+                | DataType::Char(_)
+                | DataType::Decimal(_)
+                | DataType::Date(_)
+                | DataType::Time(_)
+                | DataType::Timestamp(_)
+                | DataType::TimestampLTz(_)
+        )
+    }
+
     /// Structural equality ignoring the outermost nullability flag at
     /// every level. Equivalent to comparing `as_non_nullable()` on both
     /// sides but without the recursive clone.

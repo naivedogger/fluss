@@ -255,16 +255,44 @@ impl ArrowLogWriteBatch {
         write_limit: usize,
         compression_ratio_estimator: Arc<ArrowCompressionRatioEstimator>,
     ) -> Result<Self> {
+        Self::new_with_statistics(
+            batch_id,
+            physical_table_path,
+            schema_id,
+            arrow_compression_info,
+            row_type,
+            create_ms,
+            to_append_record_batch,
+            write_limit,
+            compression_ratio_estimator,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_statistics(
+        batch_id: i64,
+        physical_table_path: Arc<PhysicalTablePath>,
+        schema_id: i32,
+        arrow_compression_info: ArrowCompressionInfo,
+        row_type: &RowType,
+        create_ms: i64,
+        to_append_record_batch: bool,
+        write_limit: usize,
+        compression_ratio_estimator: Arc<ArrowCompressionRatioEstimator>,
+        statistics_column_indexes: Option<Vec<usize>>,
+    ) -> Result<Self> {
         let base = InnerWriteBatch::new(batch_id, physical_table_path, create_ms);
         Ok(Self {
             write_batch: base,
-            arrow_builder: MemoryLogRecordsArrowBuilder::new(
+            arrow_builder: MemoryLogRecordsArrowBuilder::new_with_statistics(
                 schema_id,
                 row_type,
                 to_append_record_batch,
                 arrow_compression_info,
                 write_limit,
                 compression_ratio_estimator,
+                statistics_column_indexes,
             )?,
             built_records: None,
         })
