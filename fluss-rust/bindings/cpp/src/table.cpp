@@ -2307,21 +2307,19 @@ Result RecordBatchLogReader::CollectAllBatches(int64_t timeout_ms, ArrowRecordBa
         if (!result.Ok()) {
             return result;
         }
+        // Finished means every stopping offset was reached, so the collected
+        // result is complete. Report success even when the budget expired in
+        // the meantime; a complete result must never surface as a timeout.
         if (step.status == BoundedReadStatus::Finished) {
-            if (std::chrono::steady_clock::now() - start >= timeout) {
-                return timeout_result();
-            }
             return utils::make_ok();
         }
         if (step.status == BoundedReadStatus::TimedOut) {
             return timeout_result();
         }
-        // BatchAvailable
+        // BatchAvailable: keep the batch and let the next iteration re-check
+        // the remaining budget.
         if (step.batch) {
             out.batches.push_back(std::move(step.batch));
-        }
-        if (std::chrono::steady_clock::now() - start >= timeout) {
-            return timeout_result();
         }
     }
 }

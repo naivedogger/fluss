@@ -1930,7 +1930,8 @@ class RecordBatchLogReader {
 
     bool Available() const;
 
-    /// Waits up to timeout_ms for the next batch.
+    /// Waits up to timeout_ms for the next batch. A non-positive timeout_ms
+    /// polls without waiting.
     /// Read `out.status` only when the returned `Result` is `Ok()`.
     /// TimedOut leaves the reader valid for a later retry; Finished means every
     /// subscribed bucket reached its stopping offset.
@@ -1944,7 +1945,8 @@ class RecordBatchLogReader {
     /// retriable REQUEST_TIME_OUT; `out` may then contain a partial set of
     /// complete batches. Only an `Ok()` result means the bounded result is
     /// complete. The timeout is checked between complete Arrow batches and never
-    /// splits a batch already being returned.
+    /// splits a batch already being returned. A non-positive timeout_ms returns
+    /// REQUEST_TIME_OUT without attempting a read.
     /// The reader remains valid after timeout, but retrying is an explicit caller
     /// policy rather than part of this operation; callers should not retry
     /// indefinitely.

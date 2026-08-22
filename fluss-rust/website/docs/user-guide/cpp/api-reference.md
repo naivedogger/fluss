@@ -277,7 +277,10 @@ forever. A timeout does not exhaust the reader; callers may check cancellation a
 Callers should normally pass the query's remaining execution time and invoke the method once. It
 appends complete batches to `out` as they arrive. If the budget expires, collection stops,
 `out` may contain only part of the bounded result, and the method returns a retriable
-`REQUEST_TIME_OUT`. Only an `Ok()` result means every stopping offset has been reached.
+`REQUEST_TIME_OUT`. Only an `Ok()` result means every stopping offset has been reached. Reaching
+every stopping offset always reports `Ok()`, even when the budget expired in the meantime, so a
+complete result never surfaces as a timeout. A non-positive `timeout_ms` returns
+`REQUEST_TIME_OUT` without attempting a read.
 
 The timeout is checked between complete Arrow batches and never splits a batch already being
 returned. The method does not internally retry after the budget is exhausted. The reader remains
