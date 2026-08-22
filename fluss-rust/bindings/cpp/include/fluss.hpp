@@ -1701,9 +1701,6 @@ class TableScan {
 
     std::vector<size_t> ResolveNameProjection() const;
     Result DoCreateScanner(LogScanner& out, bool is_record_batch);
-    Result ResolveTimestampRanges(Admin& admin, const std::vector<TableBucket>& buckets,
-                                  const TimestampRange& range,
-                                  std::vector<RecordBatchLogReadRange>& out) const;
 
     ffi::Table* table_{nullptr};
     std::vector<size_t> projection_;
@@ -1874,6 +1871,18 @@ class LogScanner {
     Result CreateRecordBatchLogReaderUntilOffsets(const std::vector<ReaderStopOffset>& offsets,
                                                   RecordBatchLogReader& out);
 
+    /// Creates a bounded reader from per-bucket offset ranges, subscribing
+    /// every non-empty range. Range validation happens in the SDK.
+    Result CreateRecordBatchLogReaderFromRanges(const std::vector<RecordBatchLogReadRange>& ranges,
+                                                RecordBatchLogReader& out);
+
+    /// Creates a bounded reader for a timestamp range over the given buckets.
+    /// The SDK resolves both timestamps to per-bucket offsets.
+    Result CreateRecordBatchLogReaderBetweenTimestamps(const Admin& admin,
+                                                       const std::vector<TableBucket>& buckets,
+                                                       const TimestampRange& range,
+                                                       RecordBatchLogReader& out);
+
     ffi::LogScanner* scanner_{nullptr};
 };
 
@@ -1912,6 +1921,19 @@ class RecordBatchLogScanner {
    private:
     friend class TableScan;
     explicit RecordBatchLogScanner(ffi::LogScanner* scanner) noexcept;
+
+    /// Transfers this scanner into a reader bounded by per-bucket offset ranges,
+    /// subscribing every non-empty range. The scanner becomes unavailable on
+    /// success.
+    Result CreateRecordBatchLogReaderFromRanges(const std::vector<RecordBatchLogReadRange>& ranges,
+                                                RecordBatchLogReader& out) &&;
+
+    /// Transfers this scanner into a reader bounded by a timestamp range over
+    /// the given buckets. The scanner becomes unavailable on success.
+    Result CreateRecordBatchLogReaderBetweenTimestamps(const Admin& admin,
+                                                       const std::vector<TableBucket>& buckets,
+                                                       const TimestampRange& range,
+                                                       RecordBatchLogReader& out) &&;
 
     LogScanner scanner_;
 };

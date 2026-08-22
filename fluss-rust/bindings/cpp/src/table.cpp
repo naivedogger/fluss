@@ -20,11 +20,7 @@
 #include <arrow/c/bridge.h>
 
 #include <cassert>
-#include <chrono>
 #include <ctime>
-#include <map>
-#include <set>
-#include <tuple>
 
 #include "ffi_converter.hpp"
 #include "fluss.hpp"
@@ -1292,206 +1288,24 @@ Result TableScan::DoCreateScanner(LogScanner& out, bool is_record_batch) {
 
 Result TableScan::CreateRecordBatchLogReader(const std::vector<RecordBatchLogReadRange>& ranges,
                                              RecordBatchLogReader& out) {
-    if (table_ == nullptr) {
-        return utils::make_client_error("Table not available");
-    }
-
-    auto info = utils::from_ffi_table_info(table_->get_table_info_from_table());
-    std::vector<BucketSubscription> bucket_subscriptions;
-    std::vector<PartitionBucketSubscription> partition_subscriptions;
-    std::vector<ReaderStopOffset> stopping_offsets;
-    std::set<std::tuple<int64_t, int64_t, int32_t>> seen_buckets;
-
-    for (const auto& range : ranges) {
-        if (range.bucket.table_id != info.table_id) {
-            return utils::make_client_error("Read range table_id does not match the scanned table");
-        }
-        if (range.starting_offset > range.stopping_offset) {
-            return utils::make_client_error(
-                "Read range starting_offset must not exceed stopping_offset");
-        }
-
-        const int64_t partition_id = range.bucket.partition_id.value_or(-1);
-        if (!seen_buckets.emplace(range.bucket.table_id, partition_id, range.bucket.bucket_id)
-                 .second) {
-            return utils::make_client_error("Duplicate bucket in bounded read ranges");
-        }
-        if (info.is_partitioned != range.bucket.partition_id.has_value()) {
-            return utils::make_client_error(
-                info.is_partitioned
-                    ? "Partitioned table read ranges must include partition_id"
-                    : "Non-partitioned table read ranges must not include partition_id");
-        }
-
-        // Empty ranges complete immediately and do not need a subscription.
-        if (range.starting_offset == range.stopping_offset) {
-            continue;
-        }
-
-        if (info.is_partitioned) {
-            partition_subscriptions.push_back(
-                {*range.bucket.partition_id, range.bucket.bucket_id, range.starting_offset});
-        } else {
-            bucket_subscriptions.push_back({range.bucket.bucket_id, range.starting_offset});
-        }
-        stopping_offsets.push_back({range.bucket, range.stopping_offset});
-    }
-
     RecordBatchLogScanner scanner;
     auto result = CreateRecordBatchLogScanner(scanner);
     if (!result.Ok()) {
         return result;
     }
-
-    if (!partition_subscriptions.empty()) {
-        result = scanner.SubscribePartitionBuckets(partition_subscriptions);
-    } else if (!bucket_subscriptions.empty()) {
-        result = scanner.Subscribe(bucket_subscriptions);
-    }
-    if (!result.Ok()) {
-        return result;
-    }
-
-    return std::move(scanner).CreateRecordBatchLogReaderUntilOffsets(stopping_offsets, out);
-}
-
-Result TableScan::ResolveTimestampRanges(Admin& admin, const std::vector<TableBucket>& buckets,
-                                         const TimestampRange& range,
-                                         std::vector<RecordBatchLogReadRange>& out) const {
-    if (table_ == nullptr) {
-        return utils::make_client_error("Table not available");
-    }
-    if (!admin.Available()) {
-        return utils::make_client_error("Admin not available");
-    }
-    if (range.starting_timestamp_ms > range.stopping_timestamp_ms) {
-        return utils::make_client_error(
-            "starting_timestamp_ms must not exceed stopping_timestamp_ms");
-    }
-
-    auto info = utils::from_ffi_table_info(table_->get_table_info_from_table());
-    auto ffi_path = table_->get_table_path();
-    TablePath table_path(std::string(ffi_path.database_name), std::string(ffi_path.table_name));
-    std::set<std::tuple<int64_t, int64_t, int32_t>> seen_buckets;
-    out.clear();
-    if (buckets.empty()) {
-        return utils::make_ok();
-    }
-
-    if (!info.is_partitioned) {
-        std::vector<int32_t> bucket_ids;
-        for (const auto& bucket : buckets) {
-            if (bucket.table_id != info.table_id || bucket.partition_id.has_value()) {
-                return utils::make_client_error(
-                    "Timestamp range contains a bucket from another table or partition mode");
-            }
-            if (!seen_buckets.emplace(bucket.table_id, -1, bucket.bucket_id).second) {
-                return utils::make_client_error("Duplicate bucket in timestamp read range");
-            }
-            bucket_ids.push_back(bucket.bucket_id);
-        }
-
-        std::unordered_map<int32_t, int64_t> starting_offsets;
-        std::unordered_map<int32_t, int64_t> stopping_offsets;
-        auto result =
-            admin.ListOffsets(table_path, bucket_ids,
-                              OffsetSpec::Timestamp(range.starting_timestamp_ms), starting_offsets);
-        if (!result.Ok()) {
-            return result;
-        }
-        result =
-            admin.ListOffsets(table_path, bucket_ids,
-                              OffsetSpec::Timestamp(range.stopping_timestamp_ms), stopping_offsets);
-        if (!result.Ok()) {
-            return result;
-        }
-
-        for (const auto& bucket : buckets) {
-            auto start = starting_offsets.find(bucket.bucket_id);
-            auto stop = stopping_offsets.find(bucket.bucket_id);
-            if (start == starting_offsets.end() || stop == stopping_offsets.end()) {
-                return utils::make_client_error(
-                    "Timestamp offset lookup did not return every requested bucket");
-            }
-            out.push_back({bucket, start->second, stop->second});
-        }
-        return utils::make_ok();
-    }
-
-    std::vector<PartitionInfo> partition_infos;
-    auto result = admin.ListPartitionInfos(table_path, partition_infos);
-    if (!result.Ok()) {
-        return result;
-    }
-    std::unordered_map<int64_t, std::string> partition_names;
-    for (const auto& partition : partition_infos) {
-        partition_names.emplace(partition.partition_id, partition.partition_name);
-    }
-
-    std::map<int64_t, std::vector<int32_t>> bucket_ids_by_partition;
-    for (const auto& bucket : buckets) {
-        if (bucket.table_id != info.table_id || !bucket.partition_id.has_value()) {
-            return utils::make_client_error(
-                "Timestamp range contains a bucket from another table or partition mode");
-        }
-        if (!seen_buckets.emplace(bucket.table_id, *bucket.partition_id, bucket.bucket_id).second) {
-            return utils::make_client_error("Duplicate bucket in timestamp read range");
-        }
-        bucket_ids_by_partition[*bucket.partition_id].push_back(bucket.bucket_id);
-    }
-
-    std::map<std::pair<int64_t, int32_t>, int64_t> starting_offsets;
-    std::map<std::pair<int64_t, int32_t>, int64_t> stopping_offsets;
-    for (const auto& entry : bucket_ids_by_partition) {
-        const int64_t partition_id = entry.first;
-        const auto& bucket_ids = entry.second;
-        auto partition_name = partition_names.find(partition_id);
-        if (partition_name == partition_names.end()) {
-            return utils::make_client_error("Unknown partition_id in timestamp read range");
-        }
-
-        std::unordered_map<int32_t, int64_t> partition_starts;
-        std::unordered_map<int32_t, int64_t> partition_stops;
-        result = admin.ListPartitionOffsets(table_path, partition_name->second, bucket_ids,
-                                            OffsetSpec::Timestamp(range.starting_timestamp_ms),
-                                            partition_starts);
-        if (!result.Ok()) {
-            return result;
-        }
-        result = admin.ListPartitionOffsets(table_path, partition_name->second, bucket_ids,
-                                            OffsetSpec::Timestamp(range.stopping_timestamp_ms),
-                                            partition_stops);
-        if (!result.Ok()) {
-            return result;
-        }
-        for (int32_t bucket_id : bucket_ids) {
-            auto start = partition_starts.find(bucket_id);
-            auto stop = partition_stops.find(bucket_id);
-            if (start == partition_starts.end() || stop == partition_stops.end()) {
-                return utils::make_client_error(
-                    "Timestamp offset lookup did not return every requested partition bucket");
-            }
-            starting_offsets[{partition_id, bucket_id}] = start->second;
-            stopping_offsets[{partition_id, bucket_id}] = stop->second;
-        }
-    }
-
-    for (const auto& bucket : buckets) {
-        const auto key = std::make_pair(*bucket.partition_id, bucket.bucket_id);
-        out.push_back({bucket, starting_offsets.at(key), stopping_offsets.at(key)});
-    }
-    return utils::make_ok();
+    return std::move(scanner).CreateRecordBatchLogReaderFromRanges(ranges, out);
 }
 
 Result TableScan::CreateRecordBatchLogReader(Admin& admin, const std::vector<TableBucket>& buckets,
                                              const TimestampRange& range,
                                              RecordBatchLogReader& out) {
-    std::vector<RecordBatchLogReadRange> ranges;
-    auto result = ResolveTimestampRanges(admin, buckets, range, ranges);
+    RecordBatchLogScanner scanner;
+    auto result = CreateRecordBatchLogScanner(scanner);
     if (!result.Ok()) {
         return result;
     }
-    return CreateRecordBatchLogReader(ranges, out);
+    return std::move(scanner).CreateRecordBatchLogReaderBetweenTimestamps(admin, buckets, range,
+                                                                          out);
 }
 
 TableScan& TableScan::Limit(int32_t row_number) {
@@ -2041,6 +1855,10 @@ namespace detail {
 struct ArrowBatchImporter {
     static Result Import(ffi::FfiArrowRecordBatches& src, ArrowRecordBatches& out) {
         out.batches.clear();
+        return ImportAppend(src, out);
+    }
+
+    static Result ImportAppend(ffi::FfiArrowRecordBatches& src, ArrowRecordBatches& out) {
         for (const auto& ffi_batch : src.batches) {
             auto* c_array = reinterpret_cast<struct ArrowArray*>(ffi_batch.array_ptr);
             auto* c_schema = reinterpret_cast<struct ArrowSchema*>(ffi_batch.schema_ptr);
@@ -2155,6 +1973,26 @@ Result RecordBatchLogScanner::CreateRecordBatchLogReaderUntilOffsets(
     return result;
 }
 
+Result RecordBatchLogScanner::CreateRecordBatchLogReaderFromRanges(
+    const std::vector<RecordBatchLogReadRange>& ranges, RecordBatchLogReader& out) && {
+    auto result = scanner_.CreateRecordBatchLogReaderFromRanges(ranges, out);
+    if (result.Ok()) {
+        scanner_ = LogScanner();
+    }
+    return result;
+}
+
+Result RecordBatchLogScanner::CreateRecordBatchLogReaderBetweenTimestamps(
+    const Admin& admin, const std::vector<TableBucket>& buckets, const TimestampRange& range,
+    RecordBatchLogReader& out) && {
+    auto result =
+        scanner_.CreateRecordBatchLogReaderBetweenTimestamps(admin, buckets, range, out);
+    if (result.Ok()) {
+        scanner_ = LogScanner();
+    }
+    return result;
+}
+
 // ============================================================================
 // RecordBatchLogReader
 // ============================================================================
@@ -2196,6 +2034,64 @@ Result LogScanner::CreateRecordBatchLogReaderUntilOffsets(
 
     auto ffi_result =
         scanner_->create_record_batch_log_reader_until_offsets(std::move(ffi_offsets));
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.Destroy();
+        out.reader_ = utils::ptr_from_ffi<ffi::RecordBatchLogReader>(ffi_result);
+    }
+    return result;
+}
+
+Result LogScanner::CreateRecordBatchLogReaderFromRanges(
+    const std::vector<RecordBatchLogReadRange>& ranges, RecordBatchLogReader& out) {
+    if (!Available()) {
+        return utils::make_client_error("LogScanner not available");
+    }
+
+    rust::Vec<ffi::FfiBoundedLogReadRange> ffi_ranges;
+    for (const auto& range : ranges) {
+        ffi::FfiBoundedLogReadRange ffi_range;
+        ffi_range.table_id = range.bucket.table_id;
+        ffi_range.has_partition_id = range.bucket.partition_id.has_value();
+        ffi_range.partition_id = range.bucket.partition_id.value_or(0);
+        ffi_range.bucket_id = range.bucket.bucket_id;
+        ffi_range.starting_offset = range.starting_offset;
+        ffi_range.stopping_offset = range.stopping_offset;
+        ffi_ranges.push_back(ffi_range);
+    }
+
+    auto ffi_result = scanner_->create_record_batch_log_reader_from_ranges(std::move(ffi_ranges));
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.Destroy();
+        out.reader_ = utils::ptr_from_ffi<ffi::RecordBatchLogReader>(ffi_result);
+    }
+    return result;
+}
+
+Result LogScanner::CreateRecordBatchLogReaderBetweenTimestamps(
+    const Admin& admin, const std::vector<TableBucket>& buckets, const TimestampRange& range,
+    RecordBatchLogReader& out) {
+    if (!Available()) {
+        return utils::make_client_error("LogScanner not available");
+    }
+    if (!admin.Available()) {
+        return utils::make_client_error("Admin not available");
+    }
+
+    rust::Vec<ffi::FfiReaderBucket> ffi_buckets;
+    for (const auto& bucket : buckets) {
+        ffi::FfiReaderBucket ffi_bucket;
+        ffi_bucket.table_id = bucket.table_id;
+        ffi_bucket.has_partition_id = bucket.partition_id.has_value();
+        ffi_bucket.partition_id = bucket.partition_id.value_or(0);
+        ffi_bucket.bucket_id = bucket.bucket_id;
+        ffi_buckets.push_back(ffi_bucket);
+    }
+
+    auto ffi_result = scanner_->create_record_batch_log_reader_between_timestamps(
+        *admin.admin_, std::move(ffi_buckets), range.starting_timestamp_ms,
+        range.stopping_timestamp_ms);
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
         out.Destroy();
@@ -2287,40 +2183,27 @@ Result RecordBatchLogReader::CollectAllBatches(int64_t timeout_ms, ArrowRecordBa
         return utils::make_client_error("RecordBatchLogReader not available");
     }
 
-    const auto timeout = std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
-    const auto start = std::chrono::steady_clock::now();
-    const auto timeout_result = [] {
-        return utils::make_error(
-            ErrorCode::REQUEST_TIME_OUT,
-            "CollectAllBatches timed out before every stopping offset was reached");
-    };
-    while (true) {
-        const auto elapsed = std::chrono::steady_clock::now() - start;
-        if (elapsed >= timeout) {
-            return timeout_result();
-        }
-
-        const int64_t remaining_ms =
-            std::chrono::ceil<std::chrono::milliseconds>(timeout - elapsed).count();
-        RecordBatchReadResult step;
-        auto result = NextBatch(remaining_ms, step);
-        if (!result.Ok()) {
-            return result;
-        }
-        // Finished means every stopping offset was reached, so the collected
-        // result is complete. Report success even when the budget expired in
-        // the meantime; a complete result must never surface as a timeout.
-        if (step.status == BoundedReadStatus::Finished) {
+    auto ffi_result = reader_->record_batch_log_reader_collect_all_batches(timeout_ms);
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (!result.Ok()) {
+        return result;
+    }
+    // Batches collected before the budget expired are part of the result, so
+    // they are appended even when the collection is incomplete.
+    result = detail::ArrowBatchImporter::ImportAppend(ffi_result.arrow_batches, out);
+    if (!result.Ok()) {
+        return result;
+    }
+    switch (ffi_result.status) {
+        case static_cast<int32_t>(BoundedReadStatus::Finished):
             return utils::make_ok();
-        }
-        if (step.status == BoundedReadStatus::TimedOut) {
-            return timeout_result();
-        }
-        // BatchAvailable: keep the batch and let the next iteration re-check
-        // the remaining budget.
-        if (step.batch) {
-            out.batches.push_back(std::move(step.batch));
-        }
+        case static_cast<int32_t>(BoundedReadStatus::TimedOut):
+            return utils::make_error(
+                ErrorCode::REQUEST_TIME_OUT,
+                "CollectAllBatches timed out before every stopping offset was reached");
+        default:
+            return utils::make_client_error("Unknown bounded read status: " +
+                                           std::to_string(ffi_result.status));
     }
 }
 

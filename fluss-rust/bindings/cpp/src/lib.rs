@@ -188,6 +188,22 @@ mod ffi {
         offset: i64,
     }
 
+    struct FfiReaderBucket {
+        table_id: i64,
+        has_partition_id: bool,
+        partition_id: i64,
+        bucket_id: i32,
+    }
+
+    struct FfiBoundedLogReadRange {
+        table_id: i64,
+        has_partition_id: bool,
+        partition_id: i64,
+        bucket_id: i32,
+        starting_offset: i64,
+        stopping_offset: i64,
+    }
+
     struct FfiLakeSnapshot {
         snapshot_id: i64,
         bucket_offsets: Vec<FfiBucketOffset>,
@@ -722,11 +738,26 @@ mod ffi {
             self: &LogScanner,
             offsets: Vec<FfiReaderStopOffset>,
         ) -> FfiPtrResult;
+        fn create_record_batch_log_reader_from_ranges(
+            self: &LogScanner,
+            ranges: Vec<FfiBoundedLogReadRange>,
+        ) -> FfiPtrResult;
+        fn create_record_batch_log_reader_between_timestamps(
+            self: &LogScanner,
+            admin: &Admin,
+            buckets: Vec<FfiReaderBucket>,
+            starting_timestamp_ms: i64,
+            stopping_timestamp_ms: i64,
+        ) -> FfiPtrResult;
         fn free_arrow_ffi_structures(array_ptr: usize, schema_ptr: usize);
 
         // RecordBatchLogReader
         unsafe fn delete_record_batch_log_reader(reader: *mut RecordBatchLogReader);
         fn record_batch_log_reader_next_batch(
+            self: &RecordBatchLogReader,
+            timeout_ms: i64,
+        ) -> FfiBoundedReadResult;
+        fn record_batch_log_reader_collect_all_batches(
             self: &RecordBatchLogReader,
             timeout_ms: i64,
         ) -> FfiBoundedReadResult;
@@ -2299,9 +2330,109 @@ impl LogScanner {
             Err(e) => err_ptr_from_core(&e),
         }
     }
+
+    fn create_record_batch_log_reader_from_ranges(
+        &self,
+        ranges: Vec<ffi::FfiBoundedLogReadRange>,
+    ) -> ffi::FfiPtrResult {
+        let ScannerKind::Batch(ref scanner) = self.scanner else {
+            return client_err_ptr("Batch-based scanner not available".to_string());
+        };
+
+        let ranges: Vec<fcore::client::BoundedLogReadRange> = ranges
+            .into_iter()
+            .map(|range| fcore::client::BoundedLogReadRange {
+                bucket: reader_bucket_to_core(
+                    range.table_id,
+                    range.has_partition_id,
+                    range.partition_id,
+                    range.bucket_id,
+                ),
+                starting_offset: range.starting_offset,
+                stopping_offset: range.stopping_offset,
+            })
+            .collect();
+
+        let reader_result = RUNTIME.block_on(fcore::client::RecordBatchLogReader::new_from_ranges(
+            scanner.new_shared_handle(),
+            ranges,
+        ));
+
+        match reader_result {
+            Ok(reader) => {
+                let ptr = Box::into_raw(Box::new(RecordBatchLogReader {
+                    inner: Mutex::new(reader),
+                }));
+                ok_ptr(ptr as usize)
+            }
+            Err(e) => err_ptr_from_core(&e),
+        }
+    }
+
+    fn create_record_batch_log_reader_between_timestamps(
+        &self,
+        admin: &Admin,
+        buckets: Vec<ffi::FfiReaderBucket>,
+        starting_timestamp_ms: i64,
+        stopping_timestamp_ms: i64,
+    ) -> ffi::FfiPtrResult {
+        let ScannerKind::Batch(ref scanner) = self.scanner else {
+            return client_err_ptr("Batch-based scanner not available".to_string());
+        };
+
+        let buckets: Vec<fcore::metadata::TableBucket> = buckets
+            .into_iter()
+            .map(|bucket| {
+                reader_bucket_to_core(
+                    bucket.table_id,
+                    bucket.has_partition_id,
+                    bucket.partition_id,
+                    bucket.bucket_id,
+                )
+            })
+            .collect();
+
+        let reader_result =
+            RUNTIME.block_on(fcore::client::RecordBatchLogReader::new_between_timestamps(
+                scanner.new_shared_handle(),
+                admin.inner.as_ref(),
+                &buckets,
+                starting_timestamp_ms,
+                stopping_timestamp_ms,
+            ));
+
+        match reader_result {
+            Ok(reader) => {
+                let ptr = Box::into_raw(Box::new(RecordBatchLogReader {
+                    inner: Mutex::new(reader),
+                }));
+                ok_ptr(ptr as usize)
+            }
+            Err(e) => err_ptr_from_core(&e),
+        }
+    }
+}
+
+fn reader_bucket_to_core(
+    table_id: i64,
+    has_partition_id: bool,
+    partition_id: i64,
+    bucket_id: i32,
+) -> fcore::metadata::TableBucket {
+    fcore::metadata::TableBucket::new_with_partition(
+        table_id,
+        has_partition_id.then_some(partition_id),
+        bucket_id,
+    )
 }
 
 // RecordBatchLogReader implementation
+
+/// Bounded read statuses shared with the C++ `BoundedReadStatus` enum.
+const BATCH_AVAILABLE: i32 = 0;
+const TIMED_OUT: i32 = 1;
+const FINISHED: i32 = 2;
+
 unsafe fn delete_record_batch_log_reader(reader: *mut RecordBatchLogReader) {
     if !reader.is_null() {
         unsafe {
@@ -2312,10 +2443,6 @@ unsafe fn delete_record_batch_log_reader(reader: *mut RecordBatchLogReader) {
 
 impl RecordBatchLogReader {
     fn record_batch_log_reader_next_batch(&self, timeout_ms: i64) -> ffi::FfiBoundedReadResult {
-        const BATCH_AVAILABLE: i32 = 0;
-        const TIMED_OUT: i32 = 1;
-        const FINISHED: i32 = 2;
-
         let mut reader = self.inner.lock().unwrap();
         let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
         match RUNTIME.block_on(reader.next_batch_with_timeout(timeout)) {
@@ -2329,6 +2456,28 @@ impl RecordBatchLogReader {
             Ok(fcore::client::RecordBatchReadOutcome::Finished) => {
                 empty_bounded_read_result(ok_result(), FINISHED)
             }
+            Err(e) => empty_bounded_read_result(err_from_core_error(&e), FINISHED),
+        }
+    }
+
+    /// Drains the reader under a total time budget. `FINISHED` means the whole
+    /// bounded result was collected; `TIMED_OUT` means the budget expired and
+    /// the returned batches are a partial result.
+    fn record_batch_log_reader_collect_all_batches(
+        &self,
+        timeout_ms: i64,
+    ) -> ffi::FfiBoundedReadResult {
+        let mut reader = self.inner.lock().unwrap();
+        let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+        match RUNTIME.block_on(reader.collect_all_batches_with_timeout(timeout)) {
+            Ok(outcome) => bounded_read_result(
+                types::core_scan_batches_to_ffi(&outcome.batches),
+                if outcome.complete {
+                    FINISHED
+                } else {
+                    TIMED_OUT
+                },
+            ),
             Err(e) => empty_bounded_read_result(err_from_core_error(&e), FINISHED),
         }
     }
