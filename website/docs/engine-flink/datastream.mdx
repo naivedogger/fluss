@@ -95,8 +95,8 @@ The `FlussSourceBuilder` provides several methods for configuring the source con
 * **setProjectedFields(String... projectedFieldNames):** Sets the fields to project from the table (if not specified, all fields are included)
 * **setScanPartitionDiscoveryIntervalMs(long intervalMs):** Sets the interval for discovering new partitions (default: from configuration)
 * **setStartingOffsets(OffsetsInitializer initializer):** Sets the strategy for determining starting offsets (default: `OffsetsInitializer.full()`)
-* **setBatch():** Configures batch-read semantics and stops at the latest offsets captured when the source starts
-* **setBounded(OffsetsInitializer stoppingOffsetsInitializer):** Makes the source bounded: it stops once it reaches the given stopping offsets and then finishes, even in streaming execution mode (see [Bounded Reads](#bounded-reads))
+* **setBatch():** Selects the Fluss batch-read path; if stopping offsets are not specified, the source stops at the latest offsets captured when it starts
+* **setStoppingOffsets(OffsetsInitializer initializer):** Sets the strategy for determining stopping offsets (see [Read Mode and Offset Range](#read-mode-and-offset-range))
 * **setFlussConfig(Configuration flussConf):** Sets custom Fluss configuration properties
 
 ### Offset Initializers
@@ -130,26 +130,31 @@ FlussSource<Order> source = FlussSource.<Order>builder()
     .build();
 ```
 
-### Bounded Reads
-By default, the source is unbounded and keeps reading new records. Calling `setBounded(OffsetsInitializer)` makes the source stop once it reaches the given stopping offsets and then finish, even in streaming execution mode (a bounded streaming read). Typical usages are replaying a bounded time range of the log, backfilling and archiving. Supported stopping offsets initializers are `OffsetsInitializer.latest()` and `OffsetsInitializer.timestamp(long)`.
+### Read Mode and Offset Range
+The read mode and offset range are configured independently:
 
-Use `setBatch()` for batch reads. The deprecated no-argument `setBounded()` overload is retained for compatibility and is equivalent to `setBatch()`. Use `setBounded(OffsetsInitializer)` for bounded streaming reads.
+* `setBatch()` selects the Fluss batch-read path. If no stopping offsets are specified, batch reads stop at the latest offsets captured when the source starts.
+* `setStartingOffsets(OffsetsInitializer)` sets the beginning of the offset range.
+* `setStoppingOffsets(OffsetsInitializer)` sets the end of the offset range. In streaming mode, configuring stopping offsets makes the source bounded. In batch mode, it overrides the default latest stopping offsets for supported read paths.
 
-Bounded reads are supported for log tables and the changelog of primary key tables (earliest/latest/timestamp starting offsets), but not for the full startup mode of primary key tables or the datalake union read.
+The deprecated no-argument `setBounded()` overload is retained for compatibility and is equivalent to `setBatch()`.
+
+Supported stopping offsets initializers are `OffsetsInitializer.latest()` and `OffsetsInitializer.timestamp(long)`. Explicit stopping offsets are supported for log tables and the changelog of primary key tables (earliest/latest/timestamp starting offsets), but not for the full startup mode of primary key tables or the datalake union read.
 
 **Example:**
 ```java
-// Replay a bounded time range of the log: from one hour ago up to now
+// Replay a bounded time range in streaming mode
 FlussSource<Order> timeRangeSource = FlussSource.<Order>builder()
     .setStartingOffsets(OffsetsInitializer.timestamp(System.currentTimeMillis() - 3600 * 1000))
-    .setBounded(OffsetsInitializer.timestamp(System.currentTimeMillis()))
+    .setStoppingOffsets(OffsetsInitializer.timestamp(System.currentTimeMillis()))
     // other configuration...
     .build();
 
-// Read up to the latest offsets captured at startup and then finish
-FlussSource<Order> latestSource = FlussSource.<Order>builder()
+// Read the same kind of offset range through the Fluss batch-read path
+FlussSource<Order> batchRangeSource = FlussSource.<Order>builder()
+    .setBatch()
     .setStartingOffsets(OffsetsInitializer.earliest())
-    .setBounded(OffsetsInitializer.latest())
+    .setStoppingOffsets(OffsetsInitializer.timestamp(System.currentTimeMillis()))
     // other configuration...
     .build();
 ```

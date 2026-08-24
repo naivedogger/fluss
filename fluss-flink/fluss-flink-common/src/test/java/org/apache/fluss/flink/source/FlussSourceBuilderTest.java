@@ -17,10 +17,14 @@
 
 package org.apache.fluss.flink.source;
 
+import org.apache.fluss.client.initializer.LatestOffsetsInitializer;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
+import org.apache.fluss.client.initializer.TimestampOffsetsInitializer;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
 import org.apache.fluss.flink.utils.FlinkTestBase;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.types.RowType;
@@ -62,39 +66,45 @@ public class FlussSourceBuilderTest extends FlinkTestBase {
         // Then
         assertThat(source).isNotNull();
         assertThat(source.getBoundedness()).isEqualTo(Boundedness.CONTINUOUS_UNBOUNDED);
+        assertThat(source.isStreaming()).isTrue();
+        assertThat(source.getStoppingOffsetsInitializer())
+                .isInstanceOf(NoStoppingOffsetsInitializer.class);
     }
 
     @Test
     public void testRejectUnsupportedStoppingOffsetsInitializer() {
         FlussSourceBuilder<TestRecord> builder = FlussSource.builder();
 
-        assertThatThrownBy(() -> builder.setBounded(OffsetsInitializer.earliest()))
+        assertThatThrownBy(() -> builder.setStoppingOffsets(OffsetsInitializer.earliest()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(
                         "Only OffsetsInitializer.latest() and "
                                 + "OffsetsInitializer.timestamp(...) are supported");
-        assertThatThrownBy(() -> builder.setBounded(OffsetsInitializer.full()))
+        assertThatThrownBy(() -> builder.setStoppingOffsets(OffsetsInitializer.full()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(
                         "Only OffsetsInitializer.latest() and "
                                 + "OffsetsInitializer.timestamp(...) are supported");
 
-        assertThat(builder.setBounded(OffsetsInitializer.timestamp(1L))).isSameAs(builder);
+        assertThat(builder.setStoppingOffsets(OffsetsInitializer.timestamp(1L))).isSameAs(builder);
     }
 
     @Test
-    public void testBuildBoundedStreamingSource() {
+    public void testBuildStreamingSourceWithStoppingOffsets() {
         FlussSource<TestRecord> source =
                 FlussSource.<TestRecord>builder()
                         .setBootstrapServers(bootstrapServers)
                         .setDatabase(DEFAULT_DB)
                         .setTable(DEFAULT_TABLE_PATH.getTableName())
                         .setStartingOffsets(OffsetsInitializer.earliest())
-                        .setBounded(OffsetsInitializer.latest())
+                        .setStoppingOffsets(OffsetsInitializer.latest())
                         .setDeserializationSchema(new TestDeserializationSchema())
                         .build();
 
         assertThat(source.getBoundedness()).isEqualTo(Boundedness.BOUNDED);
+        assertThat(source.isStreaming()).isTrue();
+        assertThat(source.getStoppingOffsetsInitializer())
+                .isInstanceOf(LatestOffsetsInitializer.class);
     }
 
     @Test
@@ -109,6 +119,43 @@ public class FlussSourceBuilderTest extends FlinkTestBase {
                         .build();
 
         assertThat(source.getBoundedness()).isEqualTo(Boundedness.BOUNDED);
+        assertThat(source.isStreaming()).isFalse();
+        assertThat(source.getStoppingOffsetsInitializer())
+                .isInstanceOf(LatestOffsetsInitializer.class);
+    }
+
+    @Test
+    public void testBatchAndStoppingOffsetsAreOrderIndependent() throws Exception {
+        TablePath logTablePath = TablePath.of(DEFAULT_DB, "batch-with-stopping-offsets");
+        createTable(logTablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+
+        FlussSource<TestRecord> batchThenStopping =
+                FlussSource.<TestRecord>builder()
+                        .setBootstrapServers(bootstrapServers)
+                        .setDatabase(DEFAULT_DB)
+                        .setTable(logTablePath.getTableName())
+                        .setBatch()
+                        .setStoppingOffsets(OffsetsInitializer.timestamp(1L))
+                        .setDeserializationSchema(new TestDeserializationSchema())
+                        .build();
+        FlussSource<TestRecord> stoppingThenBatch =
+                FlussSource.<TestRecord>builder()
+                        .setBootstrapServers(bootstrapServers)
+                        .setDatabase(DEFAULT_DB)
+                        .setTable(logTablePath.getTableName())
+                        .setStoppingOffsets(OffsetsInitializer.timestamp(1L))
+                        .setBatch()
+                        .setDeserializationSchema(new TestDeserializationSchema())
+                        .build();
+
+        assertThat(batchThenStopping.getBoundedness()).isEqualTo(Boundedness.BOUNDED);
+        assertThat(batchThenStopping.isStreaming()).isFalse();
+        assertThat(batchThenStopping.getStoppingOffsetsInitializer())
+                .isInstanceOf(TimestampOffsetsInitializer.class);
+        assertThat(stoppingThenBatch.getBoundedness()).isEqualTo(Boundedness.BOUNDED);
+        assertThat(stoppingThenBatch.isStreaming()).isFalse();
+        assertThat(stoppingThenBatch.getStoppingOffsetsInitializer())
+                .isInstanceOf(TimestampOffsetsInitializer.class);
     }
 
     @Test
@@ -123,6 +170,9 @@ public class FlussSourceBuilderTest extends FlinkTestBase {
                         .build();
 
         assertThat(source.getBoundedness()).isEqualTo(Boundedness.BOUNDED);
+        assertThat(source.isStreaming()).isFalse();
+        assertThat(source.getStoppingOffsetsInitializer())
+                .isInstanceOf(LatestOffsetsInitializer.class);
     }
 
     @Test

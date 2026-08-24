@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.source;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
@@ -303,6 +304,16 @@ public class FlinkSource<OUT>
     @Override
     public Boundedness getBoundedness() {
         return boundedness;
+    }
+
+    @VisibleForTesting
+    boolean isStreaming() {
+        return streaming;
+    }
+
+    @VisibleForTesting
+    OffsetsInitializer getStoppingOffsetsInitializer() {
+        return stoppingOffsetsInitializer;
     }
 
     @Override

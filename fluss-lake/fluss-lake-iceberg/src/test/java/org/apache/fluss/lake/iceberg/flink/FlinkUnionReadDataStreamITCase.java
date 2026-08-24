@@ -252,7 +252,7 @@ public class FlinkUnionReadDataStreamITCase extends FlinkUnionReadTestBase {
         assertThatThrownBy(builder::build)
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(
-                        "Bounded (batch) read on primary-key tables requires full mode");
+                        "Batch read on primary-key tables requires full startup mode");
     }
 
     @Test

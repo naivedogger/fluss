@@ -41,6 +41,8 @@ import org.apache.flink.api.connector.source.Boundedness;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -88,12 +90,11 @@ public class FlussSourceBuilder<OUT> {
     private Long scanPartitionDiscoveryIntervalMs;
     private Integer splitPerAssignmentBatchSize;
     private OffsetsInitializer offsetsInitializer;
-    private OffsetsInitializer stoppingOffsetsInitializer = new NoStoppingOffsetsInitializer();
+    @Nullable private OffsetsInitializer stoppingOffsetsInitializer;
 
-    // setBatch() enables batch-read semantics. The deprecated no-argument setBounded() is a
-    // compatibility alias, while the parameterized overload enables bounded-streaming semantics.
+    // Selects the Fluss batch-read path independently from the configured offset range. The
+    // deprecated no-argument setBounded() is retained as a compatibility alias for setBatch().
     private boolean isBatch;
-    private Boundedness boundedness = Boundedness.CONTINUOUS_UNBOUNDED;
     private FlussDeserializationSchema<OUT> deserializationSchema;
 
     private String bootstrapServers;
@@ -183,27 +184,27 @@ public class FlussSourceBuilder<OUT> {
     }
 
     /**
-     * Builds a source for batch execution. The source reads up to the latest offsets at job startup
-     * and then finishes; combined with the default {@link OffsetsInitializer#full()} on a
-     * datalake-enabled table this performs a bounded union read of the lake snapshot and the Fluss
-     * log.
+     * Configures the source to use the Fluss batch-read path. If no stopping offsets are configured
+     * through {@link #setStoppingOffsets(OffsetsInitializer)}, the source reads up to the latest
+     * offsets captured at startup. Without explicit stopping offsets, combining batch mode with the
+     * default {@link OffsetsInitializer#full()} on a datalake-enabled table performs a bounded
+     * union read of the lake snapshot and the Fluss log.
      *
      * @return this builder
      */
     public FlussSourceBuilder<OUT> setBatch() {
         this.isBatch = true;
-        this.boundedness = Boundedness.BOUNDED;
-        this.stoppingOffsetsInitializer = OffsetsInitializer.latest();
         return this;
     }
 
     /**
-     * Builds a source for batch execution.
+     * Configures the source to use the Fluss batch-read path.
      *
      * <p>This overload is retained for compatibility and is equivalent to {@link #setBatch()}.
      *
      * @return this builder
-     * @deprecated Use {@link #setBatch()} for batch reads.
+     * @deprecated This no-argument overload configures a batch read, not stopping offsets. Use
+     *     {@link #setBatch()} for batch reads.
      */
     @Deprecated
     public FlussSourceBuilder<OUT> setBounded() {
@@ -211,9 +212,9 @@ public class FlussSourceBuilder<OUT> {
     }
 
     /**
-     * Builds a bounded source that stops once it reaches the given stopping offsets and then
-     * finishes, even in streaming execution mode (a bounded streaming read). Typical usages are
-     * replaying a bounded time range of the log, backfilling and archiving.
+     * Sets the stopping offsets strategy for the Fluss source. In streaming mode, configuring
+     * stopping offsets makes the source bounded. In batch mode, it overrides the default latest
+     * stopping offsets for supported read paths.
      *
      * <p>Supported stopping offsets initializers are {@link OffsetsInitializer#latest()} and {@link
      * OffsetsInitializer#timestamp(long)}.
@@ -221,7 +222,8 @@ public class FlussSourceBuilder<OUT> {
      * @param stoppingOffsetsInitializer the strategy for determining the stopping offsets
      * @return this builder
      */
-    public FlussSourceBuilder<OUT> setBounded(OffsetsInitializer stoppingOffsetsInitializer) {
+    public FlussSourceBuilder<OUT> setStoppingOffsets(
+            OffsetsInitializer stoppingOffsetsInitializer) {
         OffsetsInitializer checkedStoppingOffsetsInitializer =
                 checkNotNull(
                         stoppingOffsetsInitializer, "stoppingOffsetsInitializer must not be null");
@@ -231,9 +233,7 @@ public class FlussSourceBuilder<OUT> {
                 "Only OffsetsInitializer.latest() and OffsetsInitializer.timestamp(...) are "
                         + "supported as stopping offsets, but was %s.",
                 checkedStoppingOffsetsInitializer.getClass().getName());
-        this.isBatch = false;
         this.stoppingOffsetsInitializer = checkedStoppingOffsetsInitializer;
-        this.boundedness = Boundedness.BOUNDED;
         return this;
     }
 
@@ -325,6 +325,18 @@ public class FlussSourceBuilder<OUT> {
             offsetsInitializer = OffsetsInitializer.full();
         }
 
+        boolean hasExplicitStoppingOffsets = stoppingOffsetsInitializer != null;
+        OffsetsInitializer effectiveStoppingOffsetsInitializer =
+                hasExplicitStoppingOffsets
+                        ? stoppingOffsetsInitializer
+                        : isBatch
+                                ? OffsetsInitializer.latest()
+                                : new NoStoppingOffsetsInitializer();
+        Boundedness effectiveBoundedness =
+                isBatch || hasExplicitStoppingOffsets
+                        ? Boundedness.BOUNDED
+                        : Boundedness.CONTINUOUS_UNBOUNDED;
+
         // if null use the default value:
         if (scanPartitionDiscoveryIntervalMs == null) {
             scanPartitionDiscoveryIntervalMs =
@@ -405,40 +417,31 @@ public class FlussSourceBuilder<OUT> {
         boolean lakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
         boolean fullStartup = offsetsInitializer instanceof SnapshotOffsetsInitializer;
 
-        if (isBatch && hasPrimaryKey && !fullStartup) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "Bounded (batch) read on primary-key tables requires full mode "
-                                    + "(OffsetsInitializer.full()), but table '%s' has full "
-                                    + "startup mode=%s.",
-                            tablePath, fullStartup));
-        }
-
-        // Bounded streaming read support (user-supplied stopping offsets):
+        // Explicit stopping offsets support:
         //  - Log tables and the changelog of primary key tables (earliest/latest/timestamp
         //    startup mode) are supported.
         //  - The full startup mode of primary key tables is not supported, because the snapshot
         //    reading phase has no bounded end.
         //  - The datalake union read (full startup mode on a datalake-enabled table) is not
         //    supported, because lake splits have no bounded end.
-        if (!isBatch && boundedness == Boundedness.BOUNDED) {
+        if (hasExplicitStoppingOffsets) {
             if (hasPrimaryKey && fullStartup) {
                 throw new IllegalArgumentException(
                         String.format(
-                                "Bounded read with stopping offsets on primary key table '%s' is "
-                                        + "not supported in full startup mode, because the "
-                                        + "snapshot reading phase has no bounded end. Use "
-                                        + "earliest/latest/timestamp starting offsets to read the "
-                                        + "changelog with a bounded end.",
+                                "Explicit stopping offsets on primary key table '%s' are not "
+                                        + "supported in full startup mode, because the snapshot "
+                                        + "reading phase has no bounded end. Use "
+                                        + "earliest/latest/timestamp starting offsets to read "
+                                        + "the changelog with a bounded end.",
                                 tablePath));
             }
             if (lakeEnabled && fullStartup) {
                 throw new IllegalArgumentException(
                         String.format(
-                                "Bounded read with stopping offsets on datalake-enabled table '%s' "
-                                        + "is not supported in full startup mode (datalake union "
-                                        + "read). Use earliest/latest/timestamp starting offsets "
-                                        + "to read only the Fluss log with a bounded end.",
+                                "Explicit stopping offsets on datalake-enabled table '%s' are not "
+                                        + "supported in full startup mode (datalake union read). "
+                                        + "Use earliest/latest/timestamp starting offsets to read "
+                                        + "only the Fluss log with a bounded end.",
                                 tablePath));
             }
         }
@@ -474,8 +477,8 @@ public class FlussSourceBuilder<OUT> {
                 projectedFields,
                 logRecordBatchFilter,
                 offsetsInitializer,
-                stoppingOffsetsInitializer,
-                boundedness,
+                effectiveStoppingOffsetsInitializer,
+                effectiveBoundedness,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,

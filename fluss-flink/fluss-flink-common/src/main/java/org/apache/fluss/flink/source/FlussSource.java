@@ -184,7 +184,7 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 && !(offsetsInitializer instanceof SnapshotOffsetsInitializer)) {
             throw new IllegalArgumentException(
                     String.format(
-                            "Bounded (batch) read on primary-key tables requires full mode "
+                            "Batch read on primary-key tables requires full startup mode "
                                     + "(OffsetsInitializer.full()), but table '%s' isn't started "
                                     + "in full mode.",
                             tablePath));
