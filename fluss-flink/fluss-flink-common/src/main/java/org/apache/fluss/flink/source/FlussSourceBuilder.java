@@ -93,6 +93,8 @@ public class FlussSourceBuilder<OUT> {
     // This flag preserves the execution semantics of the legacy no-argument setBounded(), which
     // switches the source to batch mode. The parameterized setBounded(OffsetsInitializer) keeps
     // streaming execution semantics and only makes the source bounded.
+    // TODO: Remove this compatibility flag once batch-specific behavior is derived from the actual
+    // execution mode.
     private boolean bounded;
     private Boundedness boundedness = Boundedness.CONTINUOUS_UNBOUNDED;
     private FlussDeserializationSchema<OUT> deserializationSchema;
@@ -189,11 +191,15 @@ public class FlussSourceBuilder<OUT> {
      * datalake-enabled table this performs a bounded union read of the lake snapshot and the Fluss
      * log.
      *
-     * <p>This overload is retained for compatibility and switches the source to batch execution
-     * semantics. Use {@link #setBounded(OffsetsInitializer)} for a bounded streaming read.
+     * <p>This overload is retained for compatibility and switches the source to legacy batch
+     * semantics.
      *
      * @return this builder
+     * @deprecated This overload conflates source boundedness with batch execution semantics. Use
+     *     {@link #setBounded(OffsetsInitializer)} for bounded streaming reads. Batch-specific
+     *     behavior will be derived from the actual execution mode in a follow-up.
      */
+    @Deprecated
     public FlussSourceBuilder<OUT> setBounded() {
         this.bounded = true;
         this.boundedness = Boundedness.BOUNDED;

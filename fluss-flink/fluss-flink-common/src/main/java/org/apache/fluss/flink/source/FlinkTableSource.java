@@ -201,6 +201,7 @@ public class FlinkTableSource
                 partitionKeyIndexes,
                 streaming,
                 startupOptions,
+                FlinkConnectorOptionsUtils.BoundedOptions.unbounded(),
                 lookupAsync,
                 insertIfNotExists,
                 cache,
@@ -265,47 +266,6 @@ public class FlinkTableSource
         RowType flussRowType = FlinkConversions.toFlussRowType(tableOutputType);
         this.availableStatsColumns =
                 PushdownUtils.computeAvailableStatsColumns(flussRowType, tableConfig);
-    }
-
-    public FlinkTableSource(
-            TablePath tablePath,
-            Configuration flussConfig,
-            TableConfig tableConfig,
-            org.apache.flink.table.types.logical.RowType tableOutputType,
-            int[] primaryKeyIndexes,
-            int[] bucketKeyIndexes,
-            int[] partitionKeyIndexes,
-            boolean streaming,
-            FlinkConnectorOptionsUtils.StartupOptions startupOptions,
-            boolean lookupAsync,
-            boolean insertIfNotExists,
-            @Nullable LookupCache cache,
-            long scanPartitionDiscoveryIntervalMs,
-            int splitPerAssignmentBatchSize,
-            boolean isDataLakeEnabled,
-            @Nullable MergeEngineType mergeEngineType,
-            Map<String, String> tableOptions,
-            LeaseContext leaseContext) {
-        this(
-                tablePath,
-                flussConfig,
-                tableConfig,
-                tableOutputType,
-                primaryKeyIndexes,
-                bucketKeyIndexes,
-                partitionKeyIndexes,
-                streaming,
-                startupOptions,
-                FlinkConnectorOptionsUtils.BoundedOptions.unbounded(),
-                lookupAsync,
-                insertIfNotExists,
-                cache,
-                scanPartitionDiscoveryIntervalMs,
-                splitPerAssignmentBatchSize,
-                isDataLakeEnabled,
-                mergeEngineType,
-                tableOptions,
-                leaseContext);
     }
 
     @Override
