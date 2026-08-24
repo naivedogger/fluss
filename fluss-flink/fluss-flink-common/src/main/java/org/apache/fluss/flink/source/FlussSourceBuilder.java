@@ -90,12 +90,9 @@ public class FlussSourceBuilder<OUT> {
     private OffsetsInitializer offsetsInitializer;
     private OffsetsInitializer stoppingOffsetsInitializer = new NoStoppingOffsetsInitializer();
 
-    // This flag preserves the execution semantics of the legacy no-argument setBounded(), which
-    // switches the source to batch mode. The parameterized setBounded(OffsetsInitializer) keeps
-    // streaming execution semantics and only makes the source bounded.
-    // TODO: Remove this compatibility flag once batch-specific behavior is derived from the actual
-    // execution mode.
-    private boolean bounded;
+    // setBatch() enables batch-read semantics. The deprecated no-argument setBounded() is a
+    // compatibility alias, while the parameterized overload enables bounded-streaming semantics.
+    private boolean isBatch;
     private Boundedness boundedness = Boundedness.CONTINUOUS_UNBOUNDED;
     private FlussDeserializationSchema<OUT> deserializationSchema;
 
@@ -186,25 +183,31 @@ public class FlussSourceBuilder<OUT> {
     }
 
     /**
-     * Builds a bounded source for batch execution. The source reads up to the latest offsets at job
-     * startup and then finishes; combined with the default {@link OffsetsInitializer#full()} on a
+     * Builds a source for batch execution. The source reads up to the latest offsets at job startup
+     * and then finishes; combined with the default {@link OffsetsInitializer#full()} on a
      * datalake-enabled table this performs a bounded union read of the lake snapshot and the Fluss
      * log.
      *
-     * <p>This overload is retained for compatibility and switches the source to legacy batch
-     * semantics.
-     *
      * @return this builder
-     * @deprecated This overload conflates source boundedness with batch execution semantics. Use
-     *     {@link #setBounded(OffsetsInitializer)} for bounded streaming reads. Batch-specific
-     *     behavior will be derived from the actual execution mode in a follow-up.
      */
-    @Deprecated
-    public FlussSourceBuilder<OUT> setBounded() {
-        this.bounded = true;
+    public FlussSourceBuilder<OUT> setBatch() {
+        this.isBatch = true;
         this.boundedness = Boundedness.BOUNDED;
         this.stoppingOffsetsInitializer = OffsetsInitializer.latest();
         return this;
+    }
+
+    /**
+     * Builds a source for batch execution.
+     *
+     * <p>This overload is retained for compatibility and is equivalent to {@link #setBatch()}.
+     *
+     * @return this builder
+     * @deprecated Use {@link #setBatch()} for batch reads.
+     */
+    @Deprecated
+    public FlussSourceBuilder<OUT> setBounded() {
+        return setBatch();
     }
 
     /**
@@ -228,6 +231,7 @@ public class FlussSourceBuilder<OUT> {
                 "Only OffsetsInitializer.latest() and OffsetsInitializer.timestamp(...) are "
                         + "supported as stopping offsets, but was %s.",
                 checkedStoppingOffsetsInitializer.getClass().getName());
+        this.isBatch = false;
         this.stoppingOffsetsInitializer = checkedStoppingOffsetsInitializer;
         this.boundedness = Boundedness.BOUNDED;
         return this;
@@ -401,7 +405,7 @@ public class FlussSourceBuilder<OUT> {
         boolean lakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
         boolean fullStartup = offsetsInitializer instanceof SnapshotOffsetsInitializer;
 
-        if (bounded && hasPrimaryKey && !fullStartup) {
+        if (isBatch && hasPrimaryKey && !fullStartup) {
             throw new IllegalArgumentException(
                     String.format(
                             "Bounded (batch) read on primary-key tables requires full mode "
@@ -417,7 +421,7 @@ public class FlussSourceBuilder<OUT> {
         //    reading phase has no bounded end.
         //  - The datalake union read (full startup mode on a datalake-enabled table) is not
         //    supported, because lake splits have no bounded end.
-        if (!bounded && boundedness == Boundedness.BOUNDED) {
+        if (!isBatch && boundedness == Boundedness.BOUNDED) {
             if (hasPrimaryKey && fullStartup) {
                 throw new IllegalArgumentException(
                         String.format(
@@ -475,7 +479,7 @@ public class FlussSourceBuilder<OUT> {
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
                 deserializationSchema,
-                !bounded,
+                !isBatch,
                 lakeSource);
     }
 }

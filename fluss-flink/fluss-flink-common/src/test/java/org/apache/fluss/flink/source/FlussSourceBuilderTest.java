@@ -98,6 +98,20 @@ public class FlussSourceBuilderTest extends FlinkTestBase {
     }
 
     @Test
+    public void testBuildBatchSource() {
+        FlussSource<TestRecord> source =
+                FlussSource.<TestRecord>builder()
+                        .setBootstrapServers(bootstrapServers)
+                        .setDatabase(DEFAULT_DB)
+                        .setTable(DEFAULT_TABLE_PATH.getTableName())
+                        .setBatch()
+                        .setDeserializationSchema(new TestDeserializationSchema())
+                        .build();
+
+        assertThat(source.getBoundedness()).isEqualTo(Boundedness.BOUNDED);
+    }
+
+    @Test
     public void testBuildLegacyBoundedSource() {
         FlussSource<TestRecord> source =
                 FlussSource.<TestRecord>builder()
