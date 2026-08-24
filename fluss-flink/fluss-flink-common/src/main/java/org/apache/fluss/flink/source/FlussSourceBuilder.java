@@ -200,11 +200,12 @@ public class FlussSourceBuilder<OUT> {
     /**
      * Configures the source to use the Fluss batch-read path.
      *
-     * <p>This overload is retained for compatibility and is equivalent to {@link #setBatch()}.
+     * <p>This deprecated method is retained for compatibility and is equivalent to {@link
+     * #setBatch()}.
      *
      * @return this builder
-     * @deprecated This no-argument overload configures a batch read, not stopping offsets. Use
-     *     {@link #setBatch()} for batch reads.
+     * @deprecated This method configures a batch read, not stopping offsets. Use {@link
+     *     #setBatch()} for batch reads.
      */
     @Deprecated
     public FlussSourceBuilder<OUT> setBounded() {
@@ -214,7 +215,7 @@ public class FlussSourceBuilder<OUT> {
     /**
      * Sets the stopping offsets strategy for the Fluss source. In streaming mode, configuring
      * stopping offsets makes the source bounded. In batch mode, it overrides the default latest
-     * stopping offsets for supported read paths.
+     * stopping offsets for log-table reads.
      *
      * <p>Supported stopping offsets initializers are {@link OffsetsInitializer#latest()} and {@link
      * OffsetsInitializer#timestamp(long)}.
@@ -420,11 +421,21 @@ public class FlussSourceBuilder<OUT> {
         // Explicit stopping offsets support:
         //  - Log tables and the changelog of primary key tables (earliest/latest/timestamp
         //    startup mode) are supported.
+        //  - Batch reads of primary key tables do not support explicit stopping offsets.
         //  - The full startup mode of primary key tables is not supported, because the snapshot
         //    reading phase has no bounded end.
         //  - The datalake union read (full startup mode on a datalake-enabled table) is not
         //    supported, because lake splits have no bounded end.
         if (hasExplicitStoppingOffsets) {
+            if (isBatch && hasPrimaryKey) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Batch read on primary-key table '%s' does not support explicit "
+                                        + "stopping offsets. Remove setStoppingOffsets(...); "
+                                        + "primary-key batch reads require full startup mode and "
+                                        + "stop at the latest offsets captured at startup.",
+                                tablePath));
+            }
             if (hasPrimaryKey && fullStartup) {
                 throw new IllegalArgumentException(
                         String.format(

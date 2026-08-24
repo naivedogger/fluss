@@ -159,6 +159,38 @@ public class FlussSourceBuilderTest extends FlinkTestBase {
     }
 
     @Test
+    public void testRejectStoppingOffsetsForPrimaryKeyBatchRead() {
+        assertThatThrownBy(
+                        () ->
+                                FlussSource.<TestRecord>builder()
+                                        .setBootstrapServers(bootstrapServers)
+                                        .setDatabase(DEFAULT_DB)
+                                        .setTable(DEFAULT_TABLE_PATH.getTableName())
+                                        .setBatch()
+                                        .setStoppingOffsets(OffsetsInitializer.latest())
+                                        .setDeserializationSchema(new TestDeserializationSchema())
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Batch read on primary-key table")
+                .hasMessageContaining("does not support explicit stopping offsets");
+
+        assertThatThrownBy(
+                        () ->
+                                FlussSource.<TestRecord>builder()
+                                        .setBootstrapServers(bootstrapServers)
+                                        .setDatabase(DEFAULT_DB)
+                                        .setTable(DEFAULT_TABLE_PATH.getTableName())
+                                        .setBatch()
+                                        .setStartingOffsets(OffsetsInitializer.earliest())
+                                        .setStoppingOffsets(OffsetsInitializer.latest())
+                                        .setDeserializationSchema(new TestDeserializationSchema())
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Batch read on primary-key table")
+                .hasMessageContaining("does not support explicit stopping offsets");
+    }
+
+    @Test
     public void testBuildLegacyBoundedSource() {
         FlussSource<TestRecord> source =
                 FlussSource.<TestRecord>builder()
