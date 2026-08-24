@@ -111,11 +111,12 @@ is preferred. `timeout_ms` is the total execution budget for the whole call, so 
 normally pass the query's remaining execution time and call the method once. It appends complete
 batches to `out` as they arrive. If the budget expires before every stopping offset is reached, it
 stops collecting and returns a retriable `REQUEST_TIME_OUT`; `out` may contain a partial result,
-and only an `Ok()` result means the bounded result is complete. The timeout is checked between
-complete Arrow batches and never splits a batch already being returned. The reader remains valid
-after timeout if a caller has an explicit resume policy, but unconditional retry is not the
-intended usage. `NextBatch()` remains the per-poll API for engines that need to check cancellation
-between batches.
+and only an `Ok()` result means the bounded result is complete. Once the budget is exhausted, the
+reader stops waiting for scanner data but still drains already-buffered batches and observes
+completion before reporting a timeout. This means an already-complete reader returns `Ok()` even
+with a non-positive timeout. The reader remains valid after timeout if a caller has an explicit
+resume policy, but unconditional retry is not the intended usage. `NextBatch()` remains the
+per-poll API for engines that need to check cancellation between batches.
 
 ## TODO
 

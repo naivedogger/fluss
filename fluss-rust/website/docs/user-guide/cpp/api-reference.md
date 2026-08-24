@@ -279,14 +279,15 @@ appends complete batches to `out` as they arrive. If the budget expires, collect
 `out` may contain only part of the bounded result, and the method returns a retriable
 `REQUEST_TIME_OUT`. Only an `Ok()` result means every stopping offset has been reached. Reaching
 every stopping offset always reports `Ok()`, even when the budget expired in the meantime, so a
-complete result never surfaces as a timeout. A non-positive `timeout_ms` returns
-`REQUEST_TIME_OUT` without attempting a read.
+complete result never surfaces as a timeout. Once the budget is exhausted, the reader does not wait
+for additional scanner data, but it still returns already-buffered batches and observes an
+already-complete reader. Consequently, a non-positive `timeout_ms` returns `Ok()` when the reader
+is already complete and `REQUEST_TIME_OUT` when unread work remains.
 
-The timeout is checked between complete Arrow batches and never splits a batch already being
-returned. The method does not internally retry after the budget is exhausted. The reader remains
-valid, so an application may explicitly resume with the same reader and `out`, but the normal
-whole-query behavior is to propagate the timeout/incomplete result rather than start an
-unconditional retry loop.
+The method does not internally retry or perform another blocking poll after the budget is
+exhausted. The reader remains valid, so an application may explicitly resume with the same reader
+and `out`, but the normal whole-query behavior is to propagate the timeout/incomplete result rather
+than start an unconditional retry loop.
 
 :::
 

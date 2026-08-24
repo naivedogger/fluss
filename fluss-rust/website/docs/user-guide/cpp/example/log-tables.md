@@ -270,11 +270,11 @@ result means all stopping offsets have been reached.
 
 The supplied timeout is the total execution budget for the whole `CollectAllBatches()` call, not a
 per-batch polling timeout. Once the budget expires, the method stops collecting and returns
-`REQUEST_TIME_OUT`; it does not internally retry with a fresh budget. The timeout is checked
-between complete Arrow batches and never splits a batch already being returned. The reader remains
-valid after timeout, but applications should normally propagate the incomplete result. Resuming
-with the same reader and output should only be done as an explicit higher-level policy with its own
-deadline.
+`REQUEST_TIME_OUT` if unread work remains; it does not internally retry with a fresh budget. It
+does not wait for more scanner data after the deadline, but it still drains already-buffered
+batches and reports `Ok()` if every stopping offset has been reached. The reader remains valid
+after timeout, but applications should normally propagate the incomplete result. Resuming with the
+same reader and output should only be done as an explicit higher-level policy with its own deadline.
 
 :::
 

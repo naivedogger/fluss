@@ -193,10 +193,20 @@ Unlike `RecordBatchLogScanner` which polls indefinitely, this reader stops autom
 |-------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|
 | `async fn new_until_latest(scanner: RecordBatchLogScanner, admin: &FlussAdmin) -> Result<Self>`              | Read until the latest offsets at time of creation         |
 | `fn new_until_offsets(scanner: RecordBatchLogScanner, stopping_offsets: HashMap<TableBucket, i64>) -> Result<Self>` | Read until custom stopping offsets per bucket             |
+| `async fn new_from_ranges(scanner: RecordBatchLogScanner, ranges: Vec<BoundedLogReadRange>) -> Result<Self>` | Subscribe and read explicit per-bucket offset ranges |
+| `async fn new_between_timestamps(scanner: RecordBatchLogScanner, admin: &FlussAdmin, buckets: &[TableBucket], starting_timestamp_ms: i64, stopping_timestamp_ms: i64) -> Result<Self>` | Resolve and read a timestamp range per bucket |
 | `async fn next_batch(&mut self) -> Result<Option<ScanBatch>>`                                                | Get the next batch with bucket/offset metadata, or `None` when all buckets caught up |
+| `async fn next_batch_with_timeout(&mut self, timeout: Duration) -> Result<RecordBatchReadOutcome>`           | Get a batch, timeout, or completion without exhausting the reader |
 | `async fn collect_all_batches(&mut self) -> Result<Vec<ScanBatch>>`                                          | Drain all batches (with metadata) until stopping offsets are satisfied |
+| `async fn collect_all_batches_with_timeout(&mut self, timeout: Duration) -> Result<BoundedCollectOutcome>`   | Drain batches using one whole-operation timeout budget |
 | `fn schema(&self) -> SchemaRef`                                                                              | Arrow schema for produced batches                        |
 | `fn to_record_batch_reader(self, handle: tokio::runtime::Handle) -> SyncRecordBatchLogReader`                | Sync adapter implementing `arrow::RecordBatchReader` (see below) |
+
+`collect_all_batches_with_timeout` returns batches collected before the budget expires and sets
+`BoundedCollectOutcome::complete` to indicate whether every stopping offset was reached. Once the
+budget is exhausted, it does not wait for additional scanner data, but it still drains buffered
+batches and observes completion before reporting an incomplete result. An already-complete reader
+therefore returns `complete = true` even with a zero timeout.
 
 ## `SyncRecordBatchLogReader`
 

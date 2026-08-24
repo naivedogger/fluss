@@ -306,6 +306,17 @@ TEST_F(LogTableTest, RecordBatchLogReaderUntilOffsets) {
         EXPECT_EQ(result.batch, nullptr);
     }
 
+    // Completion takes precedence over timeout. An empty bounded range is
+    // already complete, so a zero budget must return Ok without polling.
+    {
+        fluss::RecordBatchLogReader complete_reader;
+        ASSERT_OK(table.NewScan().CreateRecordBatchLogReader({}, complete_reader));
+
+        fluss::ArrowRecordBatches complete;
+        ASSERT_OK(complete_reader.CollectAllBatches(0, complete));
+        EXPECT_TRUE(complete.Empty());
+    }
+
     // CollectAllBatches appends to the output instead of clearing batches that
     // the caller collected earlier.
     {

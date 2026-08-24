@@ -172,6 +172,55 @@ mod reader_test {
     }
 
     #[tokio::test]
+    async fn collect_with_expired_budget_reports_already_complete_reader() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().expect("Failed to get admin");
+
+        let table_path = TablePath::new("fluss", "test_reader_collect_already_complete");
+        let table_descriptor = TableDescriptor::builder()
+            .schema(
+                Schema::builder()
+                    .column("id", DataTypes::int())
+                    .build()
+                    .expect("Failed to build schema"),
+            )
+            .build()
+            .expect("Failed to build table");
+        create_table(&admin, &table_path, &table_descriptor).await;
+
+        let table = connection
+            .get_table(&table_path)
+            .await
+            .expect("Failed to get table");
+        let scanner = table
+            .new_scan()
+            .create_record_batch_log_scanner()
+            .expect("Failed to create record batch scanner");
+        let mut reader = RecordBatchLogReader::new_until_offsets(scanner, HashMap::new())
+            .expect("Failed to create already-complete reader");
+
+        let outcome = reader
+            .collect_all_batches_with_timeout(Duration::ZERO)
+            .await
+            .expect("Failed to collect already-complete reader");
+
+        assert!(
+            outcome.complete,
+            "an already-complete reader must not be reported as timed out"
+        );
+        assert!(
+            outcome.batches.is_empty(),
+            "an already-complete reader should not return any batches"
+        );
+
+        admin
+            .drop_table(&table_path, false)
+            .await
+            .expect("Failed to drop table");
+    }
+
+    #[tokio::test]
     async fn until_offsets_past_end_of_log() {
         let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;

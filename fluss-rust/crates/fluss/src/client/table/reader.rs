@@ -310,11 +310,12 @@ impl RecordBatchLogReader {
     /// operation.
     ///
     /// The timeout is a budget for this call rather than a per-poll timeout, so
-    /// a stalled bucket cannot keep the caller blocked forever. It is checked
-    /// between complete batches and never splits a batch. When the budget
-    /// expires first, the batches collected so far are returned with
-    /// [`BoundedCollectOutcome::complete`] set to `false`; the reader stays
-    /// valid, so resuming is an explicit caller policy.
+    /// a stalled bucket cannot keep the caller blocked forever. Once the budget
+    /// is exhausted, the reader no longer waits for scanner data, but it still
+    /// drains already-buffered batches and observes completion before reporting
+    /// a timeout. When unread work remains, the batches collected so far are
+    /// returned with [`BoundedCollectOutcome::complete`] set to `false`; the
+    /// reader stays valid, so resuming is an explicit caller policy.
     pub async fn collect_all_batches_with_timeout(
         &mut self,
         timeout: Duration,
@@ -322,14 +323,12 @@ impl RecordBatchLogReader {
         let start = Instant::now();
         let mut batches = Vec::new();
         loop {
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
-                return Ok(BoundedCollectOutcome {
-                    batches,
-                    complete: false,
-                });
-            }
-            match self.next_batch_with_timeout(timeout - elapsed).await? {
+            // next_batch_with_timeout checks buffered batches and completion
+            // before checking its timeout. Passing a zero remaining duration
+            // therefore stops network waiting without misreporting a complete
+            // result as timed out.
+            let remaining = timeout.saturating_sub(start.elapsed());
+            match self.next_batch_with_timeout(remaining).await? {
                 RecordBatchReadOutcome::Batch(batch) => batches.push(batch),
                 RecordBatchReadOutcome::TimedOut => {
                     return Ok(BoundedCollectOutcome {
