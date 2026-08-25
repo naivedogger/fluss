@@ -23,20 +23,31 @@ on:
   push:
     branches:
       - main
+      - release-**
+      - ci-**
     paths:
       - 'fluss-gateway/**'
       - 'fluss-rust/Cargo.toml'
       - 'fluss-rust/crates/fluss/**'
       - 'fluss-rpc/src/main/proto/**'
+      - 'docker/fluss-gateway/**'
+      - '.dockerignore'
+      - 'tools/releasing/create_gateway_release.sh'
+      - 'tools/releasing/update_branch_version.sh'
       - '.github/workflows/gateway-ci.yml'
   pull_request:
     branches:
       - main
+      - release-**
     paths:
       - 'fluss-gateway/**'
       - 'fluss-rust/Cargo.toml'
       - 'fluss-rust/crates/fluss/**'
       - 'fluss-rpc/src/main/proto/**'
+      - 'docker/fluss-gateway/**'
+      - '.dockerignore'
+      - 'tools/releasing/create_gateway_release.sh'
+      - 'tools/releasing/update_branch_version.sh'
       - '.github/workflows/gateway-ci.yml'
   workflow_dispatch:
 
@@ -133,6 +144,9 @@ jobs:
           cargo deny --locked list -f tsv -t 0.6 | sed 's/[[:space:]]*$//' > DEPENDENCIES.rust.tsv
           git diff --exit-code DEPENDENCIES.rust.tsv
 
+      - name: Binary LICENSE and NOTICE drift check
+        run: python3 scripts/generate_binary_license.py --check
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -148,3 +162,55 @@ jobs:
         run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+      - name: Check distribution shell scripts
+        run: |
+          bash -n bin/fluss-gateway.sh
+          bash -n bin/gateway-healthcheck.sh
+          bash -n ../docker/fluss-gateway/build.sh
+          bash -n ../docker/fluss-gateway/docker-entrypoint.sh
+          bash -n ../docker/fluss-gateway/prepare_build.sh
+          bash -n ../docker/fluss-gateway/smoke-test.sh
+          bash -n ../tools/releasing/create_gateway_release.sh
+          bash -n ../tools/releasing/update_branch_version.sh
+
+  container-smoke-test:
+    name: "Gateway Distribution and Container (${{ matrix.arch }})"
+    timeout-minutes: 90
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and smoke test the distribution and image
+        env:
+          FLUSS_VERSION: smoke
+          GATEWAY_ARCH: ${{ matrix.arch }}
+          GATEWAY_BUILD_CACHE_FROM: type=gha,scope=fluss-gateway-${{ matrix.arch }}
+          GATEWAY_BUILD_CACHE_TO: type=gha,mode=max,scope=fluss-gateway-${{ matrix.arch }}
+          GATEWAY_IMAGE: fluss-gateway:smoke-${{ matrix.arch }}
+          RUN_SMOKE: "true"
+          VCS_REF: ${{ github.sha }}
+        run: docker/fluss-gateway/build.sh
+
+      - name: Upload the Gateway binary distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: fluss-gateway-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            target/gateway-release/fluss-gateway-*-bin-linux-${{ matrix.arch }}.tgz
+            target/gateway-release/fluss-gateway-*-bin-linux-${{ matrix.arch }}.tgz.sha512
