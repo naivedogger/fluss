@@ -20,6 +20,7 @@ package org.apache.fluss.server.replica;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.ConfigurationUtils;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
@@ -184,9 +185,8 @@ public final class Replica {
     private final AdjustIsrManager adjustIsrManager;
 
     private final SchemaGetter schemaGetter;
-    private final TableInfo tableInfo;
-    private final TableConfig tableConfig;
-    // logFormat and arrowCompressionInfo are used in hot-path, so cache them here.
+    private volatile TableInfo tableInfo;
+    // logFormat and arrowCompressionInfo are immutable and used in hot-path, so cache them here.
     private final LogFormat logFormat;
     private final ArrowCompressionInfo arrowCompressionInfo;
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
@@ -271,7 +271,7 @@ public final class Replica {
                         tableInfo.getSchemaId(),
                         tableInfo.getSchema());
         this.tableInfo = tableInfo;
-        this.tableConfig = tableInfo.getTableConfig();
+        TableConfig tableConfig = tableInfo.getTableConfig();
         this.logFormat = tableConfig.getLogFormat();
         this.arrowCompressionInfo = tableConfig.getArrowCompressionInfo();
         this.snapshotContext = snapshotContext;
@@ -279,7 +279,6 @@ public final class Replica {
         this.closeableRegistry = new CloseableRegistry();
 
         this.logTablet = createLog(dataDir, lazyHighWatermarkCheckpoint);
-        this.logTablet.updateIsDataLakeEnabled(tableConfig.isDataLakeEnabled());
         this.clock = clock;
         this.remoteLogManager = remoteLogManager;
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
@@ -345,6 +344,10 @@ public final class Replica {
         return tableInfo;
     }
 
+    private TableConfig getTableConfig() {
+        return tableInfo.getTableConfig();
+    }
+
     public @Nullable Integer getLeaderId() {
         return leaderReplicaIdOpt.get();
     }
@@ -362,7 +365,7 @@ public final class Replica {
     }
 
     public boolean isDataLakeEnabled() {
-        return tableConfig.isDataLakeEnabled();
+        return getTableConfig().isDataLakeEnabled();
     }
 
     public long getLocalLogStartOffset() {
@@ -379,10 +382,6 @@ public final class Replica {
 
     public TableBucket getTableBucket() {
         return tableBucket;
-    }
-
-    public long getLogTTLMs() {
-        return tableConfig.getLogTTLMs();
     }
 
     public int writerIdCount() {
@@ -655,51 +654,46 @@ public final class Replica {
         logTablet.updateLeaderEndOffsetSnapshot();
     }
 
-    public void updateIsDataLakeEnabled(boolean isDataLakeEnabled) {
-        boolean old = logTablet.isDataLakeEnabled();
-        if (old == isDataLakeEnabled) {
-            return;
-        }
+    /** Updates the table metadata snapshot used by this replica. */
+    public void updateTableInfo(TableInfo tableInfo) {
+        TableInfo oldTableInfo = this.tableInfo;
+        TableInfo newTableInfo = checkNotNull(tableInfo, "tableInfo");
+        boolean wasDataLakeEnabled = isDataLakeEnabled();
+        this.tableInfo = newTableInfo;
+        logTablet.applyTableConfig(newTableInfo.getTableConfig());
 
-        logTablet.updateIsDataLakeEnabled(isDataLakeEnabled);
-
-        if (isLeader()) {
+        boolean isDataLakeEnabled = isDataLakeEnabled();
+        if (isLeader() && wasDataLakeEnabled != isDataLakeEnabled) {
             if (isDataLakeEnabled) {
                 registerLakeTieringMetrics();
-            } else {
-                if (lakeTieringMetricGroup != null) {
-                    lakeTieringMetricGroup.close();
-                    lakeTieringMetricGroup = null;
-                }
+            } else if (lakeTieringMetricGroup != null) {
+                lakeTieringMetricGroup.close();
+                lakeTieringMetricGroup = null;
             }
         }
 
-        LOG.info(
-                "Replica for {} isDataLakeEnabled changed from {} to {}",
-                tableBucket,
-                old,
-                isDataLakeEnabled);
+        logTableConfigChanges(oldTableInfo, newTableInfo);
     }
 
-    /**
-     * Update the number of log segments to retain in local storage. This method is called when the
-     * table configuration is altered.
-     *
-     * @param tieredLogLocalSegments the new number of segments to retain locally
-     */
-    public void updateTieredLogLocalSegments(int tieredLogLocalSegments) {
-        int oldValue = logTablet.getTieredLogLocalSegments();
-        if (oldValue == tieredLogLocalSegments) {
-            return;
+    private void logTableConfigChanges(TableInfo oldTableInfo, TableInfo newTableInfo) {
+        Map<String, String> oldProperties = oldTableInfo.getProperties().toMap();
+        Map<String, String> newProperties = newTableInfo.getProperties().toMap();
+        Set<String> configKeys = new HashSet<>(oldProperties.keySet());
+        configKeys.addAll(newProperties.keySet());
+
+        for (String configKey : configKeys) {
+            String oldValue = oldProperties.get(configKey);
+            String newValue = newProperties.get(configKey);
+            if (!Objects.equals(oldValue, newValue)) {
+                LOG.info(
+                        "Table config {} for bucket {} of table {} changed from {} to {}.",
+                        configKey,
+                        tableBucket,
+                        physicalPath,
+                        ConfigurationUtils.hideSensitiveValue(configKey, oldValue),
+                        ConfigurationUtils.hideSensitiveValue(configKey, newValue));
+            }
         }
-
-        logTablet.updateTieredLogLocalSegments(tieredLogLocalSegments);
-
-        LOG.info(
-                "Replica for {} tieredLogLocalSegments changed from {} to {}",
-                tableBucket,
-                oldValue,
-                tieredLogLocalSegments);
     }
 
     private void createKv() {
@@ -784,6 +778,7 @@ public final class Replica {
      */
     private Optional<CompletedSnapshot> initKvTablet() {
         checkNotNull(kvManager);
+        TableConfig tableConfig = getTableConfig();
         long startTime = clock.milliseconds();
         LOG.info("Start to init kv tablet for {} of table {}.", tableBucket, physicalPath);
 
@@ -951,6 +946,7 @@ public final class Replica {
             long startRecoverLogOffset,
             @Nullable Long rowCount,
             @Nullable AutoIncIDRange autoIncIDRange) {
+        TableConfig tableConfig = getTableConfig();
         long start = clock.milliseconds();
         checkNotNull(kvTablet, "kv tablet should not be null.");
         try {
@@ -2260,7 +2256,7 @@ public final class Replica {
 
     public boolean isUnderReplicated() {
         // is leader and isr size less than numReplicas
-        return isLeader() && isrState.isr().size() < tableConfig.getReplicationFactor();
+        return isLeader() && isrState.isr().size() < getTableConfig().getReplicationFactor();
     }
 
     public boolean isUnderMinIsr() {
@@ -2288,15 +2284,11 @@ public final class Replica {
     private LogTablet createLog(
             File dataDir, OffsetCheckpointFile.LazyOffsetCheckpoints lazyHighWatermarkCheckpoint)
             throws Exception {
+        TableConfig tableConfig = getTableConfig();
         LogTablet log =
                 logManager.getOrCreateLog(
-                        dataDir,
-                        physicalPath,
-                        tableBucket,
-                        tableConfig.getLogFormat(),
-                        tableConfig.getTieredLogLocalSegments(),
-                        tableConfig.getLogTTLMs(),
-                        isKvTable());
+                        dataDir, physicalPath, tableBucket, tableConfig, isKvTable());
+        log.applyTableConfig(tableConfig);
         // update high watermark.
         Optional<Long> watermarkOpt = lazyHighWatermarkCheckpoint.fetch(tableBucket);
         long watermark =

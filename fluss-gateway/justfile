@@ -26,7 +26,7 @@ build:
 build-release:
     cargo build --release
 
-# Run all tests of the gateway.
+# Run all unit and protocol tests of the gateway.
 test:
     cargo test --all-targets
 
@@ -46,10 +46,21 @@ clippy:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-# Run the gateway binary, forwarding any flags, e.g. just run --version
+# Regenerate the checked-in OpenAPI 3.1 document from the typed contract.
+openapi:
+    cargo test --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
+
+# Run the gateway binary, forwarding any flags, e.g. just run --config gateway.yaml
 run *flags:
     cargo run -- {{flags}}
 
-# Check that every dependency license is compatible with the Apache License.
+# Check that every dependency license is compatible with the Apache License, and that no banned
+# crate entered the graph. `--locked` only here and in `deps`: editing `Cargo.toml` locally must
+# still be able to update the lockfile.
 licenses:
-    cargo deny check licenses
+    cargo deny --locked check licenses
+    cargo deny --locked check bans
+
+# Regenerate the checked-in dependency license inventory.
+deps:
+    cargo deny --locked list -f tsv -t 0.6 | sed 's/[[:space:]]*$//' > DEPENDENCIES.rust.tsv

@@ -34,3 +34,14 @@ exceptions = [
         "CDLA-Permissive-2.0",
     ] },
 ]
+
+[bans]
+# Duplicate versions are a transitive fact of life, not what this section guards.
+multiple-versions = "allow"
+deny = [
+    # HTTP/2 does not arrive through a decision in this crate but through Cargo feature
+    # unification: any dependency enabling `hyper-util/server-auto` (for example
+    # `metrics-exporter-prometheus`'s default features) pulls `hyper/http2` in for the whole graph,
+    # and no test would fail. Banning the stack keeps adding HTTP/2 a deliberate change.
+    { crate = "h2", reason = "the gateway listener serves HTTP/1.1 only; see fluss-gateway/src/lifecycle.rs" },
+]

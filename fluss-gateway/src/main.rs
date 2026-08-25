@@ -15,15 +15,54 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Placeholder entry point of the Fluss Gateway executable.
-//!
-//! This change only reserves the crate layout. The runtime — configuration,
-//! lifecycle management, and the REST layer — arrives with the Gateway
-//! foundation change described by FIP-49.
+//! `fluss-gateway` binary: parse the CLI, load and validate the config, initialise logging, then run the
+//! lifecycle. Exits nonzero on configuration errors (2) or startup/serving failures (1), e.g. a listener bind
+//! failure.
 
-fn main() {
-    println!(
-        "fluss-gateway {} (scaffolding only, the runtime is not wired yet)",
-        env!("CARGO_PKG_VERSION")
-    );
+use clap::Parser;
+use fluss_gateway::config::{self, CliOverrides};
+use fluss_gateway::{lifecycle, observability};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+/// Command-line arguments. Everything else is configured through the `gateway.yaml` file or the environment.
+#[derive(Debug, Parser)]
+#[command(
+    name = "fluss-gateway",
+    about = "Stateless REST gateway for Apache Fluss",
+    version
+)]
+struct Cli {
+    /// Path to the `gateway.yaml` configuration file (YAML with flat dotted keys).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Overrides `gateway.rest.listen` (e.g. `127.0.0.1:8080`).
+    #[arg(long, value_name = "ADDR")]
+    bind_address: Option<String>,
+}
+
+/// Loads configuration and runs the gateway process with stable exit codes.
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let overrides = CliOverrides {
+        bind_address: cli.bind_address,
+    };
+
+    let config = match config::load(cli.config.as_deref(), &env, &overrides) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("fluss-gateway: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    observability::init_logging();
+
+    if let Err(error) = lifecycle::run(config).await {
+        log::error!("fluss-gateway failed: {error}");
+        std::process::exit(1);
+    }
 }

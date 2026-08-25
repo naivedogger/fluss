@@ -27,6 +27,7 @@ import org.apache.fluss.flink.sink.state.WriterState;
 import org.apache.fluss.flink.sink.state.WriterStateSerializer;
 import org.apache.fluss.flink.sink.undo.UndoRecoveryManager.UndoOffsets;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.types.RowType;
 
@@ -152,6 +153,9 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     /** Union List State for storing bucket offsets across checkpoints. */
     private transient ListState<WriterState> undoStateList;
 
+    /** Table ID whose complete baseline is held in {@link #bucketOffsets}. */
+    @Nullable private transient Long resolvedTableId;
+
     /**
      * Map from TableBucket to the latest written offset.
      *
@@ -259,6 +263,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
         subtaskIndex = RuntimeContextAdapter.getIndexOfThisSubtask(runtimeContext);
         producerOffsetsDeleted = false;
         restoredFromCheckpoint = context.isRestored();
+        resolvedTableId = null;
 
         // Resolve producerId: use configured value or default to Flink job ID
         resolvedProducerId = configuredProducerId;
@@ -312,6 +317,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
             table = connection.getTable(tablePath);
         }
 
+        TableInfo tableInfo = table.getTableInfo();
         RecoveryOffsetManager offsetManager =
                 new RecoveryOffsetManager(
                         connection.getAdmin(),
@@ -321,14 +327,20 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
                         producerOffsetsPollIntervalMs,
                         maxPollTimeoutMs,
                         tablePath,
-                        table.getTableInfo());
+                        tableInfo);
 
         RecoveryOffsetManager.RecoveryDecision decision =
                 offsetManager.determineRecoveryStrategy(recoveredState);
+        // The recovery decision was built for this table identity and its current live buckets.
+        resolvedTableId = tableInfo.getTableId();
 
         LOG.info("Recovery decision for subtask {}: {}", subtaskIndex, decision);
 
-        // Step 4: Execute undo recovery if needed
+        // Step 4: Retain the complete positive-offset baseline regardless of whether any bucket
+        // currently needs Undo. Missing entries in V2 represent an explicit zero baseline.
+        Map<TableBucket, Long> recoveryOffsets = new HashMap<>(decision.getRecoveryOffsets());
+
+        // Step 5: Execute undo recovery if needed.
         if (decision.needsUndoRecovery()) {
             Map<TableBucket, UndoOffsets> undoOffsets = decision.getUndoOffsets();
             LOG.info(
@@ -338,20 +350,16 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
             LOG.debug("Subtask {} undoOffsets details: {}", subtaskIndex, undoOffsets);
 
             performUndoRecovery(undoOffsets);
-
-            // Initialize bucket offsets with recovery offsets (checkpoint offsets)
-            Map<TableBucket, Long> recoveryOffsets = decision.getRecoveryOffsets();
-            LOG.info(
-                    "Subtask {} initializing bucketOffsets from recovery: {} buckets",
-                    subtaskIndex,
-                    recoveryOffsets.size());
-            LOG.debug("Subtask {} recovery offsets details: {}", subtaskIndex, recoveryOffsets);
-            initializeBucketOffsets(recoveryOffsets);
         } else {
             LOG.info("No undo recovery needed for subtask {}", subtaskIndex);
-            // Initialize empty bucket offsets
-            initializeBucketOffsets(new HashMap<>());
         }
+
+        LOG.info(
+                "Subtask {} initializing complete baseline with {} positive offsets",
+                subtaskIndex,
+                recoveryOffsets.size());
+        LOG.debug("Subtask {} complete baseline details: {}", subtaskIndex, recoveryOffsets);
+        initializeBucketOffsets(recoveryOffsets);
 
         LOG.info(
                 "UndoRecoveryOperator initialized for subtask {} with {} bucket offsets",
@@ -410,7 +418,7 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
      * Snapshots the current state during checkpoint.
      *
      * <p>This method is called by Flink during checkpoint processing. It clears the existing state
-     * list and adds a new {@link WriterState} with the current bucket offsets if the map is not
+     * list and adds exactly one complete V2 {@link WriterState}, including when the baseline map is
      * empty.
      *
      * <p>Note: Producer offset cleanup is NOT done here. It is done in {@link
@@ -425,31 +433,24 @@ public class UndoRecoveryOperator<IN> extends AbstractStreamOperator<IN>
     public void snapshotState(StateSnapshotContext context) throws Exception {
         super.snapshotState(context);
 
-        // Clear existing state
-        undoStateList.clear();
+        checkState(bucketOffsets != null, "bucketOffsets must be initialized before snapshot");
+        checkState(resolvedTableId != null, "table ID must be resolved before snapshot");
 
-        // Add new state if bucket offsets is not empty
-        if (bucketOffsets != null) {
-            if (!bucketOffsets.isEmpty()) {
-                WriterState state = new WriterState(new HashMap<>(bucketOffsets));
-                undoStateList.add(state);
-                LOG.info(
-                        "Subtask {} snapshot state at checkpoint {}: {} buckets",
-                        subtaskIndex,
-                        context.getCheckpointId(),
-                        bucketOffsets.size());
-                LOG.debug(
-                        "Subtask {} checkpoint {} bucketOffsets details: {}",
-                        subtaskIndex,
-                        context.getCheckpointId(),
-                        bucketOffsets);
-            } else {
-                LOG.debug(
-                        "Subtask {} snapshot state at checkpoint {}: bucketOffsets is EMPTY",
-                        subtaskIndex,
-                        context.getCheckpointId());
-            }
-        }
+        undoStateList.clear();
+        // Persist one element even for an empty baseline so that V2 completeness survives restore.
+        undoStateList.add(WriterState.complete(resolvedTableId, new HashMap<>(bucketOffsets)));
+
+        LOG.info(
+                "Subtask {} snapshot complete V2 state at checkpoint {}: tableId={}, {} positive offsets",
+                subtaskIndex,
+                context.getCheckpointId(),
+                resolvedTableId,
+                bucketOffsets.size());
+        LOG.debug(
+                "Subtask {} checkpoint {} complete baseline details: {}",
+                subtaskIndex,
+                context.getCheckpointId(),
+                bucketOffsets);
     }
 
     /**

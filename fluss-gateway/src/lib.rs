@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Internal implementation crate of the Fluss Gateway.
+//! Internal implementation of the stateless REST gateway for Apache Fluss.
 //!
-//! The gateway is a stateless REST front end for Apache Fluss (FIP-49): it
-//! keeps no session, cursor, or replay state, so any instance can serve any
-//! request behind a plain load balancer. This change only reserves the crate
-//! layout; the runtime modules arrive with the Gateway foundation change.
+//! The library target keeps the executable entry point thin and lets integration tests exercise the production
+//! router and lifecycle in process. The package is not published as a reusable crate and makes no public API
+//! compatibility commitment.
+//!
+//! # Statelessness contract
+//!
+//! The gateway keeps **no** request-spanning state. There is no session store, no cursor store, and no replay
+//! cache — deliberately, there is not even a `store` module for one to be added to. Every response is derivable
+//! from the request plus current cluster state, so any instance can serve any request and instances can be added
+//! or removed freely behind a plain load balancer.
 
-#[cfg(test)]
-mod tests {
-    // A single smoke test so the CI build-and-test gate proves the test
-    // harness is wired up from day one; real suites arrive with the runtime.
-    #[test]
-    fn crate_layout_is_wired() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "fluss-gateway");
-    }
-}
+pub mod config;
+pub mod error;
+pub mod lifecycle;
+pub mod observability;
+pub mod protocol;

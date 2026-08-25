@@ -430,8 +430,45 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
     }
 
     @Test
+    void testAlterTableLogTtl() throws Exception {
+        TablePath tablePath = TablePath.of("test_db", "alter_table_log_ttl");
+        admin.createTable(tablePath, DEFAULT_TABLE_DESCRIPTOR, false).get();
+        // verify initial value matches DEFAULT_TABLE_DESCRIPTOR (1 day)
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        assertThat(tableInfo.getTableConfig().getLogTTLMs())
+                .isEqualTo(Duration.ofDays(1).toMillis());
+
+        // alter to 3d and verify metadata
+        List<TableChange> tableChanges =
+                Collections.singletonList(TableChange.set(ConfigOptions.TABLE_LOG_TTL.key(), "3d"));
+        admin.alterTable(tablePath, tableChanges, false).get();
+
+        tableInfo = admin.getTableInfo(tablePath).get();
+        assertThat(tableInfo.getTableConfig().getLogTTLMs())
+                .isEqualTo(Duration.ofDays(3).toMillis());
+
+        // alter to 30d to verify multiple updates work.
+        tableChanges =
+                Collections.singletonList(
+                        TableChange.set(ConfigOptions.TABLE_LOG_TTL.key(), "30d"));
+        admin.alterTable(tablePath, tableChanges, false).get();
+        tableInfo = admin.getTableInfo(tablePath).get();
+        assertThat(tableInfo.getTableConfig().getLogTTLMs())
+                .isEqualTo(Duration.ofDays(30).toMillis());
+
+        // reset; value falls back to default.
+        tableChanges =
+                Collections.singletonList(TableChange.reset(ConfigOptions.TABLE_LOG_TTL.key()));
+        admin.alterTable(tablePath, tableChanges, false).get();
+        tableInfo = admin.getTableInfo(tablePath).get();
+        assertThat(tableInfo.toTableDescriptor().getProperties())
+                .doesNotContainKey(ConfigOptions.TABLE_LOG_TTL.key());
+        assertThat(tableInfo.getTableConfig().getLogTTLMs())
+                .isEqualTo(ConfigOptions.TABLE_LOG_TTL.defaultValue().toMillis());
+    }
+
+    @Test
     void testAlterTableColumn() throws Exception {
-        // create table
         TablePath tablePath = TablePath.of("test_db", "alter_table_1");
         admin.createTable(tablePath, DEFAULT_TABLE_DESCRIPTOR, false).get();
 
@@ -866,6 +903,29 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessage("'table.log.tiered.local-segments' must be greater than 0.");
 
+        TableDescriptor invalidLocalTtl =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("test table")
+                        .property(ConfigOptions.TABLE_LOG_TTL.key(), "1h")
+                        .property(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "2h")
+                        .build();
+        assertThatThrownBy(() -> admin.createTable(tablePath, invalidLocalTtl, false).get())
+                .cause()
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessage("'table.log.local-ttl' must be less than or equal to 'table.log.ttl'.");
+
+        TableDescriptor disabledLocalTtl =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("test table")
+                        .property(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "0ms")
+                        .build();
+        admin.createTable(tablePath, disabledLocalTtl, false).join();
+        assertThat(admin.getTableInfo(tablePath).join().getTableConfig().getLocalLogTTLMs())
+                .isZero();
+        admin.dropTable(tablePath, false).join();
+
         TableDescriptor t4 =
                 TableDescriptor.builder()
                         .schema(DEFAULT_SCHEMA) // no pk
@@ -927,6 +987,24 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining(
                         "Currently, Primary Key Table supports ARROW or COMPACTED log format when kv format is COMPACTED.");
+    }
+
+    @Test
+    void testCreateTableWithLocalTtlAndInfiniteRemoteTtl() throws Exception {
+        TablePath tablePath =
+                TablePath.of(
+                        DEFAULT_TABLE_PATH.getDatabaseName(),
+                        "test_local_ttl_with_infinite_remote_ttl");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .property(ConfigOptions.TABLE_LOG_TTL.key(), "0ms")
+                        .property(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "1h")
+                        .build();
+
+        admin.createTable(tablePath, tableDescriptor, false).get();
+        assertThat(admin.tableExists(tablePath).get()).isTrue();
+        admin.dropTable(tablePath, false).get();
     }
 
     @Test
@@ -2441,6 +2519,51 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(2);
 
         // 11. Cleanup
+        admin.dropTable(tablePath, false).get();
+    }
+
+    @Test
+    void testAlterTableLocalLogTtl() throws Exception {
+        TablePath tablePath = TablePath.of("test_db", "test_alter_local_log_ttl");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .distributedBy(3)
+                        .property(ConfigOptions.TABLE_LOG_TTL.key(), "7d")
+                        .property(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "2h")
+                        .build();
+
+        admin.createTable(tablePath, tableDescriptor, false).get();
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), 0);
+        LogTablet logTablet =
+                FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket).getLogTablet();
+        assertThat(logTablet.getEffectiveLocalLogTtlMs()).isEqualTo(Duration.ofHours(2).toMillis());
+
+        admin.alterTable(
+                        tablePath,
+                        Collections.singletonList(
+                                TableChange.set(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "3h")),
+                        false)
+                .get();
+        assertThat(admin.getTableInfo(tablePath).get().getTableConfig().getLocalLogTTLMs())
+                .isEqualTo(Duration.ofHours(3).toMillis());
+        waitUntil(
+                () -> logTablet.getEffectiveLocalLogTtlMs() == Duration.ofHours(3).toMillis(),
+                Duration.ofSeconds(30),
+                "Waiting for local log TTL to propagate to TabletServer");
+
+        admin.alterTable(
+                        tablePath,
+                        Collections.singletonList(
+                                TableChange.reset(ConfigOptions.TABLE_LOG_LOCAL_TTL.key())),
+                        false)
+                .get();
+        waitUntil(
+                () -> logTablet.getEffectiveLocalLogTtlMs() == Duration.ofDays(7).toMillis(),
+                Duration.ofSeconds(30),
+                "Waiting for local log TTL reset to propagate to TabletServer");
+
         admin.dropTable(tablePath, false).get();
     }
 

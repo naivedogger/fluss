@@ -612,7 +612,7 @@ public class ReplicaManager implements ServerReconfigurable {
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
                     Set<Long> deletedTableIds =
                             metadataCache.updateClusterMetadata(clusterMetadata);
-                    updateReplicaTableConfig(clusterMetadata);
+                    updateReplicaTableInfo(clusterMetadata);
                     if (!deletedTableIds.isEmpty()) {
                         ioExecutor.execute(
                                 () ->
@@ -623,26 +623,13 @@ public class ReplicaManager implements ServerReconfigurable {
                 });
     }
 
-    private void updateReplicaTableConfig(ClusterMetadata clusterMetadata) {
-        Map<Long, Boolean> tableIdToLakeFlag = new HashMap<>();
-        Map<Long, Integer> tableIdToTieredLogLocalSegments = new HashMap<>();
-
+    private void updateReplicaTableInfo(ClusterMetadata clusterMetadata) {
+        Map<Long, TableInfo> tableInfosById = new HashMap<>();
         for (TableMetadata tableMetadata : clusterMetadata.getTableMetadataList()) {
             TableInfo tableInfo = tableMetadata.getTableInfo();
-            long tableId = tableInfo.getTableId();
-
-            // Collect datalake enabled configuration
-            if (tableInfo.getTableConfig().getDataLakeFormat().isPresent()) {
-                boolean dataLakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
-                tableIdToLakeFlag.put(tableId, dataLakeEnabled);
-            }
-
-            // Collect tiered log local segments configuration
-            int tieredLogLocalSegments = tableInfo.getTableConfig().getTieredLogLocalSegments();
-            tableIdToTieredLogLocalSegments.put(tableId, tieredLogLocalSegments);
+            tableInfosById.put(tableInfo.getTableId(), tableInfo);
         }
-
-        if (tableIdToLakeFlag.isEmpty() && tableIdToTieredLogLocalSegments.isEmpty()) {
+        if (tableInfosById.isEmpty()) {
             return;
         }
 
@@ -651,16 +638,9 @@ public class ReplicaManager implements ServerReconfigurable {
             if (hostedReplica instanceof OnlineReplica) {
                 Replica replica = ((OnlineReplica) hostedReplica).getReplica();
                 long tableId = replica.getTableBucket().getTableId();
-
-                // Update datalake enabled configuration
-                if (tableIdToLakeFlag.containsKey(tableId)) {
-                    replica.updateIsDataLakeEnabled(tableIdToLakeFlag.get(tableId));
-                }
-
-                // Update tiered log local segments configuration
-                if (tableIdToTieredLogLocalSegments.containsKey(tableId)) {
-                    replica.updateTieredLogLocalSegments(
-                            tableIdToTieredLogLocalSegments.get(tableId));
+                TableInfo tableInfo = tableInfosById.get(tableId);
+                if (tableInfo != null) {
+                    replica.updateTableInfo(tableInfo);
                 }
             }
         }
