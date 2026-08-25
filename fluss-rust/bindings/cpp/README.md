@@ -96,8 +96,8 @@ if (!finished) {
 }
 ```
 
-Timestamp-bounded reads use the same iterator after resolving the timestamps independently for
-each bucket:
+Timestamp-bounded reads use the same iterator after resolving the half-open timestamp range
+independently for each bucket:
 
 ```cpp
 fluss::RecordBatchLogReader timestamp_reader;

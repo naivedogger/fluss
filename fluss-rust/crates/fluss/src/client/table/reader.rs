@@ -40,7 +40,6 @@ use crate::{PartitionId, TableId};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::{Stream, future::try_join_all};
-use log::warn;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -67,10 +66,12 @@ pub enum RecordBatchReadOutcome {
 pub struct BoundedLogReadRange {
     /// Bucket to read. Its partition mode must match the scanned table.
     pub bucket: TableBucket,
-    /// First offset to read, inclusive.
+    /// First offset to read, inclusive. Must be non-negative or
+    /// [`crate::client::EARLIEST_OFFSET`].
     pub starting_offset: i64,
-    /// Offset to stop at, exclusive. Must not be below `starting_offset`;
-    /// an equal value is an empty range that completes immediately.
+    /// Non-negative offset to stop at, exclusive. Must not be below
+    /// `starting_offset`; an equal value is an empty range that completes
+    /// immediately.
     pub stopping_offset: i64,
 }
 
@@ -186,6 +187,13 @@ impl RecordBatchLogReader {
         )?;
 
         let stopping_offsets = query_latest_offsets(admin, &scanner, &subscribed).await?;
+        unsubscribe_completed_buckets(
+            &scanner,
+            subscribed
+                .iter()
+                .map(|(bucket, _)| bucket)
+                .filter(|bucket| !stopping_offsets.contains_key(*bucket)),
+        );
         let schema = scanner.schema();
         activation.keep_active();
 
@@ -199,8 +207,10 @@ impl RecordBatchLogReader {
 
     /// Create a reader with explicit stopping offsets per bucket.
     ///
-    /// # NOTE: Every key in `stopping_offsets` **must** correspond to a bucket that is
-    /// currently subscribed on the `scanner`; construction fails otherwise.
+    /// # NOTE: Every key in `stopping_offsets` **must** correspond to a bucket
+    /// currently subscribed on the `scanner`, every subscribed bucket must
+    /// have a stopping offset, and every stopping offset must be non-negative;
+    /// construction fails otherwise.
     /// Concrete subscriptions that already meet their stop point are treated
     /// as empty ranges and complete immediately.
     ///
@@ -219,7 +229,9 @@ impl RecordBatchLogReader {
             scanner.num_buckets(),
             stopping_offsets.keys(),
         )?;
-        validate_stopping_offsets(scanner.get_subscribed_buckets(), &mut stopping_offsets)?;
+        let completed =
+            validate_stopping_offsets(scanner.get_subscribed_buckets(), &mut stopping_offsets)?;
+        unsubscribe_completed_buckets(&scanner, &completed);
 
         let schema = scanner.schema();
         activation.keep_active();
@@ -239,9 +251,10 @@ impl RecordBatchLogReader {
     /// from a foreign language). Ranges are validated against the scanned
     /// table before anything is subscribed: every bucket must belong to the
     /// table, match its partition mode, appear once, and have
-    /// a valid bucket id and `starting_offset <= stopping_offset`. The scanner
-    /// must not have existing subscriptions. Empty ranges need no subscription
-    /// and complete immediately.
+    /// a valid bucket id, `starting_offset <= stopping_offset`, and a
+    /// non-negative stopping offset. The scanner must not have existing
+    /// subscriptions. Empty ranges need no subscription and complete
+    /// immediately.
     pub async fn new_from_ranges(
         scanner: RecordBatchLogScanner,
         ranges: Vec<BoundedLogReadRange>,
@@ -268,7 +281,7 @@ impl RecordBatchLogReader {
         let mut bucket_offsets: HashMap<i32, i64> = HashMap::new();
         let mut partition_bucket_offsets: HashMap<(PartitionId, i32), i64> = HashMap::new();
         for range in ranges {
-            if range.starting_offset == range.stopping_offset {
+            if range.stopping_offset == 0 || range.starting_offset == range.stopping_offset {
                 continue;
             }
             match range.bucket.partition_id() {
@@ -306,7 +319,7 @@ impl RecordBatchLogReader {
         })
     }
 
-    /// Create a reader for a `[starting_timestamp_ms, stopping_timestamp_ms]`
+    /// Create a reader for a `[starting_timestamp_ms, stopping_timestamp_ms)`
     /// window over the requested buckets.
     ///
     /// Both timestamps are resolved to offsets per bucket, then read with
@@ -665,6 +678,22 @@ fn validate_read_ranges(
         ranges.iter().map(|range| &range.bucket),
     )?;
     for range in ranges {
+        if range.starting_offset < 0 && range.starting_offset != crate::client::EARLIEST_OFFSET {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Read range for {:?} has unsupported negative starting offset {}.",
+                    range.bucket, range.starting_offset
+                ),
+            });
+        }
+        if range.stopping_offset < 0 {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Read range for {:?} has negative stopping offset {}.",
+                    range.bucket, range.stopping_offset
+                ),
+            });
+        }
         if range.starting_offset > range.stopping_offset {
             return Err(Error::IllegalArgument {
                 message: format!(
@@ -680,8 +709,17 @@ fn validate_read_ranges(
 fn validate_stopping_offsets(
     subscriptions: Vec<(TableBucket, i64)>,
     stopping_offsets: &mut HashMap<TableBucket, i64>,
-) -> Result<()> {
+) -> Result<Vec<TableBucket>> {
     let subscribed: HashMap<TableBucket, i64> = subscriptions.into_iter().collect();
+    for (bucket, start) in &subscribed {
+        if *start < 0 && *start != crate::client::EARLIEST_OFFSET {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Scanner subscription for {bucket:?} has unsupported negative starting offset {start}."
+                ),
+            });
+        }
+    }
     for bucket in stopping_offsets.keys() {
         if !subscribed.contains_key(bucket) {
             return Err(Error::IllegalArgument {
@@ -691,18 +729,54 @@ fn validate_stopping_offsets(
             });
         }
     }
+    for bucket in subscribed.keys() {
+        if !stopping_offsets.contains_key(bucket) {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Scanner subscription for {bucket:?} has no matching stopping offset."
+                ),
+            });
+        }
+    }
+    for (bucket, stop) in stopping_offsets.iter() {
+        if *stop < 0 {
+            return Err(Error::IllegalArgument {
+                message: format!("Stopping offset for {bucket:?} must not be negative."),
+            });
+        }
+    }
 
-    // A concrete subscription that already meets the stop point is an empty
-    // range. Remove it up front so the reader can finish without waiting for a
-    // server batch that may never arrive. Negative offsets are symbolic values
-    // such as EARLIEST_OFFSET and cannot be compared until the server resolves
-    // them.
+    // A stop at offset 0 is always empty because log offsets are non-negative.
+    // Otherwise, a concrete subscription that already meets the stop point is
+    // also empty. Remove both up front so the reader can finish without waiting
+    // for a server batch that may never arrive. Negative starting offsets are
+    // symbolic values such as EARLIEST_OFFSET and cannot otherwise be compared
+    // until the server resolves them.
+    let mut completed = Vec::new();
     stopping_offsets.retain(|bucket, stop| {
-        subscribed
-            .get(bucket)
-            .is_none_or(|start| *start < 0 || start < stop)
+        let should_read = *stop > 0
+            && subscribed
+                .get(bucket)
+                .is_none_or(|start| *start < 0 || start < stop);
+        if !should_read {
+            completed.push(bucket.clone());
+        }
+        should_read
     });
-    Ok(())
+    Ok(completed)
+}
+
+fn unsubscribe_completed_buckets<'a>(
+    scanner: &RecordBatchLogScanner,
+    buckets: impl IntoIterator<Item = &'a TableBucket>,
+) {
+    for bucket in buckets {
+        if let Some(partition_id) = bucket.partition_id() {
+            scanner.unsubscribe_partition_sync(partition_id, bucket.bucket_id());
+        } else {
+            scanner.unsubscribe_sync(bucket.bucket_id());
+        }
+    }
 }
 
 /// Resolves an [`OffsetSpec`] into per-bucket offsets, hiding the partitioned
@@ -808,9 +882,9 @@ impl<'a> OffsetResolver<'a> {
 ///
 /// Buckets whose subscribed offset already meets or exceeds the latest offset
 /// are excluded from the result (there is nothing to read). A `latest_offset`
-/// of `0` means the bucket is empty and is silently skipped; a negative value
-/// is unexpected from the server and is logged as a warning before being
-/// skipped.
+/// of `0` means the bucket is empty. Missing or negative offsets are treated as
+/// errors rather than silently reporting a potentially incomplete read as
+/// finished.
 async fn query_latest_offsets(
     admin: &FlussAdmin,
     scanner: &RecordBatchLogScanner,
@@ -825,14 +899,23 @@ async fn query_latest_offsets(
 
     let mut stopping_offsets = HashMap::with_capacity(latest_offsets.len());
     for (bucket, subscribed_offset) in subscribed {
-        let Some(&latest_offset) = latest_offsets.get(bucket) else {
-            continue;
-        };
+        let latest_offset =
+            latest_offsets
+                .get(bucket)
+                .copied()
+                .ok_or_else(|| Error::UnexpectedError {
+                    message: format!(
+                        "Latest offset lookup did not return an offset for {bucket:?}."
+                    ),
+                    source: None,
+                })?;
         if latest_offset < 0 {
-            warn!(
-                "Server returned negative latest offset {latest_offset} for {bucket:?} of table {table_id}; skipping bucket."
-            );
-            continue;
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Server returned negative latest offset {latest_offset} for {bucket:?} of table {table_id}."
+                ),
+                source: None,
+            });
         }
         if latest_offset == 0 {
             continue;
@@ -1013,24 +1096,55 @@ mod tests {
     }
 
     #[test]
-    fn validate_stopping_offsets_prunes_completed_range() {
-        let mut offsets = HashMap::from([(bucket(0), 10), (bucket(1), 20)]);
-        validate_stopping_offsets(vec![(bucket(0), 10), (bucket(1), 15)], &mut offsets).unwrap();
+    fn validate_read_ranges_rejects_negative_stopping_offset() {
+        let ranges = vec![range(bucket(0), crate::client::EARLIEST_OFFSET, -1)];
 
-        assert!(!offsets.contains_key(&bucket(0)));
-        assert_eq!(offsets.get(&bucket(1)), Some(&20));
+        let result = validate_read_ranges(1, false, 1, &ranges);
+
+        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
     }
 
     #[test]
-    fn validate_stopping_offsets_keeps_symbolic_start() {
+    fn validate_read_ranges_rejects_unknown_negative_starting_offset() {
+        let ranges = vec![range(bucket(0), -1, 10)];
+
+        let result = validate_read_ranges(1, false, 1, &ranges);
+
+        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
+    }
+
+    #[test]
+    fn validate_stopping_offsets_prunes_completed_range() {
+        let mut offsets = HashMap::from([(bucket(0), 10), (bucket(1), 20)]);
+        let completed =
+            validate_stopping_offsets(vec![(bucket(0), 10), (bucket(1), 15)], &mut offsets)
+                .unwrap();
+
+        assert!(!offsets.contains_key(&bucket(0)));
+        assert_eq!(offsets.get(&bucket(1)), Some(&20));
+        assert_eq!(completed, vec![bucket(0)]);
+    }
+
+    #[test]
+    fn validate_stopping_offsets_prunes_zero_stop_with_symbolic_start() {
         let mut offsets = HashMap::from([(bucket(0), 0)]);
-        validate_stopping_offsets(
+        let completed = validate_stopping_offsets(
             vec![(bucket(0), crate::client::EARLIEST_OFFSET)],
             &mut offsets,
         )
         .unwrap();
 
-        assert_eq!(offsets.get(&bucket(0)), Some(&0));
+        assert!(!offsets.contains_key(&bucket(0)));
+        assert_eq!(completed, vec![bucket(0)]);
+    }
+
+    #[test]
+    fn validate_stopping_offsets_rejects_subscription_without_stop() {
+        let mut offsets = HashMap::from([(bucket(0), 10)]);
+
+        let result = validate_stopping_offsets(vec![(bucket(0), 0), (bucket(1), 0)], &mut offsets);
+
+        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
     }
 
     #[test]

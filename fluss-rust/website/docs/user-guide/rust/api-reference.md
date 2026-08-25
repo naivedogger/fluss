@@ -203,8 +203,9 @@ Unlike `RecordBatchLogScanner` which polls indefinitely, this reader stops autom
 | `fn to_record_batch_reader(self, handle: tokio::runtime::Handle) -> SyncRecordBatchLogReader`                | Sync adapter implementing `arrow::RecordBatchReader` (see below) |
 
 `new_from_ranges` requires a scanner without existing subscriptions. It validates table identity,
-partition mode, duplicate and out-of-range bucket ids, and range ordering before subscribing.
-Timestamp offset lookups for independent partitions are issued concurrently.
+partition mode, duplicate and out-of-range bucket ids, range ordering, and non-negative stopping
+offsets before subscribing. `new_until_offsets` requires one stopping offset for every scanner
+subscription. Timestamp offset lookups for independent partitions are issued concurrently.
 
 `collect_all_batches_with_timeout` returns batches collected before the budget expires and sets
 `BoundedCollectOutcome::complete` to indicate whether every stopping offset was reached. Once the

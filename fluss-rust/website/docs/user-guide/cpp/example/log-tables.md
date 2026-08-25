@@ -202,8 +202,9 @@ Inspect `result.status` only when `NextBatch()` returns an `Ok()` result. `Timed
 exhaust the reader; it lets a query engine periodically check cancellation or deadlines before
 retrying. `Finished` means all stopping offsets have been reached.
 
-To read a log timestamp range, pass the assigned buckets and timestamps. Fluss resolves both
-timestamps with `OffsetSpec::Timestamp` for every bucket, then uses the same bounded offset reader:
+To read a half-open log timestamp range `[starting_timestamp_ms, stopping_timestamp_ms)`, pass the
+assigned buckets and timestamps. Fluss resolves both timestamps with `OffsetSpec::Timestamp` for
+every bucket, then uses the same bounded offset reader:
 
 ```cpp
 fluss::RecordBatchLogReader reader;

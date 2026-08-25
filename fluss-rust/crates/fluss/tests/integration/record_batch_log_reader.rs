@@ -152,10 +152,14 @@ mod reader_test {
 
         let table_id = table.get_table_info().table_id;
         let mut reader = RecordBatchLogReader::new_until_offsets(
-            scanner,
+            scanner.new_shared_handle(),
             HashMap::from([(TableBucket::new(table_id, 0), 1)]),
         )
         .expect("Failed to create record batch reader");
+        assert!(
+            scanner.get_subscribed_buckets().is_empty(),
+            "an empty range should be unsubscribed as soon as the reader is created"
+        );
 
         let batches = tokio::time::timeout(Duration::from_secs(10), reader.collect_all_batches())
             .await

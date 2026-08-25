@@ -1243,16 +1243,18 @@ struct ReaderStopOffset {
 };
 
 /// One bounded log range. Records are returned for
-/// [starting_offset, stopping_offset). The bucket id must be within the table's
-/// configured bucket count.
+/// [starting_offset, stopping_offset). `stopping_offset` must be non-negative,
+/// `starting_offset` must be non-negative or `EARLIEST_OFFSET`, and the bucket
+/// id must be within the table's configured bucket count.
 struct RecordBatchLogReadRange {
     TableBucket bucket;
     int64_t starting_offset;
     int64_t stopping_offset;
 };
 
-/// A log timestamp range in epoch milliseconds. Each requested bucket resolves
-/// the two timestamps to offsets before the reader is created.
+/// A half-open log timestamp range [starting_timestamp_ms,
+/// stopping_timestamp_ms) in epoch milliseconds. Each requested bucket
+/// resolves the two timestamps to offsets before the reader is created.
 struct TimestampRange {
     int64_t starting_timestamp_ms;
     int64_t stopping_timestamp_ms;

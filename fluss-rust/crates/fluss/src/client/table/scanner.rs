@@ -417,6 +417,12 @@ struct LogScannerInner {
     /// Guards against subscription changes while a
     /// [`crate::client::RecordBatchLogReader`] is iterating.
     reader_active: std::sync::atomic::AtomicBool,
+    /// Serializes the active-reader transition with subscription mutations.
+    ///
+    /// Public subscribe methods await metadata before changing the status map.
+    /// Without this lock, a subscribe call that passed the initial
+    /// `reader_active` check could finish after a bounded reader became active.
+    subscription_lock: Mutex<()>,
     /// Holds the snapshot fields used by [`PollGuard`] to derive the
     /// scanner poll-timing metrics. The mutex makes the state updates
     /// in `record_poll_start` / `record_poll_end` atomic; metric
@@ -615,6 +621,7 @@ impl LogScannerInner {
             )?,
             arrow_schema,
             reader_active: std::sync::atomic::AtomicBool::new(false),
+            subscription_lock: Mutex::new(()),
             poll_state: Mutex::new(PollState::default()),
             metrics,
             last_poll_unix_ms,
@@ -791,6 +798,8 @@ impl LogScannerInner {
         self.metadata
             .check_and_update_table_metadata(from_ref(&self.table_path))
             .await?;
+        let _subscription_guard = self.subscription_lock.lock();
+        self.check_no_active_reader()?;
         self.log_scanner_status
             .assign_scan_bucket(table_bucket, offset);
         Ok(())
@@ -850,6 +859,8 @@ impl LogScannerInner {
         self.metadata
             .check_and_update_table_metadata(from_ref(&self.table_path))
             .await?;
+        let _subscription_guard = self.subscription_lock.lock();
+        self.check_no_active_reader()?;
         self.log_scanner_status
             .assign_scan_bucket(table_bucket, offset);
         Ok(())
@@ -914,6 +925,7 @@ impl LogScannerInner {
             .check_and_update_table_metadata(from_ref(&self.table_path))
             .await?;
 
+        let _subscription_guard = self.subscription_lock.lock();
         if reader_is_active {
             debug_assert!(
                 self.reader_active
@@ -928,6 +940,7 @@ impl LogScannerInner {
     }
 
     async fn unsubscribe(&self, bucket: i32) -> Result<()> {
+        let _subscription_guard = self.subscription_lock.lock();
         self.check_no_active_reader()?;
         if self.is_partitioned_table {
             return Err(Error::UnsupportedOperation {
@@ -944,6 +957,7 @@ impl LogScannerInner {
     }
 
     async fn unsubscribe_partition(&self, partition_id: PartitionId, bucket: i32) -> Result<()> {
+        let _subscription_guard = self.subscription_lock.lock();
         self.check_no_active_reader()?;
         if !self.is_partitioned_table {
             return Err(Error::UnsupportedOperation {
@@ -1178,6 +1192,7 @@ impl RecordBatchLogScanner {
     /// `LogScannerImpl.acquire()` single-consumer guard.
     pub(crate) fn try_set_reader_active(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
+        let _subscription_guard = self.inner.subscription_lock.lock();
         self.inner
             .reader_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1191,6 +1206,7 @@ impl RecordBatchLogScanner {
 
     /// Clears the active-reader guard, re-enabling subscription changes.
     pub(crate) fn clear_reader_active(&self) {
+        let _subscription_guard = self.inner.subscription_lock.lock();
         self.inner
             .reader_active
             .store(false, std::sync::atomic::Ordering::Release);
@@ -1208,6 +1224,7 @@ impl RecordBatchLogScanner {
     ///
     /// **Not intended for general use** — prefer the async [`unsubscribe`].
     pub(crate) fn unsubscribe_sync(&self, bucket: i32) {
+        let _subscription_guard = self.inner.subscription_lock.lock();
         if self.inner.is_partitioned_table {
             return;
         }
@@ -1221,6 +1238,7 @@ impl RecordBatchLogScanner {
     /// [`unsubscribe_partition`](Self::unsubscribe_partition). See
     /// [`unsubscribe_sync`](Self::unsubscribe_sync) for rationale.
     pub(crate) fn unsubscribe_partition_sync(&self, partition_id: PartitionId, bucket: i32) {
+        let _subscription_guard = self.inner.subscription_lock.lock();
         if !self.inner.is_partitioned_table {
             return;
         }

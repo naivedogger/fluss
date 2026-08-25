@@ -230,15 +230,15 @@ useful when subscriptions need to be configured incrementally.
 | Field             | Type          | Description                         |
 |-------------------|---------------|-------------------------------------|
 | `bucket`          | `TableBucket` | Bucket assigned to this reader      |
-| `starting_offset` | `int64_t`     | Inclusive starting offset           |
-| `stopping_offset` | `int64_t`     | Exclusive stopping offset           |
+| `starting_offset` | `int64_t`     | Inclusive non-negative offset or `EARLIEST_OFFSET` |
+| `stopping_offset` | `int64_t`     | Non-negative exclusive stopping offset |
 
 ## `TimestampRange`
 
 | Field                     | Type      | Description                                  |
 |---------------------------|-----------|----------------------------------------------|
-| `starting_timestamp_ms`   | `int64_t` | Starting log timestamp in epoch milliseconds |
-| `stopping_timestamp_ms`   | `int64_t` | Stopping log timestamp in epoch milliseconds |
+| `starting_timestamp_ms`   | `int64_t` | Inclusive starting timestamp in epoch milliseconds |
+| `stopping_timestamp_ms`   | `int64_t` | Exclusive stopping timestamp in epoch milliseconds |
 
 ## `RecordBatchReadResult`
 
@@ -295,9 +295,9 @@ than start an unconditional retry loop.
 
 `TableScan::CreateRecordBatchLogReader()` accepts resolved per-bucket ranges, which is useful when
 a coordinator has selected globally consistent offsets for multiple workers. Each bucket id is
-validated against the table's configured bucket count. The timestamp overload resolves both
-timestamps with `OffsetSpec::Timestamp` for every requested bucket before reading; independent
-partition lookups are issued concurrently.
+validated against the table's configured bucket count, and stopping offsets must be non-negative.
+The timestamp overload resolves both timestamps with `OffsetSpec::Timestamp` for every requested
+bucket before reading; independent partition lookups are issued concurrently.
 
 ## `BatchScanner`
 
