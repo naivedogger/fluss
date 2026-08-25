@@ -1753,37 +1753,19 @@ mod tests {
         assert!(config.warnings().is_empty());
     }
 
+    // conf/gateway.yaml ships in the binary distribution and the container image, so it is
+    // a release artifact rather than a sample: it has to parse, it has to document every
+    // option, and its values must not drift away from the compiled defaults.
     #[test]
-    fn distribution_configuration_is_complete_and_matches_java_conventions() {
+    fn distribution_configuration_is_loadable_and_complete() {
         let template = include_str!("../conf/gateway.yaml");
         let config = load_file(template).unwrap();
+        let defaults = load(None, &no_env(), &CliOverrides::default()).unwrap();
 
-        assert_eq!(
-            config.server.rest.bind_address,
-            "127.0.0.1:8080".parse().unwrap()
-        );
-        assert_eq!(
-            config.server.metrics.bind_address,
-            "127.0.0.1:9095".parse().unwrap()
-        );
-        assert!(config.server.metrics.enabled);
-        assert_eq!(
-            cluster(&config, DEFAULT_CLUSTER_ID).bootstrap_servers,
-            DEFAULT_BOOTSTRAP_SERVERS
-        );
-        assert_eq!(
-            cluster(&config, DEFAULT_CLUSTER_ID).connect_timeout.get(),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            cluster(&config, DEFAULT_CLUSTER_ID).identity_mode,
-            IdentityMode::Service
-        );
-        assert_eq!(config.security.authentication, AuthenticationMode::Trust);
-        assert_eq!(config.request_limits, RequestLimitsConfig::default());
-        assert_eq!(config.shutdown.drain_timeout.get(), Duration::from_secs(30));
-        assert!(config.warnings().is_empty());
+        assert_eq!(config, defaults);
 
+        // Cluster IDs are resolved before the typed entries, so this key is not in
+        // CONFIG_ENTRIES and would otherwise go undocumented unnoticed.
         assert!(template.contains(&format!("{CLUSTERS_KEY}:")));
         for entry in CONFIG_ENTRIES {
             assert!(

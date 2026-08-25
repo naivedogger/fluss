@@ -242,7 +242,11 @@ def generate_license(repository_root: Path, packages: Iterable[dict]) -> str:
         "the other architecture's executable.",
     ]
     apache_dependencies: List[str] = []
-    other_sections: List[str] = []
+    # Crates that ship byte-identical license text share a single reproduction, which
+    # removes about a third of this file. The grouping key is the license text itself,
+    # so no reproduced text is ever rewritten, reordered or dropped, and every crate
+    # keeps its own attribution block.
+    reproductions: Dict[Tuple[Tuple[str, str], ...], List[List[str]]] = {}
 
     for package in packages:
         if package["source"] is None and package["name"] in LOCAL_PACKAGES:
@@ -263,22 +267,36 @@ def generate_license(repository_root: Path, packages: Iterable[dict]) -> str:
 
         package_dir = Path(package["manifest_path"]).parent
         homepage = package.get("homepage") or package.get("repository") or "(not provided)"
-        contents = [
-            SEPARATOR,
-            "",
+        attribution = [
             f"The supported Linux Gateway binaries use the Rust crate {package_name}.",
             f"Project URL: {homepage}",
             f"Declared license: {expression}",
             f"Selected license obligations: {' AND '.join(selected_terms)}",
         ]
-        for path in files:
+        reproduction = tuple(
+            (
+                str(path.relative_to(package_dir)),
+                path.read_text(encoding="utf-8").rstrip(),
+            )
+            for path in files
+        )
+        reproductions.setdefault(reproduction, []).append(attribution)
+
+    other_sections: List[str] = []
+    for reproduction, attributions in reproductions.items():
+        contents = [SEPARATOR]
+        for attribution in attributions:
+            contents.append("")
+            contents.extend(attribution)
+        if len(attributions) > 1:
             contents.extend(
                 [
                     "",
-                    f"License file: {path.relative_to(package_dir)}",
-                    indent(path.read_text(encoding="utf-8")),
+                    "These crates ship identical license text, reproduced once below.",
                 ]
             )
+        for file_name, text in reproduction:
+            contents.extend(["", f"License file: {file_name}", indent(text)])
         other_sections.append("\n".join(contents))
 
     sections.extend(
