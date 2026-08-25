@@ -28,10 +28,16 @@
 pub mod clusters;
 pub mod datatype;
 pub mod ddl;
+// The write and lookup tasks consume these crate-private APIs. Keep the complete codec available
+// while those tasks are developed in parallel without widening it into a public Gateway API.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod codec;
 pub mod health;
 pub mod metadata;
 pub mod openapi;
 pub mod pagination;
+#[allow(dead_code)]
+pub(crate) mod write;
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;

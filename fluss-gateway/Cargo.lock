@@ -802,6 +802,7 @@ dependencies = [
 name = "fluss-gateway"
 version = "1.0.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "axum",
  "base64 0.22.1",
