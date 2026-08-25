@@ -149,7 +149,6 @@ mkdir -p "${package_dir}/bin" "${package_dir}/conf"
 
 install -m 0755 "${gateway_binary}" "${package_dir}/bin/fluss-gateway"
 install -m 0755 "${GATEWAY_DIR}/bin/fluss-gateway.sh" "${package_dir}/bin/"
-install -m 0755 "${GATEWAY_DIR}/bin/gateway-healthcheck.sh" "${package_dir}/bin/"
 install -m 0644 "${GATEWAY_DIR}/conf/gateway.yaml" "${package_dir}/conf/"
 install -m 0644 "${GATEWAY_DIR}/openapi.yaml" "${package_dir}/"
 install -m 0644 "${GATEWAY_DIR}/DEPENDENCIES.rust.tsv" "${package_dir}/"

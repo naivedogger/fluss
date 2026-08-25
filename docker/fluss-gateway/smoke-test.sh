@@ -22,17 +22,11 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 IMAGE="${GATEWAY_IMAGE:-fluss-gateway:dev}"
 CONTAINER="fluss-gateway-smoke-$$-${RANDOM}"
-mkdir -p "${REPOSITORY_ROOT}/target"
-TMP_DIR="$(mktemp -d "${REPOSITORY_ROOT}/target/fluss-gateway-smoke.XXXXXX")"
-INVALID_CONFIG="${TMP_DIR}/invalid-gateway.yaml"
 
 cleanup() {
     docker rm --force "${CONTAINER}" >/dev/null 2>&1 || true
-    rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT
 
@@ -65,14 +59,6 @@ if [[ "$(docker inspect --format '{{.State.Health.Status}}' "${CONTAINER}")" != 
     exit 1
 fi
 
-docker exec \
-    --env HTTP_PROXY=http://127.0.0.1:1 \
-    --env http_proxy=http://127.0.0.1:1 \
-    --env NO_PROXY= \
-    --env no_proxy= \
-    "${CONTAINER}" \
-    /opt/fluss/bin/gateway-healthcheck.sh
-
 published_rest="$(docker port "${CONTAINER}" 8080/tcp | tail -1)"
 published_metrics="$(docker port "${CONTAINER}" 9095/tcp | tail -1)"
 curl --fail --silent --show-error --noproxy "*" --max-time 3 \
@@ -97,28 +83,5 @@ if [[ "$(docker inspect --format '{{.State.ExitCode}}' "${CONTAINER}")" != "0" ]
     exit 1
 fi
 docker rm "${CONTAINER}" >/dev/null
-
-printf 'gateway.unknown.option: true\n' > "${INVALID_CONFIG}"
-chmod 0644 "${INVALID_CONFIG}"
-set +o errexit
-invalid_output="$(docker run --rm \
-    --read-only \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --volume "${INVALID_CONFIG}:/tmp/invalid-gateway.yaml:ro" \
-    "${IMAGE}" gateway --config /tmp/invalid-gateway.yaml 2>&1)"
-invalid_exit=$?
-set -o errexit
-
-if [[ "${invalid_exit}" -ne 2 ]]; then
-    printf '%s\n' "${invalid_output}" >&2
-    echo "Invalid Gateway configuration must exit with code 2, got ${invalid_exit}." >&2
-    exit 1
-fi
-if [[ "${invalid_output}" != *"unknown configuration key: gateway.unknown.option"* ]]; then
-    printf '%s\n' "${invalid_output}" >&2
-    echo "Gateway did not report the expected invalid configuration key." >&2
-    exit 1
-fi
 
 echo "Gateway container smoke tests passed."

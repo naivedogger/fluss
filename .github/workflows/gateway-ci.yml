@@ -82,7 +82,7 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
-      - name: Unit Test
+      - name: Unit and Integration Tests
         run: cargo test --locked --all-targets
         env:
           RUST_LOG: DEBUG
@@ -166,9 +166,7 @@ jobs:
       - name: Check distribution shell scripts
         run: |
           bash -n bin/fluss-gateway.sh
-          bash -n bin/gateway-healthcheck.sh
           bash -n ../docker/fluss-gateway/build.sh
-          bash -n ../docker/fluss-gateway/docker-entrypoint.sh
           bash -n ../docker/fluss-gateway/prepare_build.sh
           bash -n ../docker/fluss-gateway/smoke-test.sh
           bash -n ../tools/releasing/create_gateway_release.sh
@@ -208,12 +206,3 @@ jobs:
           RUN_SMOKE: "true"
           VCS_REF: ${{ github.sha }}
         run: docker/fluss-gateway/build.sh
-
-      - name: Upload the Gateway binary distribution
-        uses: actions/upload-artifact@v7
-        with:
-          name: fluss-gateway-linux-${{ matrix.arch }}
-          if-no-files-found: error
-          path: |
-            target/gateway-release/fluss-gateway-*-bin-linux-${{ matrix.arch }}.tgz
-            target/gateway-release/fluss-gateway-*-bin-linux-${{ matrix.arch }}.tgz.sha512

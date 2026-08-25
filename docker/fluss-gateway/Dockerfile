@@ -52,9 +52,6 @@ ENV FLUSS_HOME=/opt/fluss \
 WORKDIR ${FLUSS_HOME}
 
 COPY --chown=fluss:fluss build-target/${TARGETARCH}/ /opt/fluss/
-COPY docker-entrypoint.sh /docker-entrypoint.sh
-
-RUN chmod 0755 /docker-entrypoint.sh
 
 USER 9999:9999
 
@@ -62,7 +59,7 @@ EXPOSE 8080 9095
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/opt/fluss/bin/gateway-healthcheck.sh"]
+    CMD curl --fail --silent --show-error --noproxy "*" --output /dev/null \
+        --max-time 3 "${FLUSS_GATEWAY_HEALTH_URL}"
 
-ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["gateway"]
+ENTRYPOINT ["/opt/fluss/bin/fluss-gateway.sh"]

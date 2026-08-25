@@ -88,15 +88,36 @@ bin/fluss-gateway.sh
 The wrapper resolves `FLUSS_HOME` from its own location, uses
 `conf/gateway.yaml` by default, and forwards additional CLI options to the
 binary. The convenience distribution follows the Java distribution and binds
-listeners to loopback by default. `gateway-healthcheck.sh` requires `curl`.
-Set `RUST_LOG=debug` when temporary diagnostic logging is needed.
+listeners to loopback by default. Set `RUST_LOG=debug` when temporary diagnostic
+logging is needed.
 
 The container image also installs into `/opt/fluss`, uses the `fluss` user with
 UID/GID 9999, and reads `/opt/fluss/conf/gateway.yaml`. The image is assembled
 from the prepared binary distribution, matching the Java image's
 `build-target` flow. Typed environment defaults bind its REST and Prometheus
 listeners to `0.0.0.0` without modifying the packaged configuration.
-See the [Gateway image README](../docker/fluss-gateway/README.md).
+
+Build and run the local image:
+
+```bash
+just image
+docker run --rm \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --stop-timeout 35 \
+  -p 8080:8080 \
+  -p 9095:9095 \
+  -e FLUSS_GATEWAY__CLUSTER__DEFAULT__BOOTSTRAP__SERVERS=host.docker.internal:9123 \
+  fluss-gateway:dev
+```
+
+The REST health and readiness endpoints are available at `/health` and
+`/ready`; Prometheus metrics are served on port `9095`. Use a cluster DNS name
+or container-network alias instead of `host.docker.internal` on Linux when that
+hostname is unavailable. Production deployments should terminate TLS at a
+trusted ingress and must not expose `trust` authentication outside a protected
+network boundary.
 
 ## Prerequisites
 

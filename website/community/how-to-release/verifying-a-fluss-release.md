@@ -96,8 +96,6 @@ The Rust workspace's dependency licenses are checked with [cargo-deny](https://e
 Extract the Gateway archive on the matching Linux architecture and check its
 version, configuration, health endpoint, and graceful shutdown:
 
-The health-check wrapper requires `curl` on the verification host.
-
 ```bash
 tar -xzf fluss-gateway-${RELEASE_VERSION}-bin-linux-amd64.tgz
 cd fluss-gateway-${RELEASE_VERSION}-bin-linux-amd64
@@ -106,8 +104,7 @@ bin/fluss-gateway --version
 bin/fluss-gateway.sh --bind-address 127.0.0.1:8080 &
 GATEWAY_PID=$!
 
-FLUSS_GATEWAY_HEALTH_URL=http://127.0.0.1:8080/health \
-  bin/gateway-healthcheck.sh
+curl --fail --silent --show-error http://127.0.0.1:8080/health
 
 kill -TERM ${GATEWAY_PID}
 wait ${GATEWAY_PID}
