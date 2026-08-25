@@ -15,25 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-header:
-  license:
-    spdx-id: Apache-2.0
-    copyright-owner: Apache Software Foundation
+# The pinned Gateway binary builder uses the repository root because
+# fluss-gateway has a path dependency on fluss-rust. The release image itself
+# uses docker/fluss-gateway as its build context.
+*
+!LICENSE
+!NOTICE
+!fluss-gateway/
+!fluss-gateway/**
+!fluss-rust/
+!fluss-rust/**
+!docker/
+!docker/fluss-gateway/
+!docker/fluss-gateway/**
 
-  paths:
-    - 'fluss-gateway/**'
-
-  paths-ignore:
-    # bare (gitignore-style) patterns match the basename at any depth
-    - '.gitignore'
-    - 'Cargo.lock'
-    - 'LICENSE'
-    - 'LICENSE-bin'
-    - 'NOTICE'
-    - 'NOTICE-bin'
-    - 'DISCLAIMER'
-    - '**/*.md'
-    - 'fluss-gateway/DEPENDENCIES.*.tsv'
-    # The checked-in OpenAPI document is generated from the typed contract (`just openapi`).
-    - 'fluss-gateway/openapi.yaml'
-  comment: on-failure
+# Generated and local-only files inside the included Rust workspaces.
+fluss-gateway/target/
+fluss-gateway/.idea/
+fluss-gateway/.vscode/
+fluss-rust/target/
+fluss-rust/**/target/
+fluss-rust/.idea/
+fluss-rust/.vscode/

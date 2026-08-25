@@ -32,9 +32,8 @@ rust-version = "1.88"
 authors = ["Apache Fluss <dev@fluss.apache.org>"]
 repository = "https://github.com/apache/fluss"
 # The gateway ships as an executable, not a library on crates.io, so `rust-release.yml` does not
-# apply to it.
-# TODO: add a release path for the gateway's own artifacts (Linux binary, container image) and the
-# dependency inventory that goes with them; no workflow publishes them today.
+# apply to it. Linux binary archives and the container image are released with the main Fluss
+# version from the repository-level release tooling.
 publish = false
 description = "Stateless REST gateway for Apache Fluss"
 

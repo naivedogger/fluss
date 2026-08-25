@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+IMAGE="${GATEWAY_IMAGE:-fluss-gateway:dev}"
+CONTAINER="fluss-gateway-smoke-$$-${RANDOM}"
+mkdir -p "${REPOSITORY_ROOT}/target"
+TMP_DIR="$(mktemp -d "${REPOSITORY_ROOT}/target/fluss-gateway-smoke.XXXXXX")"
+INVALID_CONFIG="${TMP_DIR}/invalid-gateway.yaml"
+
+cleanup() {
+    docker rm --force "${CONTAINER}" >/dev/null 2>&1 || true
+    rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
+
+docker run \
+    --detach \
+    --name "${CONTAINER}" \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --publish 127.0.0.1::8080 \
+    --publish 127.0.0.1::9095 \
+    "${IMAGE}" >/dev/null
+
+for _ in $(seq 1 60); do
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${CONTAINER}")"
+    if [[ "${health}" == "healthy" ]]; then
+        break
+    fi
+    if [[ "$(docker inspect --format '{{.State.Running}}' "${CONTAINER}")" != "true" ]]; then
+        docker logs "${CONTAINER}"
+        echo "Gateway container exited before becoming healthy." >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+if [[ "$(docker inspect --format '{{.State.Health.Status}}' "${CONTAINER}")" != "healthy" ]]; then
+    docker logs "${CONTAINER}"
+    echo "Gateway container did not become healthy." >&2
+    exit 1
+fi
+
+docker exec \
+    --env HTTP_PROXY=http://127.0.0.1:1 \
+    --env http_proxy=http://127.0.0.1:1 \
+    --env NO_PROXY= \
+    --env no_proxy= \
+    "${CONTAINER}" \
+    /opt/fluss/bin/gateway-healthcheck.sh
+
+published_rest="$(docker port "${CONTAINER}" 8080/tcp | tail -1)"
+published_metrics="$(docker port "${CONTAINER}" 9095/tcp | tail -1)"
+curl --fail --silent --show-error --noproxy "*" --max-time 3 \
+    "http://${published_rest}/health" >/dev/null
+curl --fail --silent --show-error --noproxy "*" --max-time 3 \
+    "http://${published_rest}/ready" >/dev/null
+curl --fail --silent --show-error --noproxy "*" --max-time 3 \
+    "http://${published_metrics}/metrics" \
+    | grep -Fq "fluss_gateway_rest_requests_total"
+
+if [[ "$(docker exec "${CONTAINER}" id -u)" != "9999" ]]; then
+    echo "Gateway container must run as the fluss user (uid 9999)." >&2
+    exit 1
+fi
+docker exec "${CONTAINER}" test -r /opt/fluss/LICENSE
+docker exec "${CONTAINER}" test -r /opt/fluss/NOTICE
+
+docker stop --time 35 "${CONTAINER}" >/dev/null
+if [[ "$(docker inspect --format '{{.State.ExitCode}}' "${CONTAINER}")" != "0" ]]; then
+    docker logs "${CONTAINER}"
+    echo "Gateway did not exit cleanly after SIGTERM." >&2
+    exit 1
+fi
+docker rm "${CONTAINER}" >/dev/null
+
+printf 'gateway.unknown.option: true\n' > "${INVALID_CONFIG}"
+chmod 0644 "${INVALID_CONFIG}"
+set +o errexit
+invalid_output="$(docker run --rm \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --volume "${INVALID_CONFIG}:/tmp/invalid-gateway.yaml:ro" \
+    "${IMAGE}" gateway --config /tmp/invalid-gateway.yaml 2>&1)"
+invalid_exit=$?
+set -o errexit
+
+if [[ "${invalid_exit}" -ne 2 ]]; then
+    printf '%s\n' "${invalid_output}" >&2
+    echo "Invalid Gateway configuration must exit with code 2, got ${invalid_exit}." >&2
+    exit 1
+fi
+if [[ "${invalid_output}" != *"unknown configuration key: gateway.unknown.option"* ]]; then
+    printf '%s\n' "${invalid_output}" >&2
+    echo "Gateway did not report the expected invalid configuration key." >&2
+    exit 1
+fi
+
+echo "Gateway container smoke tests passed."

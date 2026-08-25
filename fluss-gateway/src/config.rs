@@ -1656,6 +1656,54 @@ mod tests {
     }
 
     #[test]
+    fn distribution_configuration_is_complete_and_matches_java_conventions() {
+        let template = include_str!("../conf/gateway.yaml");
+        let config = load_file(template).unwrap();
+
+        assert_eq!(
+            config.server.rest.bind_address,
+            "127.0.0.1:8080".parse().unwrap()
+        );
+        assert_eq!(
+            config.server.metrics.bind_address,
+            "127.0.0.1:9095".parse().unwrap()
+        );
+        assert!(config.server.metrics.enabled);
+        assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID).bootstrap_servers,
+            DEFAULT_BOOTSTRAP_SERVERS
+        );
+        assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID).connect_timeout.get(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID).identity_mode,
+            IdentityMode::Service
+        );
+        assert_eq!(config.security.authentication, AuthenticationMode::Trust);
+        assert_eq!(config.request_limits, RequestLimitsConfig::default());
+        assert_eq!(config.shutdown.drain_timeout.get(), Duration::from_secs(30));
+        assert!(config.warnings().is_empty());
+
+        assert!(template.contains(&format!("{CLUSTERS_KEY}:")));
+        for entry in CONFIG_ENTRIES {
+            assert!(
+                template.contains(&format!("{}:", entry.key)),
+                "distribution configuration does not document {}",
+                entry.key
+            );
+        }
+        for entry in CLUSTER_ENTRIES {
+            let key = cluster_key(DEFAULT_CLUSTER_ID, entry.key);
+            assert!(
+                template.contains(&format!("{key}:")),
+                "distribution configuration does not document {key}"
+            );
+        }
+    }
+
+    #[test]
     fn public_yaml_options_are_loaded() {
         let config = load_file(
             r#"
