@@ -192,8 +192,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The ASF enterprise only permits third-party actions that its allowlist pins to
+      # an exact commit, so a moving tag such as @v3 fails the whole run before any job
+      # starts. This commit is the revision other ASF projects already build images with.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build and smoke test the distribution and image
         env:

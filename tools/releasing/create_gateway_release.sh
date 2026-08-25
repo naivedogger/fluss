@@ -91,11 +91,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! command -v docker >/dev/null 2>&1; then
+if ! docker buildx version >/dev/null 2>&1; then
     echo "Docker with buildx is required to build the Gateway release binary." >&2
     exit 1
 fi
 
+# The release manager may run this on macOS, whose Bash 3.2 treats "${array[@]}"
+# as an unbound variable when the array is empty. Expand optional arguments with
+# the ${array[@]+...} guard so an empty array stays empty instead of aborting.
 build_cache_args=()
 if [[ -n "${GATEWAY_BUILD_CACHE_FROM:-}" ]]; then
     build_cache_args+=(--cache-from "${GATEWAY_BUILD_CACHE_FROM}")
@@ -107,7 +110,7 @@ docker buildx build \
     --platform "linux/${GATEWAY_ARCH}" \
     --file "${FLUSS_DIR}/docker/fluss-gateway/Dockerfile.build" \
     --target artifact \
-    "${build_cache_args[@]}" \
+    ${build_cache_args[@]+"${build_cache_args[@]}"} \
     --output "type=local,dest=${temporary_dir}/binary" \
     "${FLUSS_DIR}"
 gateway_binary="${temporary_dir}/binary/fluss-gateway"
@@ -155,7 +158,7 @@ install -m 0644 "${GATEWAY_DIR}/NOTICE-bin" "${package_dir}/NOTICE"
 
 (
     cd "${temporary_dir}"
-    tar "${TAR_OPTIONS[@]}" -czf "${archive}" "${package_name}"
+    tar ${TAR_OPTIONS[@]+"${TAR_OPTIONS[@]}"} -czf "${archive}" "${package_name}"
 )
 
 (

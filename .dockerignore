@@ -37,3 +37,7 @@ fluss-rust/target/
 fluss-rust/**/target/
 fluss-rust/.idea/
 fluss-rust/.vscode/
+
+# Prepared image inputs belong to the release image build context, not to the
+# binary builder that runs from the repository root.
+docker/fluss-gateway/build-target/

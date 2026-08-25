@@ -391,6 +391,38 @@ Project URL: https://github.com/BurntSushi/aho-corasick
 Declared license: Unlicense OR MIT
 Selected license obligations: MIT
 
+The supported Linux Gateway binaries use the Rust crate byteorder@1.5.0.
+Project URL: https://github.com/BurntSushi/byteorder
+Declared license: Unlicense OR MIT
+Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate csv@1.4.0.
+Project URL: https://github.com/BurntSushi/rust-csv
+Declared license: Unlicense/MIT
+Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate csv-core@0.1.13.
+Project URL: https://github.com/BurntSushi/rust-csv
+Declared license: Unlicense/MIT
+Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate jiff@0.2.35.
+Project URL: https://github.com/BurntSushi/jiff
+Declared license: Unlicense OR MIT
+Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate jiff-core@0.1.0.
+Project URL: https://github.com/BurntSushi/jiff/tree/master/crates/jiff-core
+Declared license: Unlicense OR MIT
+Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate memchr@2.8.3.
+Project URL: https://github.com/BurntSushi/memchr
+Declared license: Unlicense OR MIT
+Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
+
 License file: LICENSE-MIT
 | The MIT License (MIT)
 | 
@@ -546,6 +578,13 @@ Project URL: https://bitvecto-rs.github.io/bitvec
 Declared license: MIT
 Selected license obligations: MIT
 
+The supported Linux Gateway binaries use the Rust crate wyz@0.5.1.
+Project URL: https://myrrlyn.net/crates/wyz
+Declared license: MIT
+Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
+
 License file: LICENSE.txt
 | MIT License
 | 
@@ -568,35 +607,6 @@ License file: LICENSE.txt
 | LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 | OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 | SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate byteorder@1.5.0.
-Project URL: https://github.com/BurntSushi/byteorder
-Declared license: Unlicense OR MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| The MIT License (MIT)
-| 
-| Copyright (c) 2015 Andrew Gallant
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in
-| all copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-| THE SOFTWARE.
 --------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate bytes@1.12.1.
@@ -630,64 +640,6 @@ License file: LICENSE
 | OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 | IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 | DEALINGS IN THE SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate csv@1.4.0.
-Project URL: https://github.com/BurntSushi/rust-csv
-Declared license: Unlicense/MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| The MIT License (MIT)
-| 
-| Copyright (c) 2015 Andrew Gallant
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in
-| all copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-| THE SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate csv-core@0.1.13.
-Project URL: https://github.com/BurntSushi/rust-csv
-Declared license: Unlicense/MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| The MIT License (MIT)
-| 
-| Copyright (c) 2015 Andrew Gallant
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in
-| all copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-| THE SOFTWARE.
 --------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate dashmap@6.2.1.
@@ -809,38 +761,12 @@ Project URL: https://github.com/hyperium/http-body
 Declared license: MIT
 Selected license obligations: MIT
 
-License file: LICENSE
-| Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
-| 
-| Permission is hereby granted, free of charge, to any
-| person obtaining a copy of this software and associated
-| documentation files (the "Software"), to deal in the
-| Software without restriction, including without
-| limitation the rights to use, copy, modify, merge,
-| publish, distribute, sublicense, and/or sell copies of
-| the Software, and to permit persons to whom the Software
-| is furnished to do so, subject to the following
-| conditions:
-| 
-| The above copyright notice and this permission notice
-| shall be included in all copies or substantial portions
-| of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-| ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-| TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-| PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-| SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-| CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-| OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-| IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-| DEALINGS IN THE SOFTWARE.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate http-body-util@0.1.5.
 Project URL: https://github.com/hyperium/http-body
 Declared license: MIT
 Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
 
 License file: LICENSE
 | Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
@@ -929,330 +855,78 @@ Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
 
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate icu_locale_core@2.1.1.
 Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate icu_normalizer@2.1.1.
 Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
 
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate icu_normalizer_data@2.1.1.
 Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate icu_properties@2.1.2.
 Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
 
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate icu_properties_data@2.1.2.
 Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate icu_provider@2.1.1.
 Project URL: https://icu4x.unicode.org
 Declared license: Unicode-3.0
 Selected license obligations: Unicode-3.0
 
+The supported Linux Gateway binaries use the Rust crate litemap@0.8.2.
+Project URL: https://github.com/unicode-org/icu4x
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate potential_utf@0.1.5.
+Project URL: https://icu4x.unicode.org
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate tinystr@0.8.3.
+Project URL: https://github.com/unicode-org/icu4x
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate writeable@0.6.3.
+Project URL: https://github.com/unicode-org/icu4x
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate yoke@0.8.3.
+Project URL: https://github.com/unicode-org/icu4x
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate zerofrom@0.1.8.
+Project URL: https://github.com/unicode-org/icu4x
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate zerotrie@0.2.4.
+Project URL: https://icu4x.unicode.org
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+The supported Linux Gateway binaries use the Rust crate zerovec@0.11.6.
+Project URL: https://github.com/unicode-org/icu4x
+Declared license: Unicode-3.0
+Selected license obligations: Unicode-3.0
+
+These crates ship identical license text, reproduced once below.
+
 License file: LICENSE
 | UNICODE LICENSE V3
 | 
@@ -1300,64 +974,6 @@ License file: LICENSE
 | 
 | Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 | ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate jiff@0.2.35.
-Project URL: https://github.com/BurntSushi/jiff
-Declared license: Unlicense OR MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| The MIT License (MIT)
-| 
-| Copyright (c) 2015 Andrew Gallant
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in
-| all copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-| THE SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate jiff-core@0.1.0.
-Project URL: https://github.com/BurntSushi/jiff/tree/master/crates/jiff-core
-Declared license: Unlicense OR MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| The MIT License (MIT)
-| 
-| Copyright (c) 2015 Andrew Gallant
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in
-| all copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-| THE SOFTWARE.
 --------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate libm@0.2.16.
@@ -1626,60 +1242,6 @@ License file: LICENSE.txt
 | Copyright notices are retained in src/* files where relevant.
 --------------------------------------------------------------------------------
 
-The supported Linux Gateway binaries use the Rust crate litemap@0.8.2.
-Project URL: https://github.com/unicode-org/icu4x
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate lz4_flex@0.14.0.
 Project URL: https://github.com/pseitz/lz4_flex
 Declared license: MIT
@@ -1768,93 +1330,22 @@ License file: LICENSE.httprouter
 | OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 --------------------------------------------------------------------------------
 
-The supported Linux Gateway binaries use the Rust crate memchr@2.8.3.
-Project URL: https://github.com/BurntSushi/memchr
-Declared license: Unlicense OR MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| The MIT License (MIT)
-| 
-| Copyright (c) 2015 Andrew Gallant
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in
-| all copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-| THE SOFTWARE.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate metrics@0.24.6.
 Project URL: https://github.com/metrics-rs/metrics
 Declared license: MIT
 Selected license obligations: MIT
-
-License file: LICENSE
-| Copyright (c) 2021 Metrics Contributors
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in all
-| copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-| SOFTWARE.
---------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate metrics-exporter-prometheus@0.17.2.
 Project URL: https://github.com/metrics-rs/metrics
 Declared license: MIT
 Selected license obligations: MIT
 
-License file: LICENSE
-| Copyright (c) 2021 Metrics Contributors
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in all
-| copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-| SOFTWARE.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate metrics-util@0.20.4.
 Project URL: https://github.com/metrics-rs/metrics
 Declared license: MIT
 Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
 
 License file: LICENSE
 | Copyright (c) 2021 Metrics Contributors
@@ -1936,60 +1427,6 @@ License file: LICENSE-MIT
 | OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 | IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 | DEALINGS IN THE SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate potential_utf@0.1.5.
-Project URL: https://icu4x.unicode.org
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 --------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate quanta@0.12.6.
@@ -2875,93 +2312,17 @@ License file: LICENSE.txt
 | SOFTWARE.
 --------------------------------------------------------------------------------
 
-The supported Linux Gateway binaries use the Rust crate tinystr@0.8.3.
-Project URL: https://github.com/unicode-org/icu4x
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate tokio@1.53.1.
 Project URL: https://tokio.rs
 Declared license: MIT
 Selected license obligations: MIT
 
-License file: LICENSE
-| MIT License
-| 
-| Copyright (c) Tokio Contributors
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in all
-| copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-| SOFTWARE.
---------------------------------------------------------------------------------
-
 The supported Linux Gateway binaries use the Rust crate tokio-util@0.7.19.
 Project URL: https://tokio.rs
 Declared license: MIT
 Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
 
 License file: LICENSE
 | MIT License
@@ -2991,6 +2352,18 @@ The supported Linux Gateway binaries use the Rust crate tower@0.5.3.
 Project URL: https://github.com/tower-rs/tower
 Declared license: MIT
 Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate tower-layer@0.3.3.
+Project URL: https://github.com/tower-rs/tower
+Declared license: MIT
+Selected license obligations: MIT
+
+The supported Linux Gateway binaries use the Rust crate tower-service@0.3.3.
+Project URL: https://github.com/tower-rs/tower
+Declared license: MIT
+Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
 
 License file: LICENSE
 | Copyright (c) 2019 Tower Contributors
@@ -3027,72 +2400,6 @@ Selected license obligations: MIT
 
 License file: LICENSE
 | Copyright (c) 2019-2021 Tower Contributors
-| 
-| Permission is hereby granted, free of charge, to any
-| person obtaining a copy of this software and associated
-| documentation files (the "Software"), to deal in the
-| Software without restriction, including without
-| limitation the rights to use, copy, modify, merge,
-| publish, distribute, sublicense, and/or sell copies of
-| the Software, and to permit persons to whom the Software
-| is furnished to do so, subject to the following
-| conditions:
-| 
-| The above copyright notice and this permission notice
-| shall be included in all copies or substantial portions
-| of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-| ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-| TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-| PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-| SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-| CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-| OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-| IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-| DEALINGS IN THE SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate tower-layer@0.3.3.
-Project URL: https://github.com/tower-rs/tower
-Declared license: MIT
-Selected license obligations: MIT
-
-License file: LICENSE
-| Copyright (c) 2019 Tower Contributors
-| 
-| Permission is hereby granted, free of charge, to any
-| person obtaining a copy of this software and associated
-| documentation files (the "Software"), to deal in the
-| Software without restriction, including without
-| limitation the rights to use, copy, modify, merge,
-| publish, distribute, sublicense, and/or sell copies of
-| the Software, and to permit persons to whom the Software
-| is furnished to do so, subject to the following
-| conditions:
-| 
-| The above copyright notice and this permission notice
-| shall be included in all copies or substantial portions
-| of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-| ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-| TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-| PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-| SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-| CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-| OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-| IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-| DEALINGS IN THE SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate tower-service@0.3.3.
-Project URL: https://github.com/tower-rs/tower
-Declared license: MIT
-Selected license obligations: MIT
-
-License file: LICENSE
-| Copyright (c) 2019 Tower Contributors
 | 
 | Permission is hereby granted, free of charge, to any
 | person obtaining a copy of this software and associated
@@ -3270,6 +2577,13 @@ Project URL: https://github.com/dtolnay/unsafe-libyaml
 Declared license: MIT
 Selected license obligations: MIT
 
+The supported Linux Gateway binaries use the Rust crate zmij@1.0.23.
+Project URL: https://github.com/dtolnay/zmij
+Declared license: MIT
+Selected license obligations: MIT
+
+These crates ship identical license text, reproduced once below.
+
 License file: LICENSE-MIT
 | Permission is hereby granted, free of charge, to any
 | person obtaining a copy of this software and associated
@@ -3411,336 +2725,6 @@ License file: LICENSE
 | 5.4. "Results" means any outcome obtained by computational analysis
 | of Data, including for example machine learning models and models'
 | insights.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate writeable@0.6.3.
-Project URL: https://github.com/unicode-org/icu4x
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate wyz@0.5.1.
-Project URL: https://myrrlyn.net/crates/wyz
-Declared license: MIT
-Selected license obligations: MIT
-
-License file: LICENSE.txt
-| MIT License
-| 
-| Copyright (c) 2018 myrrlyn (Alexander Payne)
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a copy
-| of this software and associated documentation files (the "Software"), to deal
-| in the Software without restriction, including without limitation the rights
-| to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-| copies of the Software, and to permit persons to whom the Software is
-| furnished to do so, subject to the following conditions:
-| 
-| The above copyright notice and this permission notice shall be included in all
-| copies or substantial portions of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-| IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-| FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-| AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-| LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-| OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-| SOFTWARE.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate yoke@0.8.3.
-Project URL: https://github.com/unicode-org/icu4x
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate zerofrom@0.1.8.
-Project URL: https://github.com/unicode-org/icu4x
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate zerotrie@0.2.4.
-Project URL: https://icu4x.unicode.org
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate zerovec@0.11.6.
-Project URL: https://github.com/unicode-org/icu4x
-Declared license: Unicode-3.0
-Selected license obligations: Unicode-3.0
-
-License file: LICENSE
-| UNICODE LICENSE V3
-| 
-| COPYRIGHT AND PERMISSION NOTICE
-| 
-| Copyright © 2020-2024 Unicode, Inc.
-| 
-| NOTICE TO USER: Carefully read the following legal agreement. BY
-| DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
-| SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
-| TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
-| DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
-| 
-| Permission is hereby granted, free of charge, to any person obtaining a
-| copy of data files and any associated documentation (the "Data Files") or
-| software and any associated documentation (the "Software") to deal in the
-| Data Files or Software without restriction, including without limitation
-| the rights to use, copy, modify, merge, publish, distribute, and/or sell
-| copies of the Data Files or Software, and to permit persons to whom the
-| Data Files or Software are furnished to do so, provided that either (a)
-| this copyright and permission notice appear with all copies of the Data
-| Files or Software, or (b) this copyright and permission notice appear in
-| associated Documentation.
-| 
-| THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-| KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-| MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-| THIRD PARTY RIGHTS.
-| 
-| IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
-| BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
-| OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
-| WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
-| ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
-| FILES OR SOFTWARE.
-| 
-| Except as contained in this notice, the name of a copyright holder shall
-| not be used in advertising or otherwise to promote the sale, use or other
-| dealings in these Data Files or Software without prior written
-| authorization of the copyright holder.
-| 
-| SPDX-License-Identifier: Unicode-3.0
-| 
-| —
-| 
-| Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-| ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
---------------------------------------------------------------------------------
-
-The supported Linux Gateway binaries use the Rust crate zmij@1.0.23.
-Project URL: https://github.com/dtolnay/zmij
-Declared license: MIT
-Selected license obligations: MIT
-
-License file: LICENSE-MIT
-| Permission is hereby granted, free of charge, to any
-| person obtaining a copy of this software and associated
-| documentation files (the "Software"), to deal in the
-| Software without restriction, including without
-| limitation the rights to use, copy, modify, merge,
-| publish, distribute, sublicense, and/or sell copies of
-| the Software, and to permit persons to whom the Software
-| is furnished to do so, subject to the following
-| conditions:
-| 
-| The above copyright notice and this permission notice
-| shall be included in all copies or substantial portions
-| of the Software.
-| 
-| THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-| ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-| TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-| PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-| SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-| CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-| OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-| IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-| DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 
 The supported Linux Gateway binaries use the Rust crate zstd@0.13.3.

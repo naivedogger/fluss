@@ -380,15 +380,6 @@ Rust dependency inventory. Like the Java distribution, its `LICENSE` and
 `NOTICE` come from component-specific binary versions rather than the source
 release files.
 
-Prepare the two distributions as Docker image inputs before staging moves the
-release archives:
-
-```bash
-tools $ cd ..
-$ RELEASE_VERSION=$RELEASE_VERSION docker/fluss-gateway/prepare_build.sh
-$ cd tools
-```
-
 ### 4. Create Helm Chart package
 
 Then, we create the Helm Chart packages:
@@ -517,11 +508,29 @@ docker/fluss $ docker buildx build --push --platform linux/arm64/v8,linux/amd64 
 ```
 
 Like the Java image, the Gateway image consumes a prepared binary distribution
-instead of compiling project sources in buildx. The Dockerfile selects the
-matching `build-target/<arch>` directory for each target platform:
+instead of compiling project sources in buildx, so both voted archives have to be
+unpacked into `docker/fluss-gateway/build-target/` first. Step 5 moved them out of
+`tools/releasing/release/`, so point `GATEWAY_RELEASE_DIR` at the staging working
+copy that now holds them:
 
 ```bash
-docker/fluss $ cd ../fluss-gateway
+docker/fluss $ cd ../..
+$ RELEASE_VERSION=$RELEASE_VERSION \
+    GATEWAY_RELEASE_DIR=tools/target/fluss/fluss-${RELEASE_VERSION}-rc${RC_NUM} \
+    docker/fluss-gateway/prepare_build.sh
+```
+
+If you build the images on a different machine than the one that created the
+archives, download both `fluss-gateway-${RELEASE_VERSION}-bin-linux-*.tgz` files
+from `https://dist.apache.org/repos/dist/dev/fluss/fluss-${RELEASE_VERSION}-rc${RC_NUM}/`
+into any directory and point `GATEWAY_RELEASE_DIR` there instead. Only the `.tgz`
+files are needed.
+
+The Dockerfile selects the matching `build-target/<arch>` directory for each
+target platform:
+
+```bash
+$ cd docker/fluss-gateway
 docker/fluss-gateway $ docker buildx build \
     --push \
     --platform linux/arm64,linux/amd64 \

@@ -26,9 +26,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 IMAGE="${GATEWAY_IMAGE:-fluss-gateway:dev}"
 RELEASE_DIR="${GATEWAY_RELEASE_DIR:-${REPOSITORY_ROOT}/target/gateway-release}"
+# The Dockerfile reads build-target/<arch> relative to its build context, so this
+# location is fixed here and passed on explicitly rather than inherited.
+BUILD_DIR="${SCRIPT_DIR}/build-target"
 
 cleanup() {
-    rm -rf "${SCRIPT_DIR}/build-target"
+    rm -rf "${BUILD_DIR}"
 }
 trap cleanup EXIT
 
@@ -67,6 +70,7 @@ mkdir -p "${RELEASE_DIR}"
 RELEASE_VERSION="${gateway_version}" \
 GATEWAY_ARCHES="${GATEWAY_ARCH}" \
 GATEWAY_RELEASE_DIR="${RELEASE_DIR}" \
+GATEWAY_IMAGE_BUILD_DIR="${BUILD_DIR}" \
     "${SCRIPT_DIR}/prepare_build.sh"
 
 image_version="${FLUSS_VERSION:-${gateway_version}}"
