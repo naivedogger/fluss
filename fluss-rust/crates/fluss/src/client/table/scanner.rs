@@ -806,24 +806,24 @@ impl LogScannerInner {
     }
 
     async fn subscribe_buckets(&self, bucket_offsets: &HashMap<i32, i64>) -> Result<()> {
-        self.check_no_active_reader()?;
-        if self.is_partitioned_table {
-            return Err(Error::UnsupportedOperation {
-                message:
-                    "The table is a partitioned table, please use \"subscribe_partition_buckets\" instead."
-                        .to_string(),
-            });
-        }
-
-        let mut scan_bucket_offsets = HashMap::new();
-        for (bucket_id, offset) in bucket_offsets {
-            let table_bucket = TableBucket::new(self.table_id, *bucket_id);
-            scan_bucket_offsets.insert(table_bucket, *offset);
-        }
-        self.do_subscribe_buckets(scan_bucket_offsets, false).await
+        self.subscribe_buckets_internal(bucket_offsets, false).await
     }
 
     async fn subscribe_buckets_for_reader(&self, bucket_offsets: &HashMap<i32, i64>) -> Result<()> {
+        self.subscribe_buckets_internal(bucket_offsets, true).await
+    }
+
+    /// `reader_is_active` is `false` for subscriptions initiated through the
+    /// scanner API, which must reject an active reader, and `true` during reader
+    /// construction, which already holds the active-reader guard.
+    async fn subscribe_buckets_internal(
+        &self,
+        bucket_offsets: &HashMap<i32, i64>,
+        reader_is_active: bool,
+    ) -> Result<()> {
+        if !reader_is_active {
+            self.check_no_active_reader()?;
+        }
         if self.is_partitioned_table {
             return Err(Error::UnsupportedOperation {
                 message:
@@ -837,7 +837,8 @@ impl LogScannerInner {
             let table_bucket = TableBucket::new(self.table_id, *bucket_id);
             scan_bucket_offsets.insert(table_bucket, *offset);
         }
-        self.do_subscribe_buckets(scan_bucket_offsets, true).await
+        self.do_subscribe_buckets(scan_bucket_offsets, reader_is_active)
+            .await
     }
 
     async fn subscribe_partition(
@@ -870,28 +871,29 @@ impl LogScannerInner {
         &self,
         partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
     ) -> Result<()> {
-        self.check_no_active_reader()?;
-        if !self.is_partitioned_table {
-            return Err(UnsupportedOperation {
-                message: "The table is not a partitioned table, please use \"subscribe_buckets\" \
-                    to subscribe to non-partitioned buckets instead."
-                    .to_string(),
-            });
-        }
-
-        let mut scan_bucket_offsets = HashMap::new();
-        for (&(partition_id, bucket_id), &offset) in partition_bucket_offsets {
-            let table_bucket =
-                TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket_id);
-            scan_bucket_offsets.insert(table_bucket, offset);
-        }
-        self.do_subscribe_buckets(scan_bucket_offsets, false).await
+        self.subscribe_partition_buckets_internal(partition_bucket_offsets, false)
+            .await
     }
 
     async fn subscribe_partition_buckets_for_reader(
         &self,
         partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
     ) -> Result<()> {
+        self.subscribe_partition_buckets_internal(partition_bucket_offsets, true)
+            .await
+    }
+
+    /// `reader_is_active` is `false` for subscriptions initiated through the
+    /// scanner API, which must reject an active reader, and `true` during reader
+    /// construction, which already holds the active-reader guard.
+    async fn subscribe_partition_buckets_internal(
+        &self,
+        partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
+        reader_is_active: bool,
+    ) -> Result<()> {
+        if !reader_is_active {
+            self.check_no_active_reader()?;
+        }
         if !self.is_partitioned_table {
             return Err(UnsupportedOperation {
                 message: "The table is not a partitioned table, please use \"subscribe_buckets\" \
@@ -906,7 +908,8 @@ impl LogScannerInner {
                 TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket_id);
             scan_bucket_offsets.insert(table_bucket, offset);
         }
-        self.do_subscribe_buckets(scan_bucket_offsets, true).await
+        self.do_subscribe_buckets(scan_bucket_offsets, reader_is_active)
+            .await
     }
 
     async fn do_subscribe_buckets(

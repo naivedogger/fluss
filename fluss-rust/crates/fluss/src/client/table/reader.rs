@@ -209,8 +209,9 @@ impl RecordBatchLogReader {
     ///
     /// # NOTE: Every key in `stopping_offsets` **must** correspond to a bucket
     /// currently subscribed on the `scanner`, every subscribed bucket must
-    /// have a stopping offset, and every stopping offset must be non-negative;
-    /// construction fails otherwise.
+    /// have a stopping offset, every subscribed starting offset must be
+    /// non-negative or [`crate::client::EARLIEST_OFFSET`], and every stopping
+    /// offset must be non-negative; construction fails otherwise.
     /// Concrete subscriptions that already meet their stop point are treated
     /// as empty ranges and complete immediately.
     ///

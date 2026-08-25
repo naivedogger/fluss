@@ -205,7 +205,8 @@ Unlike `RecordBatchLogScanner` which polls indefinitely, this reader stops autom
 `new_from_ranges` requires a scanner without existing subscriptions. It validates table identity,
 partition mode, duplicate and out-of-range bucket ids, range ordering, and non-negative stopping
 offsets before subscribing. `new_until_offsets` requires one stopping offset for every scanner
-subscription. Timestamp offset lookups for independent partitions are issued concurrently.
+subscription; starting offsets must be non-negative or `EARLIEST_OFFSET`. Timestamp offset lookups
+for independent partitions are issued concurrently.
 
 `collect_all_batches_with_timeout` returns batches collected before the budget expires and sets
 `BoundedCollectOutcome::complete` to indicate whether every stopping offset was reached. Once the
