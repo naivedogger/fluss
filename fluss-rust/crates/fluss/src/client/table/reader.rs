@@ -39,7 +39,7 @@ use crate::rpc::message::OffsetSpec;
 use crate::{PartitionId, TableId};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures::Stream;
+use futures::{Stream, future::try_join_all};
 use log::warn;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -121,6 +121,38 @@ pub struct RecordBatchLogReader {
     schema: SchemaRef,
 }
 
+/// Clears the scanner's active-reader flag if reader construction exits early.
+///
+/// This makes async constructors cancellation-safe: dropping a constructor
+/// future while it is awaiting metadata or offsets must not leave a shared
+/// binding-layer scanner permanently locked.
+struct ReaderActivationGuard<'a> {
+    scanner: &'a RecordBatchLogScanner,
+    clear_on_drop: bool,
+}
+
+impl<'a> ReaderActivationGuard<'a> {
+    fn acquire(scanner: &'a RecordBatchLogScanner) -> Result<Self> {
+        scanner.try_set_reader_active()?;
+        Ok(Self {
+            scanner,
+            clear_on_drop: true,
+        })
+    }
+
+    fn keep_active(mut self) {
+        self.clear_on_drop = false;
+    }
+}
+
+impl Drop for ReaderActivationGuard<'_> {
+    fn drop(&mut self) {
+        if self.clear_on_drop {
+            self.scanner.clear_reader_active();
+        }
+    }
+}
+
 impl RecordBatchLogReader {
     /// Create a reader that reads until the latest offsets at the time of creation.
     ///
@@ -137,25 +169,25 @@ impl RecordBatchLogReader {
     ) -> Result<Self> {
         // Acquire the guard first so no concurrent unsubscribe can mutate
         // state between reading subscriptions and using them.
-        scanner.try_set_reader_active()?;
+        let activation = ReaderActivationGuard::acquire(&scanner)?;
 
         let subscribed = scanner.get_subscribed_buckets();
         if subscribed.is_empty() {
-            scanner.clear_reader_active();
             return Err(Error::IllegalArgument {
                 message: "No buckets subscribed. Call subscribe() before creating a reader."
                     .to_string(),
             });
         }
+        validate_read_buckets(
+            scanner.table_id(),
+            scanner.is_partitioned(),
+            scanner.num_buckets(),
+            subscribed.iter().map(|(bucket, _)| bucket),
+        )?;
 
-        let stopping_offsets = match query_latest_offsets(admin, &scanner, &subscribed).await {
-            Ok(o) => o,
-            Err(e) => {
-                scanner.clear_reader_active();
-                return Err(e);
-            }
-        };
+        let stopping_offsets = query_latest_offsets(admin, &scanner, &subscribed).await?;
         let schema = scanner.schema();
+        activation.keep_active();
 
         Ok(Self {
             scanner,
@@ -179,16 +211,18 @@ impl RecordBatchLogReader {
         scanner: RecordBatchLogScanner,
         mut stopping_offsets: HashMap<TableBucket, i64>,
     ) -> Result<Self> {
-        scanner.try_set_reader_active()?;
+        let activation = ReaderActivationGuard::acquire(&scanner)?;
 
-        if let Err(error) =
-            validate_stopping_offsets(scanner.get_subscribed_buckets(), &mut stopping_offsets)
-        {
-            scanner.clear_reader_active();
-            return Err(error);
-        }
+        validate_read_buckets(
+            scanner.table_id(),
+            scanner.is_partitioned(),
+            scanner.num_buckets(),
+            stopping_offsets.keys(),
+        )?;
+        validate_stopping_offsets(scanner.get_subscribed_buckets(), &mut stopping_offsets)?;
 
         let schema = scanner.schema();
+        activation.keep_active();
         Ok(Self {
             scanner,
             stopping_offsets,
@@ -205,13 +239,30 @@ impl RecordBatchLogReader {
     /// from a foreign language). Ranges are validated against the scanned
     /// table before anything is subscribed: every bucket must belong to the
     /// table, match its partition mode, appear once, and have
-    /// `starting_offset <= stopping_offset`. Empty ranges need no subscription
+    /// a valid bucket id and `starting_offset <= stopping_offset`. The scanner
+    /// must not have existing subscriptions. Empty ranges need no subscription
     /// and complete immediately.
     pub async fn new_from_ranges(
         scanner: RecordBatchLogScanner,
         ranges: Vec<BoundedLogReadRange>,
     ) -> Result<Self> {
-        validate_read_ranges(scanner.table_id(), scanner.is_partitioned(), &ranges)?;
+        // Acquire the guard before inspecting or changing subscriptions. The
+        // internal subscribe helpers below require this guard and bypass the
+        // public subscription check that intentionally rejects active readers.
+        let activation = ReaderActivationGuard::acquire(&scanner)?;
+
+        validate_read_ranges(
+            scanner.table_id(),
+            scanner.is_partitioned(),
+            scanner.num_buckets(),
+            &ranges,
+        )?;
+        if !scanner.get_subscribed_buckets().is_empty() {
+            return Err(Error::IllegalArgument {
+                message: "new_from_ranges requires a scanner without existing subscriptions."
+                    .to_string(),
+            });
+        }
 
         let mut stopping_offsets = HashMap::with_capacity(ranges.len());
         let mut bucket_offsets: HashMap<i32, i64> = HashMap::new();
@@ -235,23 +286,32 @@ impl RecordBatchLogReader {
         }
 
         if !bucket_offsets.is_empty() {
-            scanner.subscribe_buckets(&bucket_offsets).await?;
+            scanner
+                .subscribe_buckets_for_reader(&bucket_offsets)
+                .await?;
         }
         if !partition_bucket_offsets.is_empty() {
             scanner
-                .subscribe_partition_buckets(&partition_bucket_offsets)
+                .subscribe_partition_buckets_for_reader(&partition_bucket_offsets)
                 .await?;
         }
 
-        Self::new_until_offsets(scanner, stopping_offsets)
+        let schema = scanner.schema();
+        activation.keep_active();
+        Ok(Self {
+            scanner,
+            stopping_offsets,
+            buffer: VecDeque::new(),
+            schema,
+        })
     }
 
     /// Create a reader for a `[starting_timestamp_ms, stopping_timestamp_ms]`
     /// window over the requested buckets.
     ///
     /// Both timestamps are resolved to offsets per bucket, then read with
-    /// `[starting_offset, stopping_offset)` semantics. Partition metadata and
-    /// offsets are queried once during construction.
+    /// `[starting_offset, stopping_offset)` semantics. Partition metadata is
+    /// fetched once, and independent partition lookups are issued concurrently.
     pub async fn new_between_timestamps(
         scanner: RecordBatchLogScanner,
         admin: &FlussAdmin,
@@ -265,7 +325,12 @@ impl RecordBatchLogReader {
             });
         }
 
-        validate_read_buckets(scanner.table_id(), scanner.is_partitioned(), buckets)?;
+        validate_read_buckets(
+            scanner.table_id(),
+            scanner.is_partitioned(),
+            scanner.num_buckets(),
+            buckets,
+        )?;
         if buckets.is_empty() {
             // Nothing to resolve, so skip the offset lookups entirely.
             return Self::new_from_ranges(scanner, Vec::new()).await;
@@ -547,6 +612,7 @@ impl arrow::record_batch::RecordBatchReader for SyncRecordBatchLogReader {
 fn validate_read_buckets<'a>(
     table_id: TableId,
     is_partitioned: bool,
+    num_buckets: i32,
     buckets: impl IntoIterator<Item = &'a TableBucket>,
 ) -> Result<()> {
     let mut seen = HashSet::new();
@@ -567,6 +633,14 @@ fn validate_read_buckets<'a>(
                 },
             });
         }
+        if bucket.bucket_id() < 0 || bucket.bucket_id() >= num_buckets {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Bounded read bucket id {} is out of range for a table with {num_buckets} buckets.",
+                    bucket.bucket_id()
+                ),
+            });
+        }
         if !seen.insert(bucket) {
             return Err(Error::IllegalArgument {
                 message: format!("Duplicate bucket {bucket:?} in a bounded read."),
@@ -581,11 +655,13 @@ fn validate_read_buckets<'a>(
 fn validate_read_ranges(
     table_id: TableId,
     is_partitioned: bool,
+    num_buckets: i32,
     ranges: &[BoundedLogReadRange],
 ) -> Result<()> {
     validate_read_buckets(
         table_id,
         is_partitioned,
+        num_buckets,
         ranges.iter().map(|range| &range.bucket),
     )?;
     for range in ranges {
@@ -695,20 +771,27 @@ impl<'a> OffsetResolver<'a> {
             }
         }
 
-        let mut resolved: HashMap<TableBucket, i64> = HashMap::new();
-        for (partition_id, bucket_ids) in bucket_ids_by_partition {
-            let partition_name =
-                partition_names
-                    .get(&partition_id)
-                    .ok_or_else(|| Error::UnexpectedError {
-                        message: format!("Unknown partition_id: {partition_id}"),
-                        source: None,
+        let fetches = bucket_ids_by_partition
+            .into_iter()
+            .map(|(partition_id, bucket_ids)| {
+                let spec = spec.clone();
+                async move {
+                    let partition_name = partition_names.get(&partition_id).ok_or_else(|| {
+                        Error::UnexpectedError {
+                            message: format!("Unknown partition_id: {partition_id}"),
+                            source: None,
+                        }
                     })?;
+                    let offsets = self
+                        .admin
+                        .list_partition_offsets(self.table_path, partition_name, &bucket_ids, spec)
+                        .await?;
+                    Ok::<_, Error>((partition_id, offsets))
+                }
+            });
 
-            let offsets = self
-                .admin
-                .list_partition_offsets(self.table_path, partition_name, &bucket_ids, spec.clone())
-                .await?;
+        let mut resolved: HashMap<TableBucket, i64> = HashMap::new();
+        for (partition_id, offsets) in try_join_all(fetches).await? {
             for (bucket_id, offset) in offsets {
                 let bucket =
                     TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket_id);
@@ -875,14 +958,14 @@ mod tests {
     fn validate_read_ranges_accepts_empty_and_non_empty_ranges() {
         let ranges = vec![range(bucket(0), 5, 5), range(bucket(1), 0, 10)];
 
-        validate_read_ranges(1, false, &ranges).unwrap();
+        validate_read_ranges(1, false, 2, &ranges).unwrap();
     }
 
     #[test]
     fn validate_read_ranges_rejects_bucket_of_another_table() {
         let ranges = vec![range(TableBucket::new(2, 0), 0, 10)];
 
-        let result = validate_read_ranges(1, false, &ranges);
+        let result = validate_read_ranges(1, false, 1, &ranges);
 
         assert!(matches!(result, Err(Error::IllegalArgument { .. })));
     }
@@ -893,20 +976,29 @@ mod tests {
         let partitioned = vec![range(TableBucket::new_with_partition(1, Some(7), 0), 0, 10)];
 
         assert!(matches!(
-            validate_read_ranges(1, true, &unpartitioned),
+            validate_read_ranges(1, true, 1, &unpartitioned),
             Err(Error::IllegalArgument { .. })
         ));
         assert!(matches!(
-            validate_read_ranges(1, false, &partitioned),
+            validate_read_ranges(1, false, 1, &partitioned),
             Err(Error::IllegalArgument { .. })
         ));
+    }
+
+    #[test]
+    fn validate_read_ranges_rejects_out_of_range_bucket() {
+        let ranges = vec![range(bucket(2), 0, 10)];
+
+        let result = validate_read_ranges(1, false, 2, &ranges);
+
+        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
     }
 
     #[test]
     fn validate_read_ranges_rejects_duplicate_bucket() {
         let ranges = vec![range(bucket(0), 0, 10), range(bucket(0), 10, 20)];
 
-        let result = validate_read_ranges(1, false, &ranges);
+        let result = validate_read_ranges(1, false, 1, &ranges);
 
         assert!(matches!(result, Err(Error::IllegalArgument { .. })));
     }
@@ -915,7 +1007,7 @@ mod tests {
     fn validate_read_ranges_rejects_inverted_range() {
         let ranges = vec![range(bucket(0), 20, 10)];
 
-        let result = validate_read_ranges(1, false, &ranges);
+        let result = validate_read_ranges(1, false, 1, &ranges);
 
         assert!(matches!(result, Err(Error::IllegalArgument { .. })));
     }

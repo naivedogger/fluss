@@ -1243,7 +1243,8 @@ struct ReaderStopOffset {
 };
 
 /// One bounded log range. Records are returned for
-/// [starting_offset, stopping_offset).
+/// [starting_offset, stopping_offset). The bucket id must be within the table's
+/// configured bucket count.
 struct RecordBatchLogReadRange {
     TableBucket bucket;
     int64_t starting_offset;

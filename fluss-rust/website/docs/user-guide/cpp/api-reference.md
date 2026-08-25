@@ -294,9 +294,10 @@ than start an unconditional retry loop.
 `RecordBatchReadResult::batch` is non-null only when `status` is `BatchAvailable`.
 
 `TableScan::CreateRecordBatchLogReader()` accepts resolved per-bucket ranges, which is useful when
-a coordinator has selected globally consistent offsets for multiple workers. The timestamp
-overload resolves both timestamps with `OffsetSpec::Timestamp` for every requested bucket before
-reading.
+a coordinator has selected globally consistent offsets for multiple workers. Each bucket id is
+validated against the table's configured bucket count. The timestamp overload resolves both
+timestamps with `OffsetSpec::Timestamp` for every requested bucket before reading; independent
+partition lookups are issued concurrently.
 
 ## `BatchScanner`
 

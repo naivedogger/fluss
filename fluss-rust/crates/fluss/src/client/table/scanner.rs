@@ -408,6 +408,7 @@ pub struct RecordBatchLogScanner {
 struct LogScannerInner {
     table_path: TablePath,
     table_id: TableId,
+    num_buckets: i32,
     metadata: Arc<Metadata>,
     log_scanner_status: Arc<LogScannerStatus>,
     log_fetcher: LogFetcher,
@@ -597,6 +598,7 @@ impl LogScannerInner {
         Ok(Self {
             table_path: table_info.table_path.clone(),
             table_id: table_info.table_id,
+            num_buckets: table_info.get_num_buckets(),
             is_partitioned_table: table_info.is_partitioned(),
             metadata: metadata.clone(),
             log_scanner_status: log_scanner_status.clone(),
@@ -809,7 +811,24 @@ impl LogScannerInner {
             let table_bucket = TableBucket::new(self.table_id, *bucket_id);
             scan_bucket_offsets.insert(table_bucket, *offset);
         }
-        self.do_subscribe_buckets(scan_bucket_offsets).await
+        self.do_subscribe_buckets(scan_bucket_offsets, false).await
+    }
+
+    async fn subscribe_buckets_for_reader(&self, bucket_offsets: &HashMap<i32, i64>) -> Result<()> {
+        if self.is_partitioned_table {
+            return Err(Error::UnsupportedOperation {
+                message:
+                    "The table is a partitioned table, please use \"subscribe_partition_buckets\" instead."
+                        .to_string(),
+            });
+        }
+
+        let mut scan_bucket_offsets = HashMap::new();
+        for (bucket_id, offset) in bucket_offsets {
+            let table_bucket = TableBucket::new(self.table_id, *bucket_id);
+            scan_bucket_offsets.insert(table_bucket, *offset);
+        }
+        self.do_subscribe_buckets(scan_bucket_offsets, true).await
     }
 
     async fn subscribe_partition(
@@ -855,10 +874,35 @@ impl LogScannerInner {
                 TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket_id);
             scan_bucket_offsets.insert(table_bucket, offset);
         }
-        self.do_subscribe_buckets(scan_bucket_offsets).await
+        self.do_subscribe_buckets(scan_bucket_offsets, false).await
     }
 
-    async fn do_subscribe_buckets(&self, bucket_offsets: HashMap<TableBucket, i64>) -> Result<()> {
+    async fn subscribe_partition_buckets_for_reader(
+        &self,
+        partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
+    ) -> Result<()> {
+        if !self.is_partitioned_table {
+            return Err(UnsupportedOperation {
+                message: "The table is not a partitioned table, please use \"subscribe_buckets\" \
+                    to subscribe to non-partitioned buckets instead."
+                    .to_string(),
+            });
+        }
+
+        let mut scan_bucket_offsets = HashMap::new();
+        for (&(partition_id, bucket_id), &offset) in partition_bucket_offsets {
+            let table_bucket =
+                TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket_id);
+            scan_bucket_offsets.insert(table_bucket, offset);
+        }
+        self.do_subscribe_buckets(scan_bucket_offsets, true).await
+    }
+
+    async fn do_subscribe_buckets(
+        &self,
+        bucket_offsets: HashMap<TableBucket, i64>,
+        reader_is_active: bool,
+    ) -> Result<()> {
         if bucket_offsets.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "Bucket offsets are empty.".to_string(),
@@ -870,6 +914,15 @@ impl LogScannerInner {
             .check_and_update_table_metadata(from_ref(&self.table_path))
             .await?;
 
+        if reader_is_active {
+            debug_assert!(
+                self.reader_active
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "reader-only subscription helper called without an active reader"
+            );
+        } else {
+            self.check_no_active_reader()?;
+        }
         self.log_scanner_status.assign_scan_buckets(bucket_offsets);
         Ok(())
     }
@@ -1074,6 +1127,32 @@ impl RecordBatchLogScanner {
 
     pub fn table_id(&self) -> TableId {
         self.inner.table_id
+    }
+
+    pub(crate) fn num_buckets(&self) -> i32 {
+        self.inner.num_buckets
+    }
+
+    /// Subscribes non-partitioned ranges while the caller holds the active
+    /// reader guard.
+    pub(crate) async fn subscribe_buckets_for_reader(
+        &self,
+        bucket_offsets: &HashMap<i32, i64>,
+    ) -> Result<()> {
+        self.inner
+            .subscribe_buckets_for_reader(bucket_offsets)
+            .await
+    }
+
+    /// Subscribes partitioned ranges while the caller holds the active reader
+    /// guard.
+    pub(crate) async fn subscribe_partition_buckets_for_reader(
+        &self,
+        partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
+    ) -> Result<()> {
+        self.inner
+            .subscribe_partition_buckets_for_reader(partition_bucket_offsets)
+            .await
     }
 
     /// Creates a new handle to the same underlying scanner state.
