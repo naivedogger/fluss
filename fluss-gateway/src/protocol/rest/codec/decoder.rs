@@ -16,6 +16,13 @@
 // under the License.
 
 //! Schema-aware streaming conversion from one raw FIP-49 JSON row to [`GenericRow`].
+//!
+//! Serde owns JSON syntax and container traversal. Schema-matching ARRAY, MAP, and ROW values
+//! recurse only along the validated [`RowType`], bounded by [`MAX_TYPE_NESTING`]. Scalar and
+//! ignored subtrees use serde_json's iterative [`RawValue`] and [`IgnoredAny`] scan path, so JSON
+//! depth does not grow this decoder's call stack. No container subtree is reparsed, keeping work
+//! linear in row bytes apart from local scalar decoding; the HTTP layer separately bounds body
+//! size. Recheck the iterative-scan assumption when upgrading serde_json.
 
 use crate::error::GatewayError;
 use crate::protocol::rest::codec::temporal::{parse_date, parse_time, parse_timestamp};
