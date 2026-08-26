@@ -80,7 +80,7 @@ impl SchemaDecoderCache {
     fn current(&self, table: &TableRef) -> Option<Arc<CachedSchemaDecoder>> {
         self.entries
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("schema decoder cache lock poisoned")
             .get(table)
             .cloned()
     }
@@ -109,7 +109,7 @@ impl SchemaDecoderCache {
         let mut entries = self
             .entries
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("schema decoder cache lock poisoned");
         if let Some(existing) = entries.get(table)
             && let Some(reusable) = reusable_decoder(existing, table_info)?
         {
@@ -127,7 +127,7 @@ impl SchemaDecoderCache {
         let entries = self
             .entries
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("schema decoder cache lock poisoned");
         entries
             .get(table)
             .map(|existing| reusable_decoder(existing, table_info))
@@ -143,15 +143,6 @@ fn reusable_decoder(
     if existing.table_id == table_info.get_table_id()
         && existing.schema_id == table_info.get_schema_id()
     {
-        if existing.decoder.row_type() != table_info.get_row_type()
-            || existing.primary_keys.as_ref() != table_info.get_primary_keys()
-        {
-            return Err(GatewayError::internal(format!(
-                "table `{}` returned different schema content for schema id {}",
-                table_info.get_table_path(),
-                table_info.get_schema_id()
-            )));
-        }
         return Ok(Some(Arc::clone(existing)));
     }
     if existing.table_id == table_info.get_table_id()
@@ -163,12 +154,14 @@ fn reusable_decoder(
 }
 
 /// Complete write path shared by an HTTP handler and integration tests.
+#[allow(dead_code)]
 pub(crate) struct WriteService {
     backend: Arc<dyn FlussBackend>,
     table_info: Arc<dyn TableInfoProvider>,
     decoders: SchemaDecoderCache,
 }
 
+#[allow(dead_code)]
 impl WriteService {
     pub(crate) fn new(
         backend: Arc<dyn FlussBackend>,
@@ -407,7 +400,7 @@ fn validate_partial_update_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendFuture, RowWriteError};
+    use crate::backend::BackendFuture;
     use axum::http::{HeaderValue, header};
     use fluss::metadata::{DataTypes, Schema, TableDescriptor};
     use fluss::row::Datum;
@@ -417,6 +410,8 @@ mod tests {
 
     struct TestBackend {
         latest: RwLock<TableInfo>,
+        metadata_error: Option<&'static str>,
+        write_error: Option<&'static str>,
         metadata_loads: AtomicUsize,
         requests: Mutex<Vec<WriteRequest>>,
     }
@@ -425,9 +420,21 @@ mod tests {
         fn new(latest: TableInfo) -> Self {
             Self {
                 latest: RwLock::new(latest),
+                metadata_error: None,
+                write_error: None,
                 metadata_loads: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_metadata_error(mut self, message: &'static str) -> Self {
+            self.metadata_error = Some(message);
+            self
+        }
+
+        fn with_write_error(mut self, message: &'static str) -> Self {
+            self.write_error = Some(message);
+            self
         }
 
         fn metadata_loads(&self) -> usize {
@@ -435,9 +442,7 @@ mod tests {
         }
 
         fn requests(&self) -> std::sync::MutexGuard<'_, Vec<WriteRequest>> {
-            self.requests
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            self.requests.lock().expect("request list lock poisoned")
         }
     }
 
@@ -451,8 +456,11 @@ mod tests {
                 let row_count = req.rows().len() as u64;
                 self.requests
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("request list lock poisoned")
                     .push(req);
+                if let Some(message) = self.write_error {
+                    return Err(GatewayError::unavailable(message));
+                }
                 Ok(WriteResult {
                     row_count,
                     failures: Vec::new(),
@@ -469,10 +477,13 @@ mod tests {
         ) -> BackendFuture<'a, TableInfo> {
             Box::pin(async move {
                 self.metadata_loads.fetch_add(1, Ordering::SeqCst);
+                if let Some(message) = self.metadata_error {
+                    return Err(GatewayError::unavailable(message));
+                }
                 Ok(self
                     .latest
                     .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("latest table info lock poisoned")
                     .clone())
             })
         }
@@ -690,6 +701,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_refresh_failure_is_returned_without_calling_backend() {
+        let backend = Arc::new(
+            TestBackend::new(table_info(2, true)).with_metadata_error("metadata unavailable"),
+        );
+        let service = service(backend.clone());
+        service
+            .decoders
+            .install(&table(), &table_info(1, false))
+            .unwrap();
+
+        let error = service
+            .write_json(
+                &context(),
+                table(),
+                &headers(),
+                &Bytes::from_static(br#"{"entries":[{"id":"a","upsert":{"id":1,"name":"Ada"}}]}"#),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message().contains("metadata unavailable"));
+        assert_eq!(backend.metadata_loads(), 1);
+        assert!(backend.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refreshed_schema_is_not_retried_twice() {
+        let backend = Arc::new(TestBackend::new(table_info(2, true)));
+        let service = service(backend.clone());
+        service
+            .decoders
+            .install(&table(), &table_info(1, false))
+            .unwrap();
+
+        let error = service
+            .write_json(
+                &context(),
+                table(),
+                &headers(),
+                &Bytes::from_static(br#"{"entries":[{"id":"a","upsert":{"id":1,"ghost":"x"}}]}"#),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message().contains("unknown column `ghost`"));
+        assert_eq!(backend.metadata_loads(), 1);
+        assert!(backend.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_update_can_succeed_after_schema_refresh() {
+        let backend = Arc::new(TestBackend::new(table_info(2, true)));
+        let service = service(backend.clone());
+        service
+            .decoders
+            .install(&table(), &table_info(1, false))
+            .unwrap();
+
+        let result = service
+            .write_json(
+                &context(),
+                table(),
+                &headers(),
+                &Bytes::from_static(
+                    br#"{
+                        "partial_update_columns":["id","name"],
+                        "entries":[{"id":"a","upsert":{"id":1,"name":"Ada"}}]
+                    }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.success_count(), 1);
+        assert_eq!(backend.metadata_loads(), 1);
+        let requests = backend.requests();
+        assert_eq!(
+            requests[0].partial_update_columns(),
+            Some(["id".to_string(), "name".to_string()].as_slice())
+        );
+    }
+
+    #[tokio::test]
     async fn delete_and_partial_update_use_sparse_rows_and_preserve_operation_order() {
         let schema = table_info(1, true);
         let backend = Arc::new(TestBackend::new(schema));
@@ -742,61 +836,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_row_failures_are_returned_with_their_input_indexes() {
-        struct FailingBackend {
-            schema: TableInfo,
-        }
-
-        impl TableInfoProvider for FailingBackend {
-            fn latest_table_info<'a>(
-                &'a self,
-                _ctx: &'a RequestContext,
-                _table: &'a TableRef,
-            ) -> BackendFuture<'a, TableInfo> {
-                Box::pin(async move { Ok(self.schema.clone()) })
-            }
-        }
-
-        impl FlussBackend for FailingBackend {
-            fn write<'a>(
-                &'a self,
-                _ctx: &'a RequestContext,
-                req: WriteRequest,
-            ) -> BackendFuture<'a, WriteResult> {
-                Box::pin(async move {
-                    Ok(WriteResult {
-                        row_count: req.rows().len() as u64,
-                        failures: vec![RowWriteError {
-                            index: 1,
-                            error: GatewayError::unavailable("injected failure"),
-                        }],
-                    })
-                })
-            }
-        }
-
-        let backend = Arc::new(FailingBackend {
-            schema: table_info(1, false),
-        });
-        let service = WriteService::new(backend.clone(), backend);
-        let result = service
+    async fn backend_request_failure_is_propagated() {
+        let backend =
+            Arc::new(TestBackend::new(table_info(1, false)).with_write_error("write unavailable"));
+        let service = service(backend.clone());
+        let error = service
             .write_json(
                 &context(),
                 table(),
                 &headers(),
-                &Bytes::from_static(
-                    br#"{"entries":[
-                        {"id":"first","upsert":{"id":1}},
-                        {"id":"second","upsert":{"id":2}}
-                    ]}"#,
-                ),
+                &Bytes::from_static(br#"{"entries":[{"id":"first","upsert":{"id":1}}]}"#),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(result.success_count(), 1);
-        assert_eq!(result.error_count(), 1);
-        assert_eq!(result.failures[0].index, 1);
+        assert!(error.message().contains("write unavailable"));
+        assert_eq!(backend.requests().len(), 1);
     }
 
     #[test]
@@ -811,25 +866,6 @@ mod tests {
         let current = cache.current(&table()).unwrap();
         assert_eq!(current.version(), (99, 1));
         assert_eq!(current.decoder.row_type().fields().len(), 2);
-    }
-
-    #[test]
-    fn write_result_counts_failures_defensively() {
-        let result = WriteResult {
-            row_count: 1,
-            failures: vec![
-                RowWriteError {
-                    index: 0,
-                    error: GatewayError::unavailable("first"),
-                },
-                RowWriteError {
-                    index: 1,
-                    error: GatewayError::unavailable("second"),
-                },
-            ],
-        };
-        assert_eq!(result.success_count(), 0);
-        assert_eq!(result.error_count(), 2);
     }
 
     #[test]

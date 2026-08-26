@@ -59,6 +59,7 @@ pub(crate) struct RowDecodeError {
     error: GatewayError,
 }
 
+#[allow(dead_code)]
 impl RowDecodeError {
     fn schema_mismatch(error: GatewayError) -> Self {
         Self {
@@ -103,6 +104,7 @@ struct SchemaDecoderInner {
 
 /// Immutable reusable decoder compiled from one Fluss row type.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct SchemaDecoder {
     inner: Arc<SchemaDecoderInner>,
 }
@@ -116,6 +118,7 @@ impl fmt::Debug for SchemaDecoder {
     }
 }
 
+#[allow(dead_code)]
 impl SchemaDecoder {
     /// Builds a decoder for a complete table row type.
     pub(crate) fn new(row_type: RowType) -> Result<Self, GatewayError> {

@@ -37,6 +37,7 @@ const NANOS_PER_MILLI: i64 = 1_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Renders every row of a record batch as a JSON object keyed by column name.
+#[allow(dead_code)]
 pub(crate) fn record_batch_to_json_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<JsonMap<String, JsonValue>>, GatewayError> {
@@ -58,6 +59,7 @@ pub(crate) fn record_batch_to_json_rows(
 }
 
 /// Renders one Arrow array element using the FIP-49 representation.
+#[allow(dead_code)]
 pub(crate) fn value_to_json(array: &dyn Array, index: usize) -> Result<JsonValue, GatewayError> {
     if index >= array.len() {
         return Err(GatewayError::internal(format!(
@@ -77,8 +79,8 @@ pub(crate) fn value_to_json(array: &dyn Array, index: usize) -> Result<JsonValue
             .value(index)
             .to_string()
             .into()),
-        ArrowDataType::Float32 => Ok(float_to_json(
-            downcast::<Float32Array>(array)?.value(index) as f64
+        ArrowDataType::Float32 => Ok(float32_to_json(
+            downcast::<Float32Array>(array)?.value(index),
         )),
         ArrowDataType::Float64 => Ok(float_to_json(downcast::<Float64Array>(array)?.value(index))),
         ArrowDataType::Utf8 => Ok(downcast::<StringArray>(array)?.value(index).into()),
@@ -119,6 +121,19 @@ fn float_to_json(value: f64) -> JsonValue {
     Number::from_f64(value)
         .map(JsonValue::Number)
         .expect("finite f64 values always have a JSON number representation")
+}
+
+fn float32_to_json(value: f32) -> JsonValue {
+    if value.is_finite() {
+        let shortest = value
+            .to_string()
+            .parse::<f64>()
+            .expect("a finite f32 display is valid JSON number text");
+        return JsonValue::Number(
+            Number::from_f64(shortest).expect("a finite f32 converts to a finite f64"),
+        );
+    }
+    float_to_json(value as f64)
 }
 
 fn time_to_json(array: &dyn Array, index: usize) -> Result<JsonValue, GatewayError> {
@@ -280,7 +295,7 @@ mod tests {
     use arrow::datatypes::{Field, Fields, Schema};
     use fluss::metadata::{
         ArrayType, BigIntType, BinaryType, BooleanType, DataField, DataType, DateType, DecimalType,
-        DoubleType, IntType, MapType, RowType, StringType, TimeType, TimestampLTzType,
+        DoubleType, FloatType, IntType, MapType, RowType, StringType, TimeType, TimestampLTzType,
         TimestampType,
     };
     use fluss::record::to_arrow_schema;
@@ -328,6 +343,10 @@ mod tests {
         assert_eq!(as_json(&bigint, 0), json!("9223372036854775807"));
         assert_eq!(as_json(&bigint, 1), json!("-9223372036854775808"));
         assert_eq!(as_json(&bigint, 2), JsonValue::Null);
+        assert_eq!(
+            as_json(&Float32Array::from(vec![1.1_f32]), 0).to_string(),
+            "1.1"
+        );
         assert_eq!(
             as_json(&Float64Array::from(vec![f64::INFINITY]), 0),
             json!("Infinity")
@@ -457,6 +476,7 @@ mod tests {
         let row_type = RowType::new(vec![
             field("id", DataType::Int(IntType::with_nullable(false))),
             field("big", DataType::BigInt(BigIntType::with_nullable(false))),
+            field("score", DataType::Float(FloatType::new())),
             field("ratio", DataType::Double(DoubleType::new())),
             field(
                 "amount",
@@ -491,6 +511,7 @@ mod tests {
             r#"{
                 "id": 7,
                 "big": 9007199254740993,
+                "score": 1.1,
                 "ratio": "Infinity",
                 "amount": 1234567890123456.7800,
                 "payload": "AP8=",
@@ -508,6 +529,7 @@ mod tests {
             json!({
                 "id": 7,
                 "big": "9007199254740993",
+                "score": 1.1,
                 "ratio": "Infinity",
                 "amount": "1234567890123456.7800",
                 "payload": "AP8=",

@@ -146,12 +146,11 @@ pub struct WriteResult {
 
 impl WriteResult {
     pub fn success_count(&self) -> u64 {
-        self.row_count
-            .saturating_sub(u64::try_from(self.failures.len()).unwrap_or(u64::MAX))
+        self.row_count.saturating_sub(self.error_count())
     }
 
     pub fn error_count(&self) -> u64 {
-        u64::try_from(self.failures.len()).unwrap_or(u64::MAX)
+        self.failures.len() as u64
     }
 }
 

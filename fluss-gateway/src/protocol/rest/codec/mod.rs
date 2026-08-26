@@ -28,5 +28,7 @@ mod decoder;
 mod input;
 mod temporal;
 
+// Response assembly lands in a parallel task; keep the complete Arrow codec entry points available.
+#[allow(unused_imports)]
 pub(crate) use arrow_json::{record_batch_to_json_rows, value_to_json};
 pub(crate) use decoder::{RowDecodeError, RowShape, SchemaDecoder};

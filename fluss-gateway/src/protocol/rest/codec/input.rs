@@ -20,7 +20,9 @@
 //! `serde_json::Value` cannot represent duplicate object fields, and without arbitrary precision it may
 //! convert a large number through `f64`. Rows are therefore first retained as [`RawValue`] by the REST DTO,
 //! then converted here into a small private tree that preserves number text and ordered duplicate fields.
-//! Serde still owns JSON syntax validation, so the Gateway does not carry a second JSON parser.
+//! Serde still owns JSON syntax validation, so the Gateway does not carry a second JSON parser. Because
+//! recursively parsing [`RawValue`] subtrees can rescan bytes, each row also has an eight-times-size scan
+//! budget.
 
 use crate::error::GatewayError;
 use serde::Deserialize;
@@ -29,6 +31,7 @@ use serde_json::value::RawValue;
 use std::fmt;
 
 const MAX_NESTING_DEPTH: usize = 128;
+const MAX_RECURSIVE_SCAN_MULTIPLIER: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum InputValue<'a> {
@@ -51,17 +54,24 @@ impl InputValue<'_> {
 
 /// Parses one complete JSON value while retaining exact number text and duplicate object fields.
 pub(super) fn parse_input_value(input: &[u8]) -> Result<InputValue<'_>, GatewayError> {
+    let mut budget = ParseBudget::for_input(input.len());
+    budget.consume(input.len())?;
     let raw: &RawValue = serde_json::from_slice(input)
         .map_err(|error| GatewayError::invalid_argument(format!("invalid JSON row: {error}")))?;
-    parse_raw_value(raw, 0)
+    parse_raw_value(raw, 0, &mut budget)
 }
 
-fn parse_raw_value(raw: &RawValue, depth: usize) -> Result<InputValue<'_>, GatewayError> {
+fn parse_raw_value<'a>(
+    raw: &'a RawValue,
+    depth: usize,
+    budget: &mut ParseBudget,
+) -> Result<InputValue<'a>, GatewayError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(GatewayError::invalid_argument(
             "JSON row nesting exceeds 128 levels",
         ));
     }
+    budget.consume(raw.get().len())?;
     let text = raw.get().trim();
     let first =
         text.as_bytes().first().copied().ok_or_else(|| {
@@ -80,7 +90,7 @@ fn parse_raw_value(raw: &RawValue, depth: usize) -> Result<InputValue<'_>, Gatew
             values
                 .0
                 .into_iter()
-                .map(|value| parse_raw_value(value, depth + 1))
+                .map(|value| parse_raw_value(value, depth + 1, budget))
                 .collect::<Result<Vec<_>, _>>()
                 .map(InputValue::Array)
         }
@@ -89,13 +99,36 @@ fn parse_raw_value(raw: &RawValue, depth: usize) -> Result<InputValue<'_>, Gatew
             entries
                 .0
                 .into_iter()
-                .map(|(name, value)| parse_raw_value(value, depth + 1).map(|value| (name, value)))
+                .map(|(name, value)| {
+                    parse_raw_value(value, depth + 1, budget).map(|value| (name, value))
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(InputValue::Object)
         }
         _ => Err(GatewayError::invalid_argument(
             "invalid JSON row: expected a JSON value",
         )),
+    }
+}
+
+struct ParseBudget {
+    remaining: usize,
+}
+
+impl ParseBudget {
+    fn for_input(input_len: usize) -> Self {
+        Self {
+            remaining: input_len.saturating_mul(MAX_RECURSIVE_SCAN_MULTIPLIER),
+        }
+    }
+
+    fn consume(&mut self, bytes: usize) -> Result<(), GatewayError> {
+        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
+            GatewayError::invalid_argument(
+                "JSON row requires excessive recursive parsing for its size",
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -194,5 +227,20 @@ mod tests {
         assert!(parse_input_value(b"1 2").is_err());
         let input = format!("{}0{}", "[".repeat(130), "]".repeat(130));
         assert!(parse_input_value(input.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn bounds_recursive_rescanning_without_rejecting_reasonable_nesting() {
+        let reasonable = format!("{}0{}", "[".repeat(8), "]".repeat(8));
+        assert!(parse_input_value(reasonable.as_bytes()).is_ok());
+
+        let large_leaf = "x".repeat(256 * 1024);
+        let amplified = format!("{}\"{large_leaf}\"{}", "[".repeat(16), "]".repeat(16));
+        let error = parse_input_value(amplified.as_bytes()).unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("excessive recursive parsing for its size")
+        );
     }
 }
