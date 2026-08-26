@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema-aware conversion from one raw FIP-49 JSON row to [`GenericRow`].
+//! Schema-aware streaming conversion from one raw FIP-49 JSON row to [`GenericRow`].
 
 use crate::error::GatewayError;
-use crate::protocol::rest::codec::input::{InputValue, parse_input_value};
 use crate::protocol::rest::codec::temporal::{parse_date, parse_time, parse_timestamp};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -27,11 +26,15 @@ use fluss::row::{
     Date, Datum, Decimal, FlussArrayWriter, FlussMapWriter, GenericRow, Time, TimestampLtz,
     TimestampNtz,
 };
+use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde_json::value::RawValue;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+/// Bounds schema-recursive validation and decoding; it is not a JSON body-depth limit.
 const MAX_TYPE_NESTING: usize = 64;
 const NANOS_PER_MILLI: i64 = 1_000_000;
 const MILLIS_PER_SECOND: i64 = 1_000;
@@ -155,55 +158,21 @@ impl SchemaDecoder {
         row_json: &[u8],
         shape: RowShape<'_>,
     ) -> Result<GenericRow<'static>, RowDecodeError> {
-        let value = parse_input_value(row_json).map_err(|error| {
-            RowDecodeError::invalid(GatewayError::invalid_argument(format!(
-                "{label}: {}",
-                error.message()
-            )))
-        })?;
-        let entries = value.object_entries().ok_or_else(|| {
-            RowDecodeError::invalid(GatewayError::invalid_argument(format!(
-                "{label}: row must be a JSON object, got {}",
-                input_kind(&value)
-            )))
-        })?;
-        self.check_column_names(label, entries)?;
-
         let required = self.required_columns(label, shape)?;
-        let mut provided = vec![None; self.inner.row_type.fields().len()];
-        for (name, value) in entries {
-            let index = self.inner.column_indexes[name];
-            provided[index] = Some(value);
-        }
-
-        let mut row = GenericRow::new(self.inner.row_type.fields().len());
-        for (index, field) in self.inner.row_type.fields().iter().enumerate() {
-            let datum = match provided[index] {
-                Some(InputValue::Null) if required[index] => {
-                    return Err(RowDecodeError::invalid(GatewayError::invalid_argument(
-                        format!(
-                            "{label}: column `{}` is required and must not be null",
-                            field.name
-                        ),
-                    )));
-                }
-                Some(value) => {
-                    let path = ValuePath::column(label, &field.name);
-                    decode_value(&path, &field.data_type, value)?
-                }
-                None if required[index] => {
-                    return Err(RowDecodeError::schema_mismatch(
-                        GatewayError::invalid_argument(format!(
-                            "{label}: column `{}` is required and was not provided",
-                            field.name
-                        )),
-                    ));
-                }
-                None => Datum::Null,
-            };
-            row.set_field(index, datum);
-        }
-        Ok(row)
+        let seed = RootRowSeed {
+            label,
+            row_type: &self.inner.row_type,
+            column_indexes: &self.inner.column_indexes,
+            required: &required,
+        };
+        let mut deserializer = serde_json::Deserializer::from_slice(row_json);
+        let decoded = seed
+            .deserialize(&mut deserializer)
+            .map_err(|error| invalid_json_error(label, error))?;
+        deserializer
+            .end()
+            .map_err(|error| invalid_json_error(label, error))?;
+        decoded
     }
 
     fn required_columns(
@@ -235,29 +204,12 @@ impl SchemaDecoder {
             }
         }
     }
+}
 
-    fn check_column_names(
-        &self,
-        label: &str,
-        entries: &[(String, InputValue<'_>)],
-    ) -> Result<(), RowDecodeError> {
-        let mut seen = HashSet::with_capacity(entries.len());
-        for (name, _) in entries {
-            if !seen.insert(name.as_str()) {
-                return Err(RowDecodeError::invalid(GatewayError::invalid_argument(
-                    format!("{label}: duplicate column `{name}`"),
-                )));
-            }
-        }
-        for (name, _) in entries {
-            if !self.inner.column_indexes.contains_key(name) {
-                return Err(RowDecodeError::schema_mismatch(
-                    GatewayError::invalid_argument(format!("{label}: unknown column `{name}`")),
-                ));
-            }
-        }
-        Ok(())
-    }
+fn invalid_json_error(label: &str, error: serde_json::Error) -> RowDecodeError {
+    RowDecodeError::invalid(GatewayError::invalid_argument(format!(
+        "{label}: invalid JSON row: {error}"
+    )))
 }
 
 fn validate_row_type(row_type: &RowType, depth: usize) -> Result<(), GatewayError> {
@@ -322,6 +274,7 @@ fn is_complex(data_type: &DataType) -> bool {
     )
 }
 
+#[derive(Clone)]
 struct ValuePath<'a> {
     label: &'a str,
     path: String,
@@ -368,28 +321,425 @@ impl<'a> ValuePath<'a> {
         )))
     }
 
-    fn type_error(&self, expected: &str, value: &InputValue<'_>) -> RowDecodeError {
-        self.invalid(format!("expects {expected}, got {}", input_kind(value)))
+    fn type_error(&self, expected: &str, actual: &str) -> RowDecodeError {
+        self.invalid(format!("expects {expected}, got {actual}"))
     }
 }
 
-fn input_kind(value: &InputValue<'_>) -> &'static str {
-    match value {
-        InputValue::Null => "null",
-        InputValue::Boolean(_) => "a boolean",
-        InputValue::ExactNumber(_) => "a number",
-        InputValue::String(_) => "a string",
-        InputValue::Array(_) => "an array",
-        InputValue::Object(_) => "an object",
+type DecodeResult<T> = Result<T, RowDecodeError>;
+
+enum ScalarValue<'a> {
+    Null,
+    Boolean(bool),
+    ExactNumber(&'a str),
+    String(String),
+    Array,
+    Object,
+}
+
+impl ScalarValue<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean(_) => "a boolean",
+            Self::ExactNumber(_) => "a number",
+            Self::String(_) => "a string",
+            Self::Array => "an array",
+            Self::Object => "an object",
+        }
     }
 }
 
-fn decode_value(
+fn parse_scalar_value(raw: &RawValue) -> Result<ScalarValue<'_>, serde_json::Error> {
+    let text = raw.get().trim();
+    match text.as_bytes().first().copied() {
+        Some(b'n') => Ok(ScalarValue::Null),
+        Some(b't') => Ok(ScalarValue::Boolean(true)),
+        Some(b'f') => Ok(ScalarValue::Boolean(false)),
+        Some(b'"') => serde_json::from_str(text).map(ScalarValue::String),
+        Some(b'-' | b'0'..=b'9') => Ok(ScalarValue::ExactNumber(text)),
+        Some(b'[') => Ok(ScalarValue::Array),
+        Some(b'{') => Ok(ScalarValue::Object),
+        _ => unreachable!("RawValue always contains one complete JSON value"),
+    }
+}
+
+struct RootRowSeed<'a> {
+    label: &'a str,
+    row_type: &'a RowType,
+    column_indexes: &'a HashMap<String, usize>,
+    required: &'a [bool],
+}
+
+impl<'de> DeserializeSeed<'de> for RootRowSeed<'_> {
+    type Value = DecodeResult<GenericRow<'static>>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RootRowVisitor {
+            label: self.label,
+            row_type: self.row_type,
+            column_indexes: self.column_indexes,
+            required: self.required,
+        })
+    }
+}
+
+struct RootRowVisitor<'a> {
+    label: &'a str,
+    row_type: &'a RowType,
+    column_indexes: &'a HashMap<String, usize>,
+    required: &'a [bool],
+}
+
+impl RootRowVisitor<'_> {
+    fn type_error(&self, actual: &str) -> DecodeResult<GenericRow<'static>> {
+        Err(RowDecodeError::invalid(GatewayError::invalid_argument(
+            format!("{}: row must be a JSON object, got {actual}", self.label),
+        )))
+    }
+}
+
+impl<'de> Visitor<'de> for RootRowVisitor<'_> {
+    type Value = DecodeResult<GenericRow<'static>>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON row object")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(self.type_error("null"))
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(self.type_error("a boolean"))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(self.type_error("a string"))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        drain_sequence(&mut sequence)?;
+        Ok(self.type_error("an array"))
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        decode_row_map(
+            map,
+            self.row_type,
+            RowContext::Root {
+                label: self.label,
+                column_indexes: self.column_indexes,
+                required: self.required,
+            },
+        )
+    }
+}
+
+enum RowContext<'a> {
+    Root {
+        label: &'a str,
+        column_indexes: &'a HashMap<String, usize>,
+        required: &'a [bool],
+    },
+    Nested {
+        path: ValuePath<'a>,
+    },
+}
+
+impl<'a> RowContext<'a> {
+    fn field_index(&self, row_type: &RowType, name: &str) -> Option<usize> {
+        match self {
+            Self::Root { column_indexes, .. } => column_indexes.get(name).copied(),
+            Self::Nested { .. } => row_type.get_field_index(name),
+        }
+    }
+
+    fn field_path(&self, name: &str) -> ValuePath<'a> {
+        match self {
+            Self::Root { label, .. } => ValuePath::column(label, name),
+            Self::Nested { path } => path.nested_field(name),
+        }
+    }
+
+    fn required(&self, index: usize, data_type: &DataType) -> bool {
+        match self {
+            Self::Root { required, .. } => required[index],
+            Self::Nested { .. } => !data_type.is_nullable(),
+        }
+    }
+
+    fn duplicate(&self, name: &str) -> RowDecodeError {
+        match self {
+            Self::Root { label, .. } => RowDecodeError::invalid(GatewayError::invalid_argument(
+                format!("{label}: duplicate column `{name}`"),
+            )),
+            Self::Nested { path } => path.invalid(format!("has a duplicate field `{name}`")),
+        }
+    }
+
+    fn unknown(&self, name: &str) -> RowDecodeError {
+        match self {
+            Self::Root { label, .. } => RowDecodeError::schema_mismatch(
+                GatewayError::invalid_argument(format!("{label}: unknown column `{name}`")),
+            ),
+            Self::Nested { path } => path.schema_mismatch(format!("has an unknown field `{name}`")),
+        }
+    }
+
+    fn missing(&self, name: &str) -> RowDecodeError {
+        match self {
+            Self::Root { label, .. } => {
+                RowDecodeError::schema_mismatch(GatewayError::invalid_argument(format!(
+                    "{label}: column `{name}` is required and was not provided"
+                )))
+            }
+            Self::Nested { path } => path
+                .nested_field(name)
+                .schema_mismatch("is required and was not provided"),
+        }
+    }
+
+    fn required_null(&self, name: &str) -> RowDecodeError {
+        match self {
+            Self::Root { label, .. } => RowDecodeError::invalid(GatewayError::invalid_argument(
+                format!("{label}: column `{name}` is required and must not be null"),
+            )),
+            Self::Nested { path } => path.nested_field(name).invalid("must not be null"),
+        }
+    }
+}
+
+fn decode_row_map<'de, A>(
+    mut map: A,
+    row_type: &RowType,
+    context: RowContext<'_>,
+) -> Result<DecodeResult<GenericRow<'static>>, A::Error>
+where
+    A: MapAccess<'de>,
+{
+    let mut seen = HashSet::with_capacity(map.size_hint().unwrap_or(0));
+    let mut duplicate = None;
+    let mut unknown = None;
+    let mut provided = std::iter::repeat_with(|| None)
+        .take(row_type.fields().len())
+        .collect::<Vec<Option<DecodeResult<Datum<'static>>>>>();
+
+    while let Some(name) = map.next_key::<String>()? {
+        if !seen.insert(name.clone()) {
+            map.next_value::<IgnoredAny>()?;
+            duplicate.get_or_insert(name);
+            continue;
+        }
+        let Some(index) = context.field_index(row_type, &name) else {
+            map.next_value::<IgnoredAny>()?;
+            unknown.get_or_insert(name);
+            continue;
+        };
+        let field = &row_type.fields()[index];
+        let value = map.next_value_seed(ValueSeed {
+            path: context.field_path(&field.name),
+            data_type: &field.data_type,
+        })?;
+        provided[index] = Some(value);
+    }
+
+    if let Some(name) = duplicate {
+        return Ok(Err(context.duplicate(&name)));
+    }
+    if let Some(name) = unknown {
+        return Ok(Err(context.unknown(&name)));
+    }
+
+    let mut row = GenericRow::new(row_type.fields().len());
+    for (index, field) in row_type.fields().iter().enumerate() {
+        let datum = match provided[index].take() {
+            Some(Ok(Datum::Null)) if context.required(index, &field.data_type) => {
+                return Ok(Err(context.required_null(&field.name)));
+            }
+            Some(Ok(datum)) => datum,
+            Some(Err(error)) => return Ok(Err(error)),
+            None if context.required(index, &field.data_type) => {
+                return Ok(Err(context.missing(&field.name)));
+            }
+            None => Datum::Null,
+        };
+        row.set_field(index, datum);
+    }
+    Ok(Ok(row))
+}
+
+struct ValueSeed<'a> {
+    path: ValuePath<'a>,
+    data_type: &'a DataType,
+}
+
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+    type Value = DecodeResult<Datum<'static>>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        if is_complex(self.data_type) {
+            deserializer.deserialize_any(ComplexValueVisitor {
+                path: self.path,
+                data_type: self.data_type,
+            })
+        } else {
+            let raw = <&RawValue>::deserialize(deserializer)?;
+            let value = parse_scalar_value(raw).map_err(de::Error::custom)?;
+            Ok(decode_scalar(&self.path, self.data_type, &value))
+        }
+    }
+}
+
+struct ComplexValueVisitor<'a> {
+    path: ValuePath<'a>,
+    data_type: &'a DataType,
+}
+
+impl ComplexValueVisitor<'_> {
+    fn type_error(&self, actual: &str) -> DecodeResult<Datum<'static>> {
+        Err(self
+            .path
+            .type_error(complex_expected(self.data_type), actual))
+    }
+
+    fn null(&self) -> DecodeResult<Datum<'static>> {
+        if self.data_type.is_nullable() {
+            Ok(Datum::Null)
+        } else {
+            Err(self.path.invalid("must not be null"))
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for ComplexValueVisitor<'_> {
+    type Value = DecodeResult<Datum<'static>>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(complex_expected(self.data_type))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(self.null())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(self.type_error("a boolean"))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(self.type_error("a string"))
+    }
+
+    fn visit_seq<A>(self, sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        match self.data_type {
+            DataType::Array(data_type) => {
+                decode_array_sequence(sequence, &self.path, data_type.get_element_type())
+            }
+            DataType::Map(data_type) => decode_map_sequence(
+                sequence,
+                &self.path,
+                data_type.key_type(),
+                data_type.value_type(),
+            ),
+            DataType::Row(_) => {
+                let mut sequence = sequence;
+                drain_sequence(&mut sequence)?;
+                Ok(self.type_error("an array"))
+            }
+            _ => unreachable!("complex visitor receives only ARRAY, MAP, or ROW"),
+        }
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        match self.data_type {
+            DataType::Row(row_type) => {
+                let row = decode_row_map(map, row_type, RowContext::Nested { path: self.path })?;
+                Ok(row.map(|row| Datum::Row(Box::new(row))))
+            }
+            DataType::Array(_) | DataType::Map(_) => {
+                let mut map = map;
+                drain_map(&mut map)?;
+                Ok(self.type_error("an object"))
+            }
+            _ => unreachable!("complex visitor receives only ARRAY, MAP, or ROW"),
+        }
+    }
+}
+
+fn complex_expected(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Array(_) => "ARRAY (a JSON array)",
+        DataType::Map(_) => "MAP (an array of {key, value} objects)",
+        DataType::Row(_) => "ROW (a JSON object of its declared fields)",
+        _ => unreachable!("only complex data types have a container expectation"),
+    }
+}
+
+fn drain_sequence<'de, A>(sequence: &mut A) -> Result<(), A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    while sequence.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn drain_map<'de, A>(map: &mut A) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+{
+    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn decode_scalar(
     path: &ValuePath<'_>,
     data_type: &DataType,
-    value: &InputValue<'_>,
-) -> Result<Datum<'static>, RowDecodeError> {
-    if matches!(value, InputValue::Null) {
+    value: &ScalarValue<'_>,
+) -> DecodeResult<Datum<'static>> {
+    if matches!(value, ScalarValue::Null) {
         return if data_type.is_nullable() {
             Ok(Datum::Null)
         } else {
@@ -398,8 +748,8 @@ fn decode_value(
     }
     match data_type {
         DataType::Boolean(_) => match value {
-            InputValue::Boolean(parsed) => Ok(Datum::Bool(*parsed)),
-            _ => Err(path.type_error("BOOLEAN (a JSON boolean)", value)),
+            ScalarValue::Boolean(parsed) => Ok(Datum::Bool(*parsed)),
+            _ => Err(path.type_error("BOOLEAN (a JSON boolean)", value.kind())),
         },
         DataType::TinyInt(_) => {
             decode_integer(path, value, "TINYINT", i8::MIN as i64, i8::MAX as i64)
@@ -415,8 +765,8 @@ fn decode_value(
         DataType::Float(_) => decode_float32(path, value),
         DataType::Double(_) => decode_float(path, value, "DOUBLE").map(Datum::from),
         DataType::Char(_) | DataType::String(_) => match value {
-            InputValue::String(text) => Ok(Datum::String(Cow::Owned(text.clone()))),
-            _ => Err(path.type_error("STRING (a JSON string)", value)),
+            ScalarValue::String(text) => Ok(Datum::String(Cow::Owned(text.clone()))),
+            _ => Err(path.type_error("STRING (a JSON string)", value.kind())),
         },
         DataType::Decimal(data_type) => {
             decode_decimal(path, value, data_type.precision(), data_type.scale())
@@ -431,42 +781,39 @@ fn decode_value(
         DataType::TimestampLTz(data_type) => {
             decode_timestamp(path, value, data_type.precision(), true)
         }
-        DataType::Array(data_type) => decode_array(path, data_type.get_element_type(), value),
-        DataType::Map(data_type) => {
-            decode_map(path, data_type.key_type(), data_type.value_type(), value)
+        DataType::Array(_) | DataType::Map(_) | DataType::Row(_) => {
+            unreachable!("container values use the complex visitor")
         }
-        DataType::Row(row_type) => decode_row_value(path, row_type, value),
     }
 }
-
 fn decode_integer(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
     type_name: &str,
     min: i64,
     max: i64,
 ) -> Result<i64, RowDecodeError> {
     let expected = format!("{type_name} (an integer in [{min}, {max}])");
-    let InputValue::ExactNumber(lexeme) = value else {
-        return Err(path.type_error(&expected, value));
+    let ScalarValue::ExactNumber(lexeme) = value else {
+        return Err(path.type_error(&expected, value.kind()));
     };
-    let parsed = integer_lexeme(lexeme).ok_or_else(|| path.type_error(&expected, value))?;
+    let parsed = integer_lexeme(lexeme).ok_or_else(|| path.type_error(&expected, value.kind()))?;
     if parsed < min || parsed > max {
         return Err(path.invalid(format!("expects {expected}, value is out of range")));
     }
     Ok(parsed)
 }
 
-fn decode_bigint(path: &ValuePath<'_>, value: &InputValue<'_>) -> Result<i64, RowDecodeError> {
+fn decode_bigint(path: &ValuePath<'_>, value: &ScalarValue<'_>) -> Result<i64, RowDecodeError> {
     let expected = "BIGINT (an exact integer number or a base-10 string)";
     match value {
-        InputValue::ExactNumber(lexeme) => {
-            integer_lexeme(lexeme).ok_or_else(|| path.type_error(expected, value))
+        ScalarValue::ExactNumber(lexeme) => {
+            integer_lexeme(lexeme).ok_or_else(|| path.type_error(expected, value.kind()))
         }
-        InputValue::String(text) => text
+        ScalarValue::String(text) => text
             .parse::<i64>()
-            .map_err(|_| path.type_error(expected, value)),
-        _ => Err(path.type_error(expected, value)),
+            .map_err(|_| path.type_error(expected, value.kind())),
+        _ => Err(path.type_error(expected, value.kind())),
     }
 }
 
@@ -479,15 +826,15 @@ fn integer_lexeme(lexeme: &str) -> Option<i64> {
 
 fn decode_float(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
     type_name: &str,
 ) -> Result<f64, RowDecodeError> {
     let expected = format!("{type_name} (a number or \"NaN\", \"Infinity\", \"-Infinity\")");
     match value {
-        InputValue::ExactNumber(lexeme) => {
+        ScalarValue::ExactNumber(lexeme) => {
             let parsed = lexeme
                 .parse::<f64>()
-                .map_err(|_| path.type_error(&expected, value))?;
+                .map_err(|_| path.type_error(&expected, value.kind()))?;
             if !parsed.is_finite() {
                 return Err(path.invalid(format!(
                     "expects {type_name}, finite number is out of range"
@@ -495,19 +842,19 @@ fn decode_float(
             }
             Ok(parsed)
         }
-        InputValue::String(text) => match text.as_str() {
+        ScalarValue::String(text) => match text.as_str() {
             "NaN" => Ok(f64::NAN),
             "Infinity" => Ok(f64::INFINITY),
             "-Infinity" => Ok(f64::NEG_INFINITY),
-            _ => Err(path.type_error(&expected, value)),
+            _ => Err(path.type_error(&expected, value.kind())),
         },
-        _ => Err(path.type_error(&expected, value)),
+        _ => Err(path.type_error(&expected, value.kind())),
     }
 }
 
 fn decode_float32(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
 ) -> Result<Datum<'static>, RowDecodeError> {
     let parsed = decode_float(path, value, "FLOAT")?;
     let narrowed = parsed as f32;
@@ -519,15 +866,15 @@ fn decode_float32(
 
 fn decode_decimal(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
     precision: u32,
     scale: u32,
 ) -> Result<Datum<'static>, RowDecodeError> {
     let expected = format!("DECIMAL({precision}, {scale}) (a base-10 string or a number)");
     let text = match value {
-        InputValue::String(text) => text.as_str(),
-        InputValue::ExactNumber(lexeme) => lexeme,
-        _ => return Err(path.type_error(&expected, value)),
+        ScalarValue::String(text) => text.as_str(),
+        ScalarValue::ExactNumber(lexeme) => lexeme,
+        _ => return Err(path.type_error(&expected, value.kind())),
     };
     let unscaled = decimal_to_unscaled(text, precision, scale)
         .map_err(|reason| path.invalid(format!("expects {expected}: {reason}")))?;
@@ -584,12 +931,12 @@ fn decimal_to_unscaled(text: &str, precision: u32, scale: u32) -> Result<i128, S
 
 fn decode_binary(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
     fixed_length: Option<usize>,
 ) -> Result<Datum<'static>, RowDecodeError> {
     let expected = "BINARY (a base64 string)";
-    let InputValue::String(text) = value else {
-        return Err(path.type_error(expected, value));
+    let ScalarValue::String(text) = value else {
+        return Err(path.type_error(expected, value.kind()));
     };
     let bytes = BASE64.decode(text).map_err(|error| {
         path.invalid(format!(
@@ -609,13 +956,13 @@ fn decode_binary(
 
 fn decode_date(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
 ) -> Result<Datum<'static>, RowDecodeError> {
     let expected = "DATE (an ISO-8601 string like \"2026-01-31\")";
-    let InputValue::String(text) = value else {
-        return Err(path.type_error(expected, value));
+    let ScalarValue::String(text) = value else {
+        return Err(path.type_error(expected, value.kind()));
     };
-    let days = parse_date(text).ok_or_else(|| path.type_error(expected, value))?;
+    let days = parse_date(text).ok_or_else(|| path.type_error(expected, value.kind()))?;
     let days = i32::try_from(days)
         .map_err(|_| path.invalid(format!("expects {expected}, the date is out of range")))?;
     Ok(Datum::Date(Date::new(days)))
@@ -623,15 +970,15 @@ fn decode_date(
 
 fn decode_time(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
     precision: u32,
 ) -> Result<Datum<'static>, RowDecodeError> {
     let expected = "TIME (an ISO-8601 string like \"12:34:56.789\")";
-    let InputValue::String(text) = value else {
-        return Err(path.type_error(expected, value));
+    let ScalarValue::String(text) = value else {
+        return Err(path.type_error(expected, value.kind()));
     };
     let (seconds_of_day, frac_nanos) =
-        parse_time(text).ok_or_else(|| path.type_error(expected, value))?;
+        parse_time(text).ok_or_else(|| path.type_error(expected, value.kind()))?;
     check_fraction_granularity(path, frac_nanos, precision)?;
     if frac_nanos % NANOS_PER_MILLI != 0 {
         return Err(path.invalid(
@@ -644,7 +991,7 @@ fn decode_time(
 
 fn decode_timestamp(
     path: &ValuePath<'_>,
-    value: &InputValue<'_>,
+    value: &ScalarValue<'_>,
     precision: u32,
     with_zone: bool,
 ) -> Result<Datum<'static>, RowDecodeError> {
@@ -654,14 +1001,16 @@ fn decode_timestamp(
         "TIMESTAMP (a zone-free ISO-8601 string or epoch milliseconds)"
     };
     let (millis, nanos_of_milli) = match value {
-        InputValue::ExactNumber(lexeme) => {
-            let millis = integer_lexeme(lexeme).ok_or_else(|| path.type_error(expected, value))?;
+        ScalarValue::ExactNumber(lexeme) => {
+            let millis =
+                integer_lexeme(lexeme).ok_or_else(|| path.type_error(expected, value.kind()))?;
             let frac_nanos = millis.rem_euclid(MILLIS_PER_SECOND) * NANOS_PER_MILLI;
             check_fraction_granularity(path, frac_nanos, precision)?;
             (millis, 0)
         }
-        InputValue::String(text) => {
-            let parsed = parse_timestamp(text).ok_or_else(|| path.type_error(expected, value))?;
+        ScalarValue::String(text) => {
+            let parsed =
+                parse_timestamp(text).ok_or_else(|| path.type_error(expected, value.kind()))?;
             if with_zone && parsed.offset_seconds.is_none() {
                 return Err(path.invalid(format!("expects {expected}, the value has no zone")));
             }
@@ -687,7 +1036,7 @@ fn decode_timestamp(
             })?;
             (millis, (parsed.frac_nanos % NANOS_PER_MILLI) as i32)
         }
-        _ => return Err(path.type_error(expected, value)),
+        _ => return Err(path.type_error(expected, value.kind())),
     };
     if with_zone {
         TimestampLtz::from_millis_nanos(millis, nanos_of_milli)
@@ -714,126 +1063,240 @@ fn check_fraction_granularity(
     Ok(())
 }
 
-fn decode_array(
+fn decode_array_sequence<'de, A>(
+    mut sequence: A,
     path: &ValuePath<'_>,
     element_type: &DataType,
-    value: &InputValue<'_>,
-) -> Result<Datum<'static>, RowDecodeError> {
-    let InputValue::Array(values) = value else {
-        return Err(path.type_error("ARRAY (a JSON array)", value));
-    };
-    let mut writer = FlussArrayWriter::new(values.len(), element_type);
-    for (index, item) in values.iter().enumerate() {
-        let element_path = path.element(index);
-        let datum = decode_value(&element_path, element_type, item)?;
-        write_element(&mut writer, index, datum, element_type)
-            .map_err(|reason| element_path.invalid(reason))?;
+) -> Result<DecodeResult<Datum<'static>>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+    let mut first_error = None;
+    let mut index = 0;
+    while let Some(value) = sequence.next_element_seed(ValueSeed {
+        path: path.element(index),
+        data_type: element_type,
+    })? {
+        match value {
+            Ok(value) if first_error.is_none() => values.push(value),
+            Ok(_) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        index += 1;
     }
-    writer
+    if let Some(error) = first_error {
+        return Ok(Err(error));
+    }
+
+    let mut writer = FlussArrayWriter::new(values.len(), element_type);
+    for (index, datum) in values.into_iter().enumerate() {
+        let element_path = path.element(index);
+        if let Err(reason) = write_element(&mut writer, index, datum, element_type) {
+            return Ok(Err(element_path.invalid(reason)));
+        }
+    }
+    Ok(writer
         .complete()
         .map(Datum::Array)
-        .map_err(|error| path.invalid(format!("could not be encoded as an ARRAY: {error}")))
+        .map_err(|error| path.invalid(format!("could not be encoded as an ARRAY: {error}"))))
 }
 
-fn decode_map(
+fn decode_map_sequence<'de, A>(
+    mut sequence: A,
     path: &ValuePath<'_>,
     key_type: &DataType,
     value_type: &DataType,
-    value: &InputValue<'_>,
-) -> Result<Datum<'static>, RowDecodeError> {
-    let expected = "MAP (an array of {key, value} objects)";
-    let InputValue::Array(entries) = value else {
-        return Err(path.type_error(expected, value));
-    };
-    let mut writer = FlussMapWriter::new(entries.len(), key_type, value_type);
-    for (index, entry) in entries.iter().enumerate() {
-        let entry_path = path.element(index);
-        let key_path = path.map_part(index, "key");
-        let value_path = path.map_part(index, "value");
-        let Some(fields) = entry.object_entries() else {
-            return Err(entry_path.type_error("a map entry object with `key` and `value`", entry));
-        };
-        check_protocol_fields(&entry_path, fields, &["key", "value"])?;
-        let key =
-            field(fields, "key").ok_or_else(|| key_path.invalid("is required in a map entry"))?;
-        let entry_value = field(fields, "value")
-            .ok_or_else(|| value_path.invalid("is required in a map entry"))?;
-        let key = decode_value(&key_path, key_type, key)?;
-        let entry_value = decode_value(&value_path, value_type, entry_value)?;
-        writer
-            .write_entry(key, entry_value)
-            .map_err(|error| path.invalid(format!("could not be encoded as a MAP: {error}")))?;
+) -> Result<DecodeResult<Datum<'static>>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let mut entries = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+    let mut first_error = None;
+    let mut index = 0;
+    while let Some(entry) = sequence.next_element_seed(MapEntrySeed {
+        path: path.clone(),
+        key_type,
+        value_type,
+        index,
+    })? {
+        match entry {
+            Ok(entry) if first_error.is_none() => entries.push(entry),
+            Ok(_) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        index += 1;
     }
-    writer
+    if let Some(error) = first_error {
+        return Ok(Err(error));
+    }
+
+    let mut writer = FlussMapWriter::new(entries.len(), key_type, value_type);
+    for (key, value) in entries {
+        if let Err(error) = writer.write_entry(key, value) {
+            return Ok(Err(
+                path.invalid(format!("could not be encoded as a MAP: {error}"))
+            ));
+        }
+    }
+    Ok(writer
         .complete()
         .map(Datum::Map)
-        .map_err(|error| path.invalid(format!("could not be encoded as a MAP: {error}")))
+        .map_err(|error| path.invalid(format!("could not be encoded as a MAP: {error}"))))
 }
 
-fn decode_row_value(
-    path: &ValuePath<'_>,
-    row_type: &RowType,
-    value: &InputValue<'_>,
-) -> Result<Datum<'static>, RowDecodeError> {
-    let Some(entries) = value.object_entries() else {
-        return Err(path.type_error("ROW (a JSON object of its declared fields)", value));
-    };
-    check_nested_row_fields(path, entries, row_type)?;
-    let mut row = GenericRow::new(row_type.fields().len());
-    for (index, field_type) in row_type.fields().iter().enumerate() {
-        let field_path = path.nested_field(&field_type.name);
-        let datum = match field(entries, &field_type.name) {
-            Some(value) => decode_value(&field_path, &field_type.data_type, value)?,
-            None if field_type.data_type.is_nullable() => Datum::Null,
-            None => return Err(field_path.schema_mismatch("is required and was not provided")),
+struct MapEntrySeed<'a> {
+    path: ValuePath<'a>,
+    key_type: &'a DataType,
+    value_type: &'a DataType,
+    index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for MapEntrySeed<'_> {
+    type Value = DecodeResult<(Datum<'static>, Datum<'static>)>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(MapEntryVisitor {
+            path: self.path,
+            key_type: self.key_type,
+            value_type: self.value_type,
+            index: self.index,
+        })
+    }
+}
+
+struct MapEntryVisitor<'a> {
+    path: ValuePath<'a>,
+    key_type: &'a DataType,
+    value_type: &'a DataType,
+    index: usize,
+}
+
+impl MapEntryVisitor<'_> {
+    fn entry_path(&self) -> ValuePath<'_> {
+        self.path.element(self.index)
+    }
+
+    fn type_error(&self, actual: &str) -> DecodeResult<(Datum<'static>, Datum<'static>)> {
+        Err(self
+            .entry_path()
+            .type_error("a map entry object with `key` and `value`", actual))
+    }
+}
+
+impl<'de> Visitor<'de> for MapEntryVisitor<'_> {
+    type Value = DecodeResult<(Datum<'static>, Datum<'static>)>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a map entry object with `key` and `value`")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(self.type_error("null"))
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(self.type_error("a boolean"))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(self.type_error("a number"))
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(self.type_error("a string"))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        drain_sequence(&mut sequence)?;
+        Ok(self.type_error("an array"))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen = HashSet::with_capacity(map.size_hint().unwrap_or(0));
+        let mut duplicate = None;
+        let mut unknown = None;
+        let mut key = None;
+        let mut value = None;
+        while let Some(name) = map.next_key::<String>()? {
+            if !seen.insert(name.clone()) {
+                map.next_value::<IgnoredAny>()?;
+                duplicate.get_or_insert(name);
+                continue;
+            }
+            match name.as_str() {
+                "key" => {
+                    key = Some(map.next_value_seed(ValueSeed {
+                        path: self.path.map_part(self.index, "key"),
+                        data_type: self.key_type,
+                    })?);
+                }
+                "value" => {
+                    value = Some(map.next_value_seed(ValueSeed {
+                        path: self.path.map_part(self.index, "value"),
+                        data_type: self.value_type,
+                    })?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    unknown.get_or_insert(name);
+                }
+            }
+        }
+
+        if let Some(name) = duplicate {
+            return Ok(Err(self
+                .entry_path()
+                .invalid(format!("has a duplicate field `{name}`"))));
+        }
+        if let Some(name) = unknown {
+            return Ok(Err(self
+                .entry_path()
+                .invalid(format!("has an unknown field `{name}`"))));
+        }
+        let key = match key {
+            Some(Ok(key)) => key,
+            Some(Err(error)) => return Ok(Err(error)),
+            None => {
+                return Ok(Err(self
+                    .path
+                    .map_part(self.index, "key")
+                    .invalid("is required in a map entry")));
+            }
         };
-        row.set_field(index, datum);
+        let value = match value {
+            Some(Ok(value)) => value,
+            Some(Err(error)) => return Ok(Err(error)),
+            None => {
+                return Ok(Err(self
+                    .path
+                    .map_part(self.index, "value")
+                    .invalid("is required in a map entry")));
+            }
+        };
+        Ok(Ok((key, value)))
     }
-    Ok(Datum::Row(Box::new(row)))
-}
-
-fn check_nested_row_fields(
-    path: &ValuePath<'_>,
-    entries: &[(String, InputValue<'_>)],
-    row_type: &RowType,
-) -> Result<(), RowDecodeError> {
-    let mut seen = HashSet::with_capacity(entries.len());
-    for (name, _) in entries {
-        if !seen.insert(name.as_str()) {
-            return Err(path.invalid(format!("has a duplicate field `{name}`")));
-        }
-    }
-    for (name, _) in entries {
-        if row_type.get_field_index(name).is_none() {
-            return Err(path.schema_mismatch(format!("has an unknown field `{name}`")));
-        }
-    }
-    Ok(())
-}
-
-fn check_protocol_fields(
-    path: &ValuePath<'_>,
-    entries: &[(String, InputValue<'_>)],
-    known: &[&str],
-) -> Result<(), RowDecodeError> {
-    let mut seen = HashSet::with_capacity(entries.len());
-    for (name, _) in entries {
-        if !seen.insert(name.as_str()) {
-            return Err(path.invalid(format!("has a duplicate field `{name}`")));
-        }
-    }
-    for (name, _) in entries {
-        if !known.contains(&name.as_str()) {
-            return Err(path.invalid(format!("has an unknown field `{name}`")));
-        }
-    }
-    Ok(())
-}
-
-fn field<'a>(entries: &'a [(String, InputValue<'a>)], name: &str) -> Option<&'a InputValue<'a>> {
-    entries
-        .iter()
-        .find_map(|(entry_name, value)| (entry_name == name).then_some(value))
 }
 
 fn write_element(
@@ -940,6 +1403,18 @@ mod tests {
     }
 
     #[test]
+    fn streams_deep_large_values_without_recursive_rescanning_budget() {
+        let mut data_type = DataType::String(StringType::new());
+        let mut value = format!("\"{}\"", "x".repeat(256 * 1024));
+        for _ in 0..16 {
+            data_type = DataType::Array(ArrayType::new(data_type));
+            value = format!("[{value}]");
+        }
+
+        assert!(decode_one(data_type, &value).is_ok());
+    }
+
+    #[test]
     fn complete_and_sparse_rows_follow_schema_order() {
         let decoder = SchemaDecoder::new(row_type(vec![
             field("id", DataType::Int(IntType::with_nullable(false))),
@@ -962,6 +1437,47 @@ mod tests {
         assert_eq!(
             sparse.values,
             vec![Datum::Int32(2), Datum::Null, Datum::Null]
+        );
+    }
+
+    #[test]
+    fn sparse_rows_require_named_columns_even_when_the_schema_allows_null() {
+        let decoder = SchemaDecoder::new(row_type(vec![
+            field("key", DataType::String(StringType::new())),
+            field("version", DataType::Int(IntType::with_nullable(false))),
+            field("note", DataType::String(StringType::new())),
+        ]))
+        .unwrap();
+        let required = vec!["key".to_string()];
+
+        let missing = decoder
+            .decode_row("entry `missing`", br#"{}"#, RowShape::Sparse(&required))
+            .unwrap_err();
+        assert!(missing.is_schema_mismatch());
+
+        let explicit_null = decoder
+            .decode_row(
+                "entry `null`",
+                br#"{"key":null}"#,
+                RowShape::Sparse(&required),
+            )
+            .unwrap_err();
+        assert!(!explicit_null.is_schema_mismatch());
+
+        let decoded = decoder
+            .decode_row(
+                "entry `present`",
+                br#"{"note":"kept","key":"k"}"#,
+                RowShape::Sparse(&required),
+            )
+            .unwrap();
+        assert_eq!(
+            decoded.values,
+            vec![
+                Datum::String(Cow::Borrowed("k")),
+                Datum::Null,
+                Datum::String(Cow::Borrowed("kept")),
+            ]
         );
     }
 
@@ -998,14 +1514,39 @@ mod tests {
             .unwrap_err();
         assert!(!nullability.is_schema_mismatch());
 
+        let format = decode_one(DataType::Bytes(BytesType::new()), "\"not-base64\"").unwrap_err();
+        assert!(!format.is_schema_mismatch());
+
         let duplicate_unknown = decoder
             .decode_row("entry", br#"{"new":1,"new":2}"#, RowShape::Complete)
             .unwrap_err();
         assert!(!duplicate_unknown.is_schema_mismatch());
         assert!(duplicate_unknown.message().contains("duplicate"));
 
+        let duplicate_known = decoder
+            .decode_row("entry", br#"{"id":"bad","id":1}"#, RowShape::Complete)
+            .unwrap_err();
+        assert!(!duplicate_known.is_schema_mismatch());
+        assert!(duplicate_known.message().contains("duplicate"));
+
+        let unknown_after_invalid_value = decoder
+            .decode_row(
+                "entry",
+                br#"{"id":"bad","added_column":1}"#,
+                RowShape::Complete,
+            )
+            .unwrap_err();
+        assert!(unknown_after_invalid_value.is_schema_mismatch());
+        assert!(
+            unknown_after_invalid_value
+                .message()
+                .contains("added_column")
+        );
+
+        let message = wrong_type.message().to_string();
         let invalid = wrong_type.into_gateway_error();
         assert_eq!(invalid.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(invalid.message(), message);
     }
 
     #[test]
@@ -1312,6 +1853,20 @@ mod tests {
             assert!(!error.is_schema_mismatch());
             assert!(error.message().contains("entry `bad`"));
         }
+        let malformed_after_semantic_error = decoder
+            .decode_row(
+                "entry `bad`",
+                br#"{"unknown":1,"id":"bad","later":[}"#,
+                RowShape::Complete,
+            )
+            .unwrap_err();
+        assert!(!malformed_after_semantic_error.is_schema_mismatch());
+        assert!(
+            malformed_after_semantic_error
+                .message()
+                .contains("invalid JSON row")
+        );
+
         let required = vec!["renamed_id".to_string()];
         let error = decoder
             .decode_row("entry", br#"{"id":1}"#, RowShape::Sparse(&required))

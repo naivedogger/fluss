@@ -17,15 +17,15 @@
 
 //! Schema-aware conversion between FIP-49 JSON values and Fluss row representations.
 //!
-//! The write direction consumes one raw JSON object and preserves exact number lexemes plus
-//! duplicate fields until the table schema validates them. The read direction renders Arrow
-//! values deterministically. BIGINT and DECIMAL use strings on output to avoid IEEE-754 loss,
-//! binary values use base64, temporal values use ISO-8601, arrays and rows recurse, and maps use
-//! ordered `{"key", "value"}` entries so non-string keys and entry order survive.
+//! The write direction streams one raw JSON object through the table schema. Serde traverses
+//! containers once, numeric leaves retain their exact lexemes, and map visitors observe duplicate
+//! fields. The read direction renders Arrow values deterministically. BIGINT and DECIMAL use
+//! strings on output to avoid IEEE-754 loss, binary values use base64, temporal values use
+//! ISO-8601, arrays and rows recurse, and maps use ordered `{"key", "value"}` entries so
+//! non-string keys and entry order survive.
 
 mod arrow_json;
 mod decoder;
-mod input;
 mod temporal;
 
 // Response assembly lands in a parallel task; keep the complete Arrow codec entry points available.

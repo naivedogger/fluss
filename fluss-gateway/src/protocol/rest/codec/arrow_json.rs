@@ -500,7 +500,7 @@ mod tests {
             field(
                 "attributes",
                 DataType::Map(MapType::new(
-                    DataType::String(StringType::new()),
+                    DataType::Int(IntType::new()),
                     DataType::Int(IntType::new()),
                 )),
             ),
@@ -520,7 +520,7 @@ mod tests {
                 "created": "1969-12-31T23:59:59.999999",
                 "observed": "2026-01-31T14:34:56.789+02:00",
                 "tags": ["a", null],
-                "attributes": [{"key": "b", "value": 2}, {"key": "a", "value": null}],
+                "attributes": [{"key": 2, "value": 2}, {"key": 1, "value": null}],
                 "profile": {"flag": true}
             }"#,
         );
@@ -538,7 +538,7 @@ mod tests {
                 "created": "1969-12-31T23:59:59.999999",
                 "observed": "2026-01-31T12:34:56.789Z",
                 "tags": ["a", null],
-                "attributes": [{"key": "b", "value": 2}, {"key": "a", "value": null}],
+                "attributes": [{"key": 2, "value": 2}, {"key": 1, "value": null}],
                 "profile": {"flag": true, "note": null}
             })
         );
