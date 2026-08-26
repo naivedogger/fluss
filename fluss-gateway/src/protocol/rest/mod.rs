@@ -33,7 +33,6 @@ pub mod health;
 pub mod metadata;
 pub mod openapi;
 pub mod pagination;
-pub(crate) mod write;
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;

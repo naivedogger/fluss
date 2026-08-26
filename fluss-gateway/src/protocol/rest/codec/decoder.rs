@@ -39,6 +39,7 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// Whether a row supplies a complete mutation or only selected fields.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum RowShape<'a> {
     /// Every non-nullable column must be present. Missing nullable columns become null.
     Complete,
@@ -894,6 +895,14 @@ mod tests {
         DecimalType, DoubleType, FloatType, IntType, MapType, SmallIntType, StringType, TimeType,
         TimestampLTzType, TimestampType, TinyIntType,
     };
+    use serde::Deserialize;
+    use serde_json::value::RawValue;
+
+    #[derive(Deserialize)]
+    struct BorrowedRow<'a> {
+        #[serde(borrow)]
+        row: &'a RawValue,
+    }
 
     fn field(name: &str, data_type: DataType) -> DataField {
         DataField::new(name, data_type, None)
@@ -911,6 +920,23 @@ mod tests {
             RowShape::Complete,
         )?;
         Ok(row.values[0].clone())
+    }
+
+    #[test]
+    fn borrowed_raw_value_reaches_decoder_without_losing_precision() {
+        let body: BorrowedRow<'_> =
+            serde_json::from_slice(br#"{"row":{"v":9007199254740993}}"#).unwrap();
+        let decoder = SchemaDecoder::new(row_type(vec![field(
+            "v",
+            DataType::BigInt(BigIntType::with_nullable(false)),
+        )]))
+        .unwrap();
+
+        let row = decoder
+            .decode_row("entry `raw`", body.row.get().as_bytes(), RowShape::Complete)
+            .unwrap();
+
+        assert_eq!(row.values, vec![Datum::Int64(9_007_199_254_740_993)]);
     }
 
     #[test]
