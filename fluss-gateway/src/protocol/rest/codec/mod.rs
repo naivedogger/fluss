@@ -15,21 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema-aware conversion between FIP-49 JSON values and Fluss row representations.
+//! Schema-aware conversion from FIP-49 JSON values to Fluss rows.
 //!
-//! The write direction streams one raw JSON object through the table schema. Serde traverses
-//! containers once, numeric leaves retain their exact lexemes, and map visitors observe duplicate
-//! fields. String-keyed maps additionally accept JSON objects on input. The read direction renders
-//! Arrow values deterministically. BIGINT and DECIMAL use strings on output to avoid IEEE-754
-//! loss, binary values use base64, temporal values use ISO-8601, arrays and rows recurse, and maps
-//! use ordered `{"key", "value"}` entries on output so non-string keys and entry order survive.
+//! The decoder streams one raw JSON object through the table schema. Serde traverses containers
+//! once, numeric leaves retain their exact lexemes, and map visitors observe duplicate fields.
+//! String-keyed maps additionally accept JSON objects on input.
 
-mod arrow_json;
 mod decoder;
 mod temporal;
 
-// Response assembly lands in a parallel task; keep the complete Arrow codec entry points available.
-#[allow(unused_imports)]
-pub(crate) use arrow_json::{record_batch_to_json_rows, value_to_json};
 #[allow(unused_imports)]
 pub(crate) use decoder::{RowDecodeError, RowShape, SchemaDecoder};

@@ -51,7 +51,6 @@ name = "fluss_gateway"
 [dependencies]
 # `FlussBackend` is used behind `Arc<dyn ...>`, which native `async fn` in traits cannot be.
 async-trait = "0.1"
-arrow = { version = "59.0.0", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
 # Encodes the self-describing keyset page token; already in the graph transitively.
 base64 = "0.22"
