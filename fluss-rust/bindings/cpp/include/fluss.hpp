@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -59,6 +60,8 @@ struct PrefixLookupResultInner;
 struct ArrayWriterInner;
 struct MapWriterInner;
 struct ValueInner;
+enum class FfiPredicateLiteralType : int32_t;
+enum class FfiPredicateLeafFunction : int32_t;
 }  // namespace ffi
 
 /// Named constants for Fluss API error codes.
@@ -272,6 +275,12 @@ class PredicateLiteral {
     PredicateLiteral(bool value);
     PredicateLiteral(int32_t value);
     PredicateLiteral(int64_t value);
+    template <typename T, std::enable_if_t<std::is_integral_v<std::decay_t<T>> &&
+                                               !std::is_same_v<std::decay_t<T>, bool> &&
+                                               !std::is_same_v<std::decay_t<T>, int32_t> &&
+                                               !std::is_same_v<std::decay_t<T>, int64_t>,
+                                           int> = 0>
+    PredicateLiteral(T value) : PredicateLiteral(ToInt64(value)) {}
     PredicateLiteral(float value);
     PredicateLiteral(double value);
     PredicateLiteral(const char* value);
@@ -286,25 +295,22 @@ class PredicateLiteral {
     static PredicateLiteral TimestampLtz(Timestamp value);
 
    private:
-    enum class Kind : int32_t {
-        Null = 0,
-        Boolean = 1,
-        Int32 = 2,
-        Int64 = 3,
-        Float32 = 4,
-        Float64 = 5,
-        String = 6,
-        Bytes = 7,
-        Decimal = 8,
-        Date = 9,
-        Time = 10,
-        TimestampNtz = 11,
-        TimestampLtz = 12,
-    };
+    explicit PredicateLiteral(ffi::FfiPredicateLiteralType literal_type);
 
-    explicit PredicateLiteral(Kind kind);
+    template <typename T>
+    static int64_t ToInt64(T value) {
+        using ValueType = std::decay_t<T>;
+        static_assert(sizeof(ValueType) <= sizeof(int64_t), "Integer literal is wider than INT64");
+        if constexpr (std::is_unsigned_v<ValueType>) {
+            if (value >
+                static_cast<std::make_unsigned_t<int64_t>>(std::numeric_limits<int64_t>::max())) {
+                throw std::out_of_range("Unsigned predicate literal does not fit INT64");
+            }
+        }
+        return static_cast<int64_t>(value);
+    }
 
-    Kind kind_;
+    ffi::FfiPredicateLiteralType literal_type_;
     bool boolean_value_{false};
     int64_t integer_value_{0};
     double floating_value_{0};
@@ -361,7 +367,8 @@ class ColumnRef {
     Predicate NotIn(std::vector<PredicateLiteral> values) const;
 
    private:
-    Predicate Leaf(int32_t function, std::vector<PredicateLiteral> literals) const;
+    Predicate Leaf(ffi::FfiPredicateLeafFunction function,
+                   std::vector<PredicateLiteral> literals) const;
 
     std::string name_;
 };

@@ -151,12 +151,36 @@ Complete API reference for the Fluss C++ client.
 |----------------------------------------------------------------------|-----------------------------------------------|
 | `ProjectByIndex(std::vector<size_t> column_indices) -> TableScan&`   | Project columns by index                      |
 | `ProjectByName(std::vector<std::string> column_names) -> TableScan&` | Project columns by name                       |
+| `Filter(Predicate predicate) -> TableScan&`                          | Push a predicate down for conservative server-side RecordBatch pruning |
 | `Limit(int32_t row_number) -> TableScan&`                            | Set a positive row limit (enables `CreateBucketBatchScanner`; rejected by log scanners) |
 | `CreateLogScanner(LogScanner& out) -> Result`                        | Create a record-based log scanner; on a primary-key table, subscribes to its CDC changelog (per-record `change_type`) |
 | `CreateRecordBatchLogScanner(RecordBatchLogScanner& out) -> Result`  | Create a strongly typed Arrow RecordBatch scanner |
 | `CreateRecordBatchLogReader(const std::vector<RecordBatchLogReadRange>& ranges, RecordBatchLogReader& out) -> Result` | Create a bounded reader directly from per-bucket offset ranges |
 | `CreateRecordBatchLogReader(Admin& admin, const std::vector<TableBucket>& buckets, const TimestampRange& range, RecordBatchLogReader& out) -> Result` | Resolve a timestamp range per bucket and create a bounded reader |
 | `CreateBucketBatchScanner(const TableBucket& bucket, BatchScanner& out) -> Result` | Bounded scan of one bucket (requires `Limit`) |
+
+## Filter predicates
+
+Use `Col(name)` to build a predicate and combine expressions with `And()` or `Or()`.
+
+| `ColumnRef` method                                      | Description                    |
+|---------------------------------------------------------|--------------------------------|
+| `Equal(value)` / `NotEqual(value)`                      | Equality comparisons           |
+| `LessThan(value)` / `LessOrEqual(value)`                | Less-than comparisons          |
+| `GreaterThan(value)` / `GreaterOrEqual(value)`          | Greater-than comparisons       |
+| `IsNull()` / `IsNotNull()`                              | Null checks                    |
+| `StartsWith(prefix)` / `Contains(infix)` / `EndsWith(suffix)` | String matching          |
+| `In(values)` / `NotIn(values)`                          | Set membership                 |
+
+Booleans, integers, floating-point values, strings, bytes, `Date`, and `Time` convert to
+`PredicateLiteral` directly. Use `PredicateLiteral::Decimal()`,
+`PredicateLiteral::TimestampNtz()`, and `PredicateLiteral::TimestampLtz()` when the Fluss logical
+type must be explicit.
+
+Filter pushdown skips only whole RecordBatches whose statistics prove that they cannot match.
+Returned batches may still contain non-matching rows and must be filtered again by the caller.
+Configure `table.statistics.columns` for referenced columns; batches without usable statistics
+are retained. Filters apply to Arrow log scans and are rejected by `CreateBucketBatchScanner()`.
 
 ## `AppendWriter`
 

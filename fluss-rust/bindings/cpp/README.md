@@ -39,7 +39,7 @@ See [ci.sh](ci.sh) for the CI build sequence.
 RecordBatch pruning:
 
 ```cpp
-fluss::LogScanner scanner;
+fluss::RecordBatchLogScanner scanner;
 auto predicate =
     fluss::Col("amount")
         .GreaterOrEqual(100)
@@ -58,8 +58,10 @@ decimals, dates, times, and timestamps.
 
 Pushdown is conservative: Fluss skips only whole RecordBatches whose statistics
 prove that they cannot match. Returned batches may still contain non-matching
-rows, so callers must evaluate the predicate again. Filter pushdown requires
-the Arrow log format and does not apply to `CreateBucketBatchScanner()`.
+rows, so callers must evaluate the predicate again. Configure
+`table.statistics.columns` for the referenced columns; batches without usable
+statistics are retained. Filter pushdown requires the Arrow log format and does
+not apply to `CreateBucketBatchScanner()`.
 
 ## Examples and Documentation
 

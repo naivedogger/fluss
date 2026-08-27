@@ -144,6 +144,36 @@ for (size_t i = 0; i < batches.Size(); ++i) {
 }
 ```
 
+## Filter Pushdown
+
+Configure statistics for columns used by filters:
+
+```cpp
+auto descriptor = fluss::TableDescriptor::NewBuilder()
+    .SetSchema(schema)
+    .SetProperty("table.statistics.columns", "event_id,event_type")
+    .Build();
+```
+
+Then attach a predicate to the scan:
+
+```cpp
+auto predicate =
+    fluss::Col("event_id")
+        .GreaterOrEqual(100)
+        .And(fluss::Col("event_type").StartsWith("user_"));
+
+fluss::RecordBatchLogScanner scanner;
+auto result = table.NewScan()
+                  .Filter(std::move(predicate))
+                  .ProjectByName({"event_id", "event_type"})
+                  .CreateRecordBatchLogScanner(scanner);
+```
+
+Fluss uses RecordBatch statistics to skip batches that cannot match. It does not filter individual
+rows, so consumers must evaluate the predicate again on returned batches. Batches without usable
+statistics are retained conservatively.
+
 ## Bounded Arrow RecordBatch Reading
 
 Use `RecordBatchLogReader` when the scan should finish after reaching a fixed offset for every
@@ -291,7 +321,7 @@ fluss::LogScanner name_projected_scanner;
 table.NewScan().ProjectByName({"event_id", "timestamp"}).CreateLogScanner(name_projected_scanner);
 
 // Arrow RecordBatch with projection
-fluss::LogScanner projected_arrow_scanner;
+fluss::RecordBatchLogScanner projected_arrow_scanner;
 table.NewScan().ProjectByIndex({0, 2}).CreateRecordBatchLogScanner(projected_arrow_scanner);
 ```
 

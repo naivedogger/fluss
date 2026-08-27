@@ -110,11 +110,57 @@ mod ffi {
         child_count: u32,
     }
 
+    #[repr(i32)]
+    enum FfiPredicateNodeType {
+        Leaf = 0,
+        Compound = 1,
+    }
+
+    #[repr(i32)]
+    enum FfiPredicateLeafFunction {
+        Equal = 0,
+        NotEqual = 1,
+        LessThan = 2,
+        LessOrEqual = 3,
+        GreaterThan = 4,
+        GreaterOrEqual = 5,
+        IsNull = 6,
+        IsNotNull = 7,
+        StartsWith = 8,
+        Contains = 9,
+        EndsWith = 10,
+        In = 11,
+        NotIn = 12,
+    }
+
+    #[repr(i32)]
+    enum FfiPredicateCompoundFunction {
+        And = 0,
+        Or = 1,
+    }
+
+    #[repr(i32)]
+    enum FfiPredicateLiteralType {
+        Null = 0,
+        Boolean = 1,
+        Int32 = 2,
+        Int64 = 3,
+        Float32 = 4,
+        Float64 = 5,
+        String = 6,
+        Bytes = 7,
+        Decimal = 8,
+        Date = 9,
+        Time = 10,
+        TimestampNtz = 11,
+        TimestampLtz = 12,
+    }
+
     // One scalar literal in a predicate leaf. `literal_type` is private to the
     // C++ binding and decoded into fluss::predicate::Literal before the scan is
     // created.
     struct FfiPredicateLiteral {
-        literal_type: i32,
+        literal_type: FfiPredicateLiteralType,
         boolean_value: bool,
         integer_value: i64,
         floating_value: f64,
@@ -127,8 +173,9 @@ mod ffi {
     // Predicate tree serialized in preorder. A leaf has child_count == 0 and
     // carries field/literals; a compound node is followed by child_count nodes.
     struct FfiPredicateNode {
-        node_type: i32,
-        function: i32,
+        node_type: FfiPredicateNodeType,
+        leaf_function: FfiPredicateLeafFunction,
+        compound_function: FfiPredicateCompoundFunction,
         field: String,
         literals: Vec<FfiPredicateLiteral>,
         child_count: u32,
@@ -1606,23 +1653,6 @@ impl Admin {
     }
 }
 
-const FFI_PREDICATE_NODE_LEAF: i32 = 0;
-const FFI_PREDICATE_NODE_COMPOUND: i32 = 1;
-
-const FFI_LITERAL_NULL: i32 = 0;
-const FFI_LITERAL_BOOLEAN: i32 = 1;
-const FFI_LITERAL_INT32: i32 = 2;
-const FFI_LITERAL_INT64: i32 = 3;
-const FFI_LITERAL_FLOAT32: i32 = 4;
-const FFI_LITERAL_FLOAT64: i32 = 5;
-const FFI_LITERAL_STRING: i32 = 6;
-const FFI_LITERAL_BYTES: i32 = 7;
-const FFI_LITERAL_DECIMAL: i32 = 8;
-const FFI_LITERAL_DATE: i32 = 9;
-const FFI_LITERAL_TIME: i32 = 10;
-const FFI_LITERAL_TIMESTAMP_NTZ: i32 = 11;
-const FFI_LITERAL_TIMESTAMP_LTZ: i32 = 12;
-
 fn predicate_from_ffi_nodes(
     nodes: &[ffi::FfiPredicateNode],
     row_type: &fcore::metadata::RowType,
@@ -1654,7 +1684,7 @@ fn predicate_from_ffi_node(
     *next += 1;
 
     match node.node_type {
-        FFI_PREDICATE_NODE_LEAF => {
+        ffi::FfiPredicateNodeType::Leaf => {
             if node.child_count != 0 {
                 return Err(format!(
                     "Predicate leaf at node {node_index} has {} child nodes",
@@ -1677,23 +1707,34 @@ fn predicate_from_ffi_node(
                         node.field
                     )
                 })?;
-            let function = match node.function {
-                0 => fcore::predicate::LeafFunction::Equal,
-                1 => fcore::predicate::LeafFunction::NotEqual,
-                2 => fcore::predicate::LeafFunction::LessThan,
-                3 => fcore::predicate::LeafFunction::LessOrEqual,
-                4 => fcore::predicate::LeafFunction::GreaterThan,
-                5 => fcore::predicate::LeafFunction::GreaterOrEqual,
-                6 => fcore::predicate::LeafFunction::IsNull,
-                7 => fcore::predicate::LeafFunction::IsNotNull,
-                8 => fcore::predicate::LeafFunction::StartsWith,
-                9 => fcore::predicate::LeafFunction::Contains,
-                10 => fcore::predicate::LeafFunction::EndsWith,
-                11 => fcore::predicate::LeafFunction::In,
-                12 => fcore::predicate::LeafFunction::NotIn,
+            let function = match node.leaf_function {
+                ffi::FfiPredicateLeafFunction::Equal => fcore::predicate::LeafFunction::Equal,
+                ffi::FfiPredicateLeafFunction::NotEqual => fcore::predicate::LeafFunction::NotEqual,
+                ffi::FfiPredicateLeafFunction::LessThan => fcore::predicate::LeafFunction::LessThan,
+                ffi::FfiPredicateLeafFunction::LessOrEqual => {
+                    fcore::predicate::LeafFunction::LessOrEqual
+                }
+                ffi::FfiPredicateLeafFunction::GreaterThan => {
+                    fcore::predicate::LeafFunction::GreaterThan
+                }
+                ffi::FfiPredicateLeafFunction::GreaterOrEqual => {
+                    fcore::predicate::LeafFunction::GreaterOrEqual
+                }
+                ffi::FfiPredicateLeafFunction::IsNull => fcore::predicate::LeafFunction::IsNull,
+                ffi::FfiPredicateLeafFunction::IsNotNull => {
+                    fcore::predicate::LeafFunction::IsNotNull
+                }
+                ffi::FfiPredicateLeafFunction::StartsWith => {
+                    fcore::predicate::LeafFunction::StartsWith
+                }
+                ffi::FfiPredicateLeafFunction::Contains => fcore::predicate::LeafFunction::Contains,
+                ffi::FfiPredicateLeafFunction::EndsWith => fcore::predicate::LeafFunction::EndsWith,
+                ffi::FfiPredicateLeafFunction::In => fcore::predicate::LeafFunction::In,
+                ffi::FfiPredicateLeafFunction::NotIn => fcore::predicate::LeafFunction::NotIn,
                 other => {
                     return Err(format!(
-                        "Predicate leaf at node {node_index} has unknown function {other}"
+                        "Predicate leaf at node {node_index} has unknown function {}",
+                        other.repr
                     ));
                 }
             };
@@ -1709,18 +1750,19 @@ fn predicate_from_ffi_node(
                 literals,
             })
         }
-        FFI_PREDICATE_NODE_COMPOUND => {
+        ffi::FfiPredicateNodeType::Compound => {
             if !node.field.is_empty() || !node.literals.is_empty() {
                 return Err(format!(
                     "Predicate compound node {node_index} unexpectedly carries leaf data"
                 ));
             }
-            let function = match node.function {
-                0 => fcore::predicate::CompoundFunction::And,
-                1 => fcore::predicate::CompoundFunction::Or,
+            let function = match node.compound_function {
+                ffi::FfiPredicateCompoundFunction::And => fcore::predicate::CompoundFunction::And,
+                ffi::FfiPredicateCompoundFunction::Or => fcore::predicate::CompoundFunction::Or,
                 other => {
                     return Err(format!(
-                        "Predicate compound node {node_index} has unknown function {other}"
+                        "Predicate compound node {node_index} has unknown function {}",
+                        other.repr
                     ));
                 }
             };
@@ -1731,7 +1773,8 @@ fn predicate_from_ffi_node(
             Ok(fcore::predicate::Predicate::Compound { function, children })
         }
         other => Err(format!(
-            "Predicate node {node_index} has unknown node type {other}"
+            "Predicate node {node_index} has unknown node type {}",
+            other.repr
         )),
     }
 }
@@ -1743,9 +1786,9 @@ fn predicate_literal_from_ffi(
     use fcore::predicate::Literal;
 
     match literal.literal_type {
-        FFI_LITERAL_NULL => Ok(Literal::Null),
-        FFI_LITERAL_BOOLEAN => Ok(Literal::Bool(literal.boolean_value)),
-        FFI_LITERAL_INT32 => {
+        ffi::FfiPredicateLiteralType::Null => Ok(Literal::Null),
+        ffi::FfiPredicateLiteralType::Boolean => Ok(Literal::Bool(literal.boolean_value)),
+        ffi::FfiPredicateLiteralType::Int32 => {
             let value = i32::try_from(literal.integer_value).map_err(|_| {
                 format!(
                     "Filter literal {} does not fit INT32",
@@ -1754,12 +1797,16 @@ fn predicate_literal_from_ffi(
             })?;
             Ok(Literal::Int32(value))
         }
-        FFI_LITERAL_INT64 => Ok(Literal::Int64(literal.integer_value)),
-        FFI_LITERAL_FLOAT32 => Ok(Literal::Float32(literal.floating_value as f32)),
-        FFI_LITERAL_FLOAT64 => Ok(Literal::Float64(literal.floating_value)),
-        FFI_LITERAL_STRING => Ok(Literal::String(literal.string_value.to_string())),
-        FFI_LITERAL_BYTES => Ok(Literal::Bytes(literal.bytes_value.clone())),
-        FFI_LITERAL_DECIMAL => {
+        ffi::FfiPredicateLiteralType::Int64 => Ok(Literal::Int64(literal.integer_value)),
+        ffi::FfiPredicateLiteralType::Float32 => {
+            Ok(Literal::Float32(literal.floating_value as f32))
+        }
+        ffi::FfiPredicateLiteralType::Float64 => Ok(Literal::Float64(literal.floating_value)),
+        ffi::FfiPredicateLiteralType::String => {
+            Ok(Literal::String(literal.string_value.to_string()))
+        }
+        ffi::FfiPredicateLiteralType::Bytes => Ok(Literal::Bytes(literal.bytes_value.clone())),
+        ffi::FfiPredicateLiteralType::Decimal => {
             let decimal_type = match field.data_type() {
                 fcore::metadata::DataType::Decimal(decimal_type) => decimal_type,
                 other => {
@@ -1786,7 +1833,7 @@ fn predicate_literal_from_ffi(
             }
             Ok(Literal::Decimal(decimal))
         }
-        FFI_LITERAL_DATE => {
+        ffi::FfiPredicateLiteralType::Date => {
             let days = i32::try_from(literal.integer_value).map_err(|_| {
                 format!(
                     "Date predicate literal {} does not fit INT32",
@@ -1795,7 +1842,7 @@ fn predicate_literal_from_ffi(
             })?;
             Ok(Literal::Date(days))
         }
-        FFI_LITERAL_TIME => {
+        ffi::FfiPredicateLiteralType::Time => {
             let millis = i32::try_from(literal.integer_value).map_err(|_| {
                 format!(
                     "Time predicate literal {} does not fit INT32",
@@ -1804,7 +1851,7 @@ fn predicate_literal_from_ffi(
             })?;
             Ok(Literal::Time(millis))
         }
-        FFI_LITERAL_TIMESTAMP_NTZ => {
+        ffi::FfiPredicateLiteralType::TimestampNtz => {
             let timestamp = fcore::row::TimestampNtz::from_millis_nanos(
                 literal.timestamp_millis,
                 literal.timestamp_nanos,
@@ -1812,7 +1859,7 @@ fn predicate_literal_from_ffi(
             .map_err(|e| e.to_string())?;
             Ok(Literal::TimestampNtz(timestamp))
         }
-        FFI_LITERAL_TIMESTAMP_LTZ => {
+        ffi::FfiPredicateLiteralType::TimestampLtz => {
             let timestamp = fcore::row::TimestampLtz::from_millis_nanos(
                 literal.timestamp_millis,
                 literal.timestamp_nanos,
@@ -1820,7 +1867,7 @@ fn predicate_literal_from_ffi(
             .map_err(|e| e.to_string())?;
             Ok(Literal::TimestampLtz(timestamp))
         }
-        other => Err(format!("Unknown predicate literal type {other}")),
+        other => Err(format!("Unknown predicate literal type {}", other.repr)),
     }
 }
 

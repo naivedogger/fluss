@@ -83,85 +83,65 @@ int Date::Day() const {
     return tm.tm_mday;
 }
 
-PredicateLiteral::PredicateLiteral(bool value) : kind_(Kind::Boolean), boolean_value_(value) {}
+PredicateLiteral::PredicateLiteral(bool value)
+    : literal_type_(ffi::FfiPredicateLiteralType::Boolean), boolean_value_(value) {}
 
-PredicateLiteral::PredicateLiteral(int32_t value) : kind_(Kind::Int32), integer_value_(value) {}
+PredicateLiteral::PredicateLiteral(int32_t value)
+    : literal_type_(ffi::FfiPredicateLiteralType::Int32), integer_value_(value) {}
 
-PredicateLiteral::PredicateLiteral(int64_t value) : kind_(Kind::Int64), integer_value_(value) {}
+PredicateLiteral::PredicateLiteral(int64_t value)
+    : literal_type_(ffi::FfiPredicateLiteralType::Int64), integer_value_(value) {}
 
-PredicateLiteral::PredicateLiteral(float value) : kind_(Kind::Float32), floating_value_(value) {}
+PredicateLiteral::PredicateLiteral(float value)
+    : literal_type_(ffi::FfiPredicateLiteralType::Float32), floating_value_(value) {}
 
-PredicateLiteral::PredicateLiteral(double value) : kind_(Kind::Float64), floating_value_(value) {}
+PredicateLiteral::PredicateLiteral(double value)
+    : literal_type_(ffi::FfiPredicateLiteralType::Float64), floating_value_(value) {}
 
 PredicateLiteral::PredicateLiteral(const char* value) : PredicateLiteral(std::string(value)) {}
 
 PredicateLiteral::PredicateLiteral(std::string value)
-    : kind_(Kind::String), string_value_(std::move(value)) {}
+    : literal_type_(ffi::FfiPredicateLiteralType::String), string_value_(std::move(value)) {}
 
 PredicateLiteral::PredicateLiteral(std::vector<uint8_t> value)
-    : kind_(Kind::Bytes), bytes_value_(std::move(value)) {}
+    : literal_type_(ffi::FfiPredicateLiteralType::Bytes), bytes_value_(std::move(value)) {}
 
 PredicateLiteral::PredicateLiteral(Date value)
-    : kind_(Kind::Date), integer_value_(value.days_since_epoch) {}
+    : literal_type_(ffi::FfiPredicateLiteralType::Date), integer_value_(value.days_since_epoch) {}
 
 PredicateLiteral::PredicateLiteral(Time value)
-    : kind_(Kind::Time), integer_value_(value.millis_since_midnight) {}
+    : literal_type_(ffi::FfiPredicateLiteralType::Time),
+      integer_value_(value.millis_since_midnight) {}
 
-PredicateLiteral::PredicateLiteral(Kind kind) : kind_(kind) {}
+PredicateLiteral::PredicateLiteral(ffi::FfiPredicateLiteralType literal_type)
+    : literal_type_(literal_type) {}
 
-PredicateLiteral PredicateLiteral::Null() { return PredicateLiteral(Kind::Null); }
+PredicateLiteral PredicateLiteral::Null() {
+    return PredicateLiteral(ffi::FfiPredicateLiteralType::Null);
+}
 
 PredicateLiteral PredicateLiteral::Decimal(std::string value) {
-    PredicateLiteral literal(Kind::Decimal);
+    PredicateLiteral literal(ffi::FfiPredicateLiteralType::Decimal);
     literal.string_value_ = std::move(value);
     return literal;
 }
 
 PredicateLiteral PredicateLiteral::TimestampNtz(Timestamp value) {
-    PredicateLiteral literal(Kind::TimestampNtz);
+    PredicateLiteral literal(ffi::FfiPredicateLiteralType::TimestampNtz);
     literal.timestamp_value_ = value;
     return literal;
 }
 
 PredicateLiteral PredicateLiteral::TimestampLtz(Timestamp value) {
-    PredicateLiteral literal(Kind::TimestampLtz);
+    PredicateLiteral literal(ffi::FfiPredicateLiteralType::TimestampLtz);
     literal.timestamp_value_ = value;
     return literal;
 }
 
-namespace {
-
-enum class PredicateLeafFunction : int32_t {
-    Equal = 0,
-    NotEqual = 1,
-    LessThan = 2,
-    LessOrEqual = 3,
-    GreaterThan = 4,
-    GreaterOrEqual = 5,
-    IsNull = 6,
-    IsNotNull = 7,
-    StartsWith = 8,
-    Contains = 9,
-    EndsWith = 10,
-    In = 11,
-    NotIn = 12,
-};
-
-enum class PredicateCompoundFunction : int32_t {
-    And = 0,
-    Or = 1,
-};
-
-}  // namespace
-
 struct Predicate::Node {
-    enum class Type : int32_t {
-        Leaf = 0,
-        Compound = 1,
-    };
-
-    Type type;
-    int32_t function;
+    ffi::FfiPredicateNodeType node_type{ffi::FfiPredicateNodeType::Leaf};
+    ffi::FfiPredicateLeafFunction leaf_function{ffi::FfiPredicateLeafFunction::Equal};
+    ffi::FfiPredicateCompoundFunction compound_function{ffi::FfiPredicateCompoundFunction::And};
     std::string field;
     std::vector<PredicateLiteral> literals;
     std::vector<std::shared_ptr<const Node>> children;
@@ -171,9 +151,10 @@ Predicate::Predicate(std::shared_ptr<const Node> root) : root_(std::move(root)) 
 
 Predicate Predicate::And(Predicate other) const {
     auto node = std::make_shared<Node>();
-    node->type = Node::Type::Compound;
-    node->function = static_cast<int32_t>(PredicateCompoundFunction::And);
-    if (root_->type == Node::Type::Compound && root_->function == node->function) {
+    node->node_type = ffi::FfiPredicateNodeType::Compound;
+    node->compound_function = ffi::FfiPredicateCompoundFunction::And;
+    if (root_->node_type == ffi::FfiPredicateNodeType::Compound &&
+        root_->compound_function == node->compound_function) {
         node->children = root_->children;
     } else {
         node->children.push_back(root_);
@@ -184,9 +165,10 @@ Predicate Predicate::And(Predicate other) const {
 
 Predicate Predicate::Or(Predicate other) const {
     auto node = std::make_shared<Node>();
-    node->type = Node::Type::Compound;
-    node->function = static_cast<int32_t>(PredicateCompoundFunction::Or);
-    if (root_->type == Node::Type::Compound && root_->function == node->function) {
+    node->node_type = ffi::FfiPredicateNodeType::Compound;
+    node->compound_function = ffi::FfiPredicateCompoundFunction::Or;
+    if (root_->node_type == ffi::FfiPredicateNodeType::Compound &&
+        root_->compound_function == node->compound_function) {
         node->children = root_->children;
     } else {
         node->children.push_back(root_);
@@ -195,68 +177,64 @@ Predicate Predicate::Or(Predicate other) const {
     return Predicate(std::move(node));
 }
 
-Predicate ColumnRef::Leaf(int32_t function, std::vector<PredicateLiteral> literals) const {
+Predicate ColumnRef::Leaf(ffi::FfiPredicateLeafFunction function,
+                          std::vector<PredicateLiteral> literals) const {
     auto node = std::make_shared<Predicate::Node>();
-    node->type = Predicate::Node::Type::Leaf;
-    node->function = function;
+    node->node_type = ffi::FfiPredicateNodeType::Leaf;
+    node->leaf_function = function;
     node->field = name_;
     node->literals = std::move(literals);
     return Predicate(std::move(node));
 }
 
 Predicate ColumnRef::Equal(PredicateLiteral value) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::Equal), {std::move(value)});
+    return Leaf(ffi::FfiPredicateLeafFunction::Equal, {std::move(value)});
 }
 
 Predicate ColumnRef::NotEqual(PredicateLiteral value) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::NotEqual), {std::move(value)});
+    return Leaf(ffi::FfiPredicateLeafFunction::NotEqual, {std::move(value)});
 }
 
 Predicate ColumnRef::LessThan(PredicateLiteral value) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::LessThan), {std::move(value)});
+    return Leaf(ffi::FfiPredicateLeafFunction::LessThan, {std::move(value)});
 }
 
 Predicate ColumnRef::LessOrEqual(PredicateLiteral value) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::LessOrEqual), {std::move(value)});
+    return Leaf(ffi::FfiPredicateLeafFunction::LessOrEqual, {std::move(value)});
 }
 
 Predicate ColumnRef::GreaterThan(PredicateLiteral value) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::GreaterThan), {std::move(value)});
+    return Leaf(ffi::FfiPredicateLeafFunction::GreaterThan, {std::move(value)});
 }
 
 Predicate ColumnRef::GreaterOrEqual(PredicateLiteral value) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::GreaterOrEqual), {std::move(value)});
+    return Leaf(ffi::FfiPredicateLeafFunction::GreaterOrEqual, {std::move(value)});
 }
 
-Predicate ColumnRef::IsNull() const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::IsNull), {});
-}
+Predicate ColumnRef::IsNull() const { return Leaf(ffi::FfiPredicateLeafFunction::IsNull, {}); }
 
 Predicate ColumnRef::IsNotNull() const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::IsNotNull), {});
+    return Leaf(ffi::FfiPredicateLeafFunction::IsNotNull, {});
 }
 
 Predicate ColumnRef::StartsWith(std::string prefix) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::StartsWith),
-                {PredicateLiteral(std::move(prefix))});
+    return Leaf(ffi::FfiPredicateLeafFunction::StartsWith, {PredicateLiteral(std::move(prefix))});
 }
 
 Predicate ColumnRef::Contains(std::string infix) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::Contains),
-                {PredicateLiteral(std::move(infix))});
+    return Leaf(ffi::FfiPredicateLeafFunction::Contains, {PredicateLiteral(std::move(infix))});
 }
 
 Predicate ColumnRef::EndsWith(std::string suffix) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::EndsWith),
-                {PredicateLiteral(std::move(suffix))});
+    return Leaf(ffi::FfiPredicateLeafFunction::EndsWith, {PredicateLiteral(std::move(suffix))});
 }
 
 Predicate ColumnRef::In(std::vector<PredicateLiteral> values) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::In), std::move(values));
+    return Leaf(ffi::FfiPredicateLeafFunction::In, std::move(values));
 }
 
 Predicate ColumnRef::NotIn(std::vector<PredicateLiteral> values) const {
-    return Leaf(static_cast<int32_t>(PredicateLeafFunction::NotIn), std::move(values));
+    return Leaf(ffi::FfiPredicateLeafFunction::NotIn, std::move(values));
 }
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
@@ -1462,14 +1440,15 @@ Result TableScan::DoCreateScanner(LogScanner& out, bool is_record_batch) {
             std::function<void(const std::shared_ptr<const Predicate::Node>&)> append_node;
             append_node = [&](const std::shared_ptr<const Predicate::Node>& node) {
                 ffi::FfiPredicateNode ffi_node;
-                ffi_node.node_type = static_cast<int32_t>(node->type);
-                ffi_node.function = node->function;
+                ffi_node.node_type = node->node_type;
+                ffi_node.leaf_function = node->leaf_function;
+                ffi_node.compound_function = node->compound_function;
                 ffi_node.field = rust::String(node->field);
                 ffi_node.child_count = static_cast<uint32_t>(node->children.size());
 
                 for (const auto& literal : node->literals) {
                     ffi::FfiPredicateLiteral ffi_literal;
-                    ffi_literal.literal_type = static_cast<int32_t>(literal.kind_);
+                    ffi_literal.literal_type = literal.literal_type_;
                     ffi_literal.boolean_value = literal.boolean_value_;
                     ffi_literal.integer_value = literal.integer_value_;
                     ffi_literal.floating_value = literal.floating_value_;

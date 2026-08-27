@@ -1040,7 +1040,7 @@ TEST_F(LogTableTest, FilterPushdownWithProjection) {
     ASSERT_OK(writer.AppendArrowBatch(make_batch({6, 7}, {"high-6", "high-7"})));
     ASSERT_OK(writer.Flush());
 
-    fluss::LogScanner scanner;
+    fluss::RecordBatchLogScanner scanner;
     ASSERT_OK(
         table.NewScan()
             .Filter(fluss::Col("id").GreaterThan(5).And(fluss::Col("name").StartsWith("high")))
@@ -1064,12 +1064,72 @@ TEST_F(LogTableTest, FilterPushdownWithProjection) {
     fluss_test::PollRecordBatches(scanner, 2, extract_names, names);
     EXPECT_EQ(names, (std::vector<std::string>{"high-6", "high-7"}));
 
-    fluss::LogScanner invalid_scanner;
+    fluss::RecordBatchLogScanner invalid_scanner;
     auto invalid_result = table.NewScan()
                               .Filter(fluss::Col("missing").Equal(1))
                               .CreateRecordBatchLogScanner(invalid_scanner);
     EXPECT_FALSE(invalid_result.Ok());
     EXPECT_NE(invalid_result.error_message.find("missing"), std::string::npos);
+
+    ASSERT_OK(adm.DropTable(table_path, false));
+}
+
+TEST_F(LogTableTest, FilterPushdownLiteralValidation) {
+    auto& adm = admin();
+    auto& conn = connection();
+
+    fluss::TablePath table_path("fluss", "test_filter_pushdown_literals_cpp");
+    auto schema = fluss::Schema::NewBuilder()
+                      .AddColumn("id", DataType::Int())
+                      .AddColumn("amount", DataType::Decimal(10, 2))
+                      .AddColumn("event_time", DataType::Timestamp(9))
+                      .AddColumn("event_time_ltz", DataType::TimestampLtz(9))
+                      .Build();
+    auto table_descriptor =
+        fluss::TableDescriptor::NewBuilder()
+            .SetSchema(schema)
+            .SetBucketCount(1)
+            .SetBucketKeys({"id"})
+            .SetProperty("table.replication.factor", "1")
+            .SetProperty("table.statistics.columns", "id,amount,event_time,event_time_ltz")
+            .Build();
+    fluss_test::CreateTable(adm, table_path, table_descriptor);
+
+    fluss::Table table;
+    ASSERT_OK(conn.GetTable(table_path, table));
+
+    const auto timestamp = fluss::Timestamp::FromMillisNanos(1769163227123, 456000);
+    fluss::RecordBatchLogScanner scanner;
+    ASSERT_OK(
+        table.NewScan()
+            .Filter(fluss::Col("amount")
+                        .Equal(fluss::PredicateLiteral::Decimal("12.34"))
+                        .And(fluss::Col("event_time")
+                                 .GreaterOrEqual(fluss::PredicateLiteral::TimestampNtz(timestamp)))
+                        .And(fluss::Col("event_time_ltz")
+                                 .LessOrEqual(fluss::PredicateLiteral::TimestampLtz(timestamp)))
+                        .And(fluss::Col("id").Equal(5L).Or(fluss::Col("id").Equal(5u))))
+            .CreateRecordBatchLogScanner(scanner));
+
+    fluss::RecordBatchLogScanner decimal_scanner;
+    auto decimal_result =
+        table.NewScan()
+            .Filter(fluss::Col("amount").Equal(fluss::PredicateLiteral::Decimal("12.345")))
+            .CreateRecordBatchLogScanner(decimal_scanner);
+    EXPECT_FALSE(decimal_result.Ok());
+    EXPECT_NE(decimal_result.error_message.find("cannot be represented exactly"),
+              std::string::npos);
+
+    fluss::RecordBatchLogScanner timestamp_scanner;
+    auto timestamp_result =
+        table.NewScan()
+            .Filter(fluss::Col("event_time_ltz")
+                        .Equal(fluss::PredicateLiteral::TimestampNtz(timestamp)))
+            .CreateRecordBatchLogScanner(timestamp_scanner);
+    EXPECT_FALSE(timestamp_result.Ok());
+    EXPECT_NE(timestamp_result.error_message.find("does not match"), std::string::npos);
+
+    EXPECT_THROW(fluss::Col("id").Equal(std::numeric_limits<uint64_t>::max()), std::out_of_range);
 
     ASSERT_OK(adm.DropTable(table_path, false));
 }
