@@ -268,6 +268,32 @@ ON `o`.`o_custkey` = `c`.`c_custkey` AND  `o`.`o_dt` = `c`.`dt`;
 
 For more details about Fluss partitioned table, see [Partitioned Tables](table-design/data-distribution/partitioning.md).
 
+## Lookup Shuffle
+
+For Flink 2.2, lookup custom shuffle can be enabled with the standard Flink lookup hint:
+
+```sql title="Flink SQL"
+SELECT /*+ LOOKUP('table' = 'c', 'shuffle' = 'true') */ *
+FROM Orders AS o
+JOIN Customers FOR SYSTEM_TIME AS OF o.proc_time AS c
+ON o.customer_id = c.id;
+```
+
+Fluss then partitions the lookup probe stream consistently with its bucket routing. This improves
+lookup-cache locality and reduces RPC fan-out compared with distributing lookup keys independently
+of Fluss tablets.
+
+- For a non-partitioned table, Fluss routes by bucket. If there are fewer buckets than lookup
+  subtasks, each bucket uses a disjoint subset of subtasks and the complete lookup key is used to
+  balance requests within that subset.
+- For a partitioned table, Fluss routes each `(partition, bucket)` tablet to one lookup subtask.
+  This preserves tablet locality, but the effective lookup parallelism is bounded by the number of
+  active tablets. Some lookup subtasks may therefore remain idle when the number of active tablets
+  is smaller than the configured lookup parallelism.
+
+Lookup custom shuffle requires Fluss to know the table's positive `bucket.num`. Fluss Catalog
+tables expose the resolved bucket number automatically.
+
 ## Historical Partition Lookup
 
 Auto-partitioning removes expired Fluss partitions according to the configured retention policy.

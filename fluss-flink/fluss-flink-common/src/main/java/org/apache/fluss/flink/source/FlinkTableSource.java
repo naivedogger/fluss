@@ -109,6 +109,7 @@ import static org.apache.fluss.flink.utils.PredicateConverter.convertToFlussPred
 import static org.apache.fluss.flink.utils.PushdownUtils.ValueConversion.FLINK_INTERNAL_VALUE;
 import static org.apache.fluss.flink.utils.PushdownUtils.extractFieldEquals;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Flink table source to scan Fluss data. */
 public class FlinkTableSource
@@ -551,7 +552,7 @@ public class FlinkTableSource
     @Nullable
     private InputDataPartitionerAdapter createLookupInputPartitioner(
             LookupNormalizer lookupNormalizer) {
-        if (numBuckets == null || numBuckets <= 0) {
+        if (numBuckets == null) {
             return null;
         }
 
@@ -583,7 +584,13 @@ public class FlinkTableSource
 
     @Override
     public Optional<InputDataPartitionerAdapter> getPartitionerAdapter() {
-        return Optional.ofNullable(lookupInputPartitioner);
+        checkState(
+                lookupInputPartitioner != null,
+                "Lookup custom shuffle was requested for table %s, but no partitioner could be "
+                        + "created. Ensure '%s' is configured with a positive value.",
+                tablePath,
+                FlinkConnectorOptions.BUCKET_NUMBER.key());
+        return Optional.of(lookupInputPartitioner);
     }
 
     @Override

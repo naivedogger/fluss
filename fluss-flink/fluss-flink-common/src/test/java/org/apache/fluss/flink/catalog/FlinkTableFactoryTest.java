@@ -191,6 +191,19 @@ abstract class FlinkTableFactoryTest {
     }
 
     @Test
+    void testLookupCustomShuffleRequiresBucketNumber() {
+        ResolvedSchema schema = createBasicSchema();
+        FlinkTableSource tableSource =
+                (FlinkTableSource) createTableSource(schema, getBasicOptionsWithBucketKey());
+        tableSource.getLookupRuntimeProvider(createLookupContext(new int[][] {{0}, {2}}));
+
+        assertThatThrownBy(tableSource::getPartitionerAdapter)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Lookup custom shuffle was requested")
+                .hasMessageContaining(BUCKET_NUMBER.key());
+    }
+
+    @Test
     void testVirtualLogTableSourceSupportsBatchMode() {
         ResolvedSchema schema = createBasicSchema();
         Map<String, String> properties = getBasicOptions();
