@@ -19,10 +19,10 @@
 //!
 //! The write direction streams one raw JSON object through the table schema. Serde traverses
 //! containers once, numeric leaves retain their exact lexemes, and map visitors observe duplicate
-//! fields. The read direction renders Arrow values deterministically. BIGINT and DECIMAL use
-//! strings on output to avoid IEEE-754 loss, binary values use base64, temporal values use
-//! ISO-8601, arrays and rows recurse, and maps use ordered `{"key", "value"}` entries so
-//! non-string keys and entry order survive.
+//! fields. String-keyed maps additionally accept JSON objects on input. The read direction renders
+//! Arrow values deterministically. BIGINT and DECIMAL use strings on output to avoid IEEE-754
+//! loss, binary values use base64, temporal values use ISO-8601, arrays and rows recurse, and maps
+//! use ordered `{"key", "value"}` entries on output so non-string keys and entry order survive.
 
 mod arrow_json;
 mod decoder;

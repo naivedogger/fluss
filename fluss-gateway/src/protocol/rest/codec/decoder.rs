@@ -262,8 +262,8 @@ fn validate_data_type(data_type: &DataType, depth: usize) -> Result<(), GatewayE
                 return Err(GatewayError::internal("MAP key type must not be nullable"));
             }
             if is_complex(data_type.key_type()) {
-                return Err(GatewayError::invalid_argument(
-                    "FIP-49 JSON does not support ARRAY, MAP, or ROW values as MAP keys",
+                return Err(GatewayError::unsupported(
+                    "JSON rows do not support ARRAY, MAP, or ROW values as MAP keys",
                 ));
             }
             validate_data_type(data_type.key_type(), depth + 1)?;
@@ -305,6 +305,10 @@ impl<'a> ValuePath<'a> {
 
     fn map_part(&self, index: usize, part: &str) -> Self {
         self.nested(format!("{}[{index}].{part}", self.path))
+    }
+
+    fn map_value(&self, key: &str) -> Self {
+        self.nested(format!("{}[{key:?}]", self.path))
     }
 
     fn nested(&self, path: String) -> Self {
@@ -706,6 +710,14 @@ impl<'de> Visitor<'de> for ComplexValueVisitor<'_> {
                 let row = decode_row_map(map, row_type, RowContext::Nested { path: self.path })?;
                 Ok(row.map(|row| Datum::Row(Box::new(row))))
             }
+            DataType::Map(data_type) if matches!(data_type.key_type(), DataType::String(_)) => {
+                decode_string_map_object(
+                    map,
+                    &self.path,
+                    data_type.key_type(),
+                    data_type.value_type(),
+                )
+            }
             DataType::Array(_) | DataType::Map(_) => {
                 let mut map = map;
                 drain_map(&mut map)?;
@@ -719,6 +731,9 @@ impl<'de> Visitor<'de> for ComplexValueVisitor<'_> {
 fn complex_expected(data_type: &DataType) -> &'static str {
     match data_type {
         DataType::Array(_) => "ARRAY (a JSON array)",
+        DataType::Map(data_type) if matches!(data_type.key_type(), DataType::String(_)) => {
+            "MAP (a JSON object or an array of {key, value} objects)"
+        }
         DataType::Map(_) => "MAP (an array of {key, value} objects)",
         DataType::Row(_) => "ROW (a JSON object of its declared fields)",
         _ => unreachable!("only complex data types have a container expectation"),
@@ -768,10 +783,13 @@ fn decode_scalar(
         }
         DataType::Int(_) => decode_integer(path, value, "INT", i32::MIN as i64, i32::MAX as i64)
             .map(|parsed| Datum::Int32(parsed as i32)),
-        DataType::BigInt(_) => decode_bigint(path, value).map(Datum::Int64),
+        DataType::BigInt(_) => {
+            decode_integer(path, value, "BIGINT", i64::MIN, i64::MAX).map(Datum::Int64)
+        }
         DataType::Float(_) => decode_float32(path, value),
         DataType::Double(_) => decode_float(path, value, "DOUBLE").map(Datum::from),
-        DataType::Char(_) | DataType::String(_) => match value {
+        DataType::Char(data_type) => decode_char(path, value, data_type.length()),
+        DataType::String(_) => match value {
             ScalarValue::String(text) => Ok(Datum::String(Cow::Owned(text.clone()))),
             _ => Err(path.type_error("STRING (a JSON string)", value.kind())),
         },
@@ -800,9 +818,11 @@ fn decode_integer(
     min: i64,
     max: i64,
 ) -> Result<i64, RowDecodeError> {
-    let expected = format!("{type_name} (an integer in [{min}, {max}])");
-    let ScalarValue::ExactNumber(lexeme) = value else {
-        return Err(path.type_error(&expected, value.kind()));
+    let expected = format!("{type_name} (an integer number or numeric string in [{min}, {max}])");
+    let lexeme = match value {
+        ScalarValue::ExactNumber(lexeme) => *lexeme,
+        ScalarValue::String(text) => text,
+        _ => return Err(path.type_error(&expected, value.kind())),
     };
     let parsed = integer_lexeme(lexeme).ok_or_else(|| path.type_error(&expected, value.kind()))?;
     if parsed < min || parsed > max {
@@ -811,24 +831,73 @@ fn decode_integer(
     Ok(parsed)
 }
 
-fn decode_bigint(path: &ValuePath<'_>, value: &ScalarValue<'_>) -> Result<i64, RowDecodeError> {
-    let expected = "BIGINT (an exact integer number or a base-10 string)";
-    match value {
-        ScalarValue::ExactNumber(lexeme) => {
-            integer_lexeme(lexeme).ok_or_else(|| path.type_error(expected, value.kind()))
-        }
-        ScalarValue::String(text) => text
-            .parse::<i64>()
-            .map_err(|_| path.type_error(expected, value.kind())),
-        _ => Err(path.type_error(expected, value.kind())),
-    }
-}
-
+/// Parses ProtoJSON's quoted or unquoted integer spellings without routing through `f64`.
+///
+/// Zero fractional parts and exponent notation are accepted only when the exact result is integral.
 fn integer_lexeme(lexeme: &str) -> Option<i64> {
-    if lexeme.contains(['.', 'e', 'E']) {
+    let (negative, unsigned) = match lexeme.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, lexeme.strip_prefix('+').unwrap_or(lexeme)),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) if !exponent.contains(['e', 'E']) => {
+            (mantissa, exponent.parse::<i64>().ok()?)
+        }
+        Some(_) => return None,
+        None => (unsigned, 0),
+    };
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((integer, fraction)) if !fraction.contains('.') => (integer, Some(fraction)),
+        Some(_) => return None,
+        None => (mantissa, None),
+    };
+    if integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
         return None;
     }
-    lexeme.parse::<i64>().ok()
+
+    let fraction = fraction.unwrap_or("");
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Some(0);
+    }
+
+    let decimal_places = i64::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+    let integer_digits = if decimal_places > 0 {
+        let decimal_places = usize::try_from(decimal_places).ok()?;
+        if decimal_places >= significant.len()
+            || !significant[significant.len() - decimal_places..]
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return None;
+        }
+        &significant[..significant.len() - decimal_places]
+    } else {
+        significant
+    };
+
+    let mut parsed = integer_digits.parse::<i128>().ok()?;
+    if decimal_places < 0 {
+        let trailing_zeros = usize::try_from(decimal_places.checked_neg()?).ok()?;
+        if integer_digits.len().saturating_add(trailing_zeros) > 19 {
+            return None;
+        }
+        for _ in 0..trailing_zeros {
+            parsed = parsed.checked_mul(10)?;
+        }
+    }
+    if negative {
+        parsed = parsed.checked_neg()?;
+    }
+    i64::try_from(parsed).ok()
 }
 
 fn decode_float(
@@ -836,27 +905,27 @@ fn decode_float(
     value: &ScalarValue<'_>,
     type_name: &str,
 ) -> Result<f64, RowDecodeError> {
-    let expected = format!("{type_name} (a number or \"NaN\", \"Infinity\", \"-Infinity\")");
-    match value {
-        ScalarValue::ExactNumber(lexeme) => {
-            let parsed = lexeme
-                .parse::<f64>()
-                .map_err(|_| path.type_error(&expected, value.kind()))?;
-            if !parsed.is_finite() {
-                return Err(path.invalid(format!(
-                    "expects {type_name}, finite number is out of range"
-                )));
-            }
-            Ok(parsed)
-        }
+    let expected =
+        format!("{type_name} (a number, numeric string, or \"NaN\", \"Infinity\", \"-Infinity\")");
+    let lexeme = match value {
+        ScalarValue::ExactNumber(lexeme) => *lexeme,
         ScalarValue::String(text) => match text.as_str() {
-            "NaN" => Ok(f64::NAN),
-            "Infinity" => Ok(f64::INFINITY),
-            "-Infinity" => Ok(f64::NEG_INFINITY),
-            _ => Err(path.type_error(&expected, value.kind())),
+            "NaN" => return Ok(f64::NAN),
+            "Infinity" => return Ok(f64::INFINITY),
+            "-Infinity" => return Ok(f64::NEG_INFINITY),
+            _ => text,
         },
-        _ => Err(path.type_error(&expected, value.kind())),
+        _ => return Err(path.type_error(&expected, value.kind())),
+    };
+    let parsed = lexeme
+        .parse::<f64>()
+        .map_err(|_| path.type_error(&expected, value.kind()))?;
+    if !parsed.is_finite() {
+        return Err(path.invalid(format!(
+            "expects {type_name}, finite number is out of range"
+        )));
     }
+    Ok(parsed)
 }
 
 fn decode_float32(
@@ -869,6 +938,22 @@ fn decode_float32(
         return Err(path.invalid("expects FLOAT, value is out of 32-bit float range"));
     }
     Ok(Datum::from(narrowed))
+}
+
+fn decode_char(
+    path: &ValuePath<'_>,
+    value: &ScalarValue<'_>,
+    length: u32,
+) -> Result<Datum<'static>, RowDecodeError> {
+    let expected = format!("CHAR({length}) (a JSON string of at most {length} code points)");
+    let ScalarValue::String(text) = value else {
+        return Err(path.type_error(&expected, value.kind()));
+    };
+    let actual = text.chars().count();
+    if actual > length as usize {
+        return Err(path.invalid(format!("expects {expected}, got {actual} code points")));
+    }
+    Ok(Datum::String(Cow::Owned(text.clone())))
 }
 
 fn decode_decimal(
@@ -1142,18 +1227,68 @@ where
         return Ok(Err(error));
     }
 
+    Ok(finish_map(path, key_type, value_type, entries))
+}
+
+fn decode_string_map_object<'de, A>(
+    mut map: A,
+    path: &ValuePath<'_>,
+    key_type: &DataType,
+    value_type: &DataType,
+) -> Result<DecodeResult<Datum<'static>>, A::Error>
+where
+    A: MapAccess<'de>,
+{
+    let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+    let mut seen = HashSet::with_capacity(map.size_hint().unwrap_or(0));
+    let mut first_error = None;
+    let mut duplicate = None;
+    while let Some(key) = map.next_key::<String>()? {
+        if !seen.insert(key.clone()) {
+            map.next_value::<IgnoredAny>()?;
+            duplicate.get_or_insert(key);
+            continue;
+        }
+        let value = map.next_value_seed(ValueSeed {
+            path: path.map_value(&key),
+            data_type: value_type,
+        })?;
+        match value {
+            Ok(value) if first_error.is_none() => {
+                entries.push((Datum::String(Cow::Owned(key)), value));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(key) = duplicate {
+        return Ok(Err(path.invalid(format!("has a duplicate key `{key}`"))));
+    }
+    if let Some(error) = first_error {
+        return Ok(Err(error));
+    }
+
+    Ok(finish_map(path, key_type, value_type, entries))
+}
+
+fn finish_map(
+    path: &ValuePath<'_>,
+    key_type: &DataType,
+    value_type: &DataType,
+    entries: Vec<(Datum<'static>, Datum<'static>)>,
+) -> DecodeResult<Datum<'static>> {
     let mut writer = FlussMapWriter::new(entries.len(), key_type, value_type);
     for (key, value) in entries {
         if let Err(error) = writer.write_entry(key, value) {
-            return Ok(Err(
-                path.invalid(format!("could not be encoded as a MAP: {error}"))
-            ));
+            return Err(path.invalid(format!("could not be encoded as a MAP: {error}")));
         }
     }
-    Ok(writer
+    writer
         .complete()
         .map(Datum::Map)
-        .map_err(|error| path.invalid(format!("could not be encoded as a MAP: {error}"))))
+        .map_err(|error| path.invalid(format!("could not be encoded as a MAP: {error}")))
 }
 
 struct MapEntrySeed<'a> {
@@ -1507,7 +1642,7 @@ mod tests {
         assert!(missing.is_schema_mismatch());
 
         let wrong_type = decoder
-            .decode_row("entry", br#"{"id":"1"}"#, RowShape::Complete)
+            .decode_row("entry", br#"{"id":"not-an-int"}"#, RowShape::Complete)
             .unwrap_err();
         assert!(!wrong_type.is_schema_mismatch());
 
@@ -1557,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_integer_boundaries_without_coercion() {
+    fn decodes_integer_boundaries_and_protojson_spellings() {
         for (data_type, json, expected) in [
             (
                 DataType::TinyInt(TinyIntType::new()),
@@ -1589,14 +1724,27 @@ mod tests {
                 "2147483647",
                 Datum::Int32(i32::MAX),
             ),
+            (DataType::Int(IntType::new()), "\"42\"", Datum::Int32(42)),
+            (DataType::Int(IntType::new()), "1.0", Datum::Int32(1)),
+            (DataType::Int(IntType::new()), "\"1e2\"", Datum::Int32(100)),
+            (DataType::Int(IntType::new()), "1.5e1", Datum::Int32(15)),
+            (
+                DataType::BigInt(BigIntType::new()),
+                "\"9007199254740993\"",
+                Datum::Int64(9_007_199_254_740_993),
+            ),
         ] {
             assert_eq!(decode_one(data_type, json).unwrap(), expected);
         }
         for (data_type, json) in [
             (DataType::TinyInt(TinyIntType::new()), "128"),
             (DataType::SmallInt(SmallIntType::new()), "-32769"),
-            (DataType::Int(IntType::new()), "1.0"),
-            (DataType::Int(IntType::new()), "1e0"),
+            (DataType::Int(IntType::new()), "1.5"),
+            (DataType::Int(IntType::new()), "\"1e-1\""),
+            (
+                DataType::BigInt(BigIntType::new()),
+                "\"9223372036854775808\"",
+            ),
         ] {
             assert!(decode_one(data_type, json).is_err(), "{json}");
         }
@@ -1616,7 +1764,7 @@ mod tests {
             .unwrap(),
             Datum::Int64(i64::MIN)
         );
-        for json in ["9223372036854775808", "\"1.0\"", "1e0"] {
+        for json in ["9223372036854775808", "\"1.5\"", "1e400"] {
             assert!(
                 decode_one(DataType::BigInt(BigIntType::new()), json).is_err(),
                 "{json}"
@@ -1652,6 +1800,12 @@ mod tests {
             "a finite JSON number must not silently become infinity"
         );
         let Datum::Float64(value) =
+            decode_one(DataType::Double(DoubleType::new()), "\"1.5\"").unwrap()
+        else {
+            panic!("expected double");
+        };
+        assert_eq!(value.into_inner(), 1.5);
+        let Datum::Float64(value) =
             decode_one(DataType::Double(DoubleType::new()), "\"Infinity\"").unwrap()
         else {
             panic!("expected double");
@@ -1672,9 +1826,15 @@ mod tests {
     #[test]
     fn decodes_strings_and_base64_binary() {
         assert_eq!(
-            decode_one(DataType::Char(CharType::new(2)), "\"longer\"").unwrap(),
-            Datum::String(Cow::Owned("longer".to_string()))
+            decode_one(DataType::Char(CharType::new(3)), "\"雪ab\"").unwrap(),
+            Datum::String(Cow::Owned("雪ab".to_string()))
         );
+        assert_eq!(
+            decode_one(DataType::Char(CharType::new(3)), "\"a\"").unwrap(),
+            Datum::String(Cow::Owned("a".to_string()))
+        );
+        let error = decode_one(DataType::Char(CharType::new(3)), "\"雪abc\"").unwrap_err();
+        assert!(error.message().contains("got 4 code points"));
         assert_eq!(
             decode_one(DataType::String(StringType::new()), "\"a\\n雪\"").unwrap(),
             Datum::String(Cow::Owned("a\n雪".to_string()))
@@ -1760,6 +1920,13 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            decode_one(
+                DataType::Timestamp(TimestampType::new(3).unwrap()),
+                "\"2026-01-31 12:34:56.789\""
+            )
+            .is_err()
+        );
         assert_eq!(
             decode_one(DataType::Timestamp(TimestampType::new(3).unwrap()), "-1").unwrap(),
             Datum::TimestampNtz(TimestampNtz::new(-1))
@@ -1794,6 +1961,54 @@ mod tests {
             panic!("expected array");
         };
         assert_eq!(array.size(), 1);
+    }
+
+    #[test]
+    fn accepts_object_shorthand_for_string_keyed_maps() {
+        let map_type = DataType::Map(MapType::new(
+            DataType::String(StringType::new()),
+            DataType::Int(IntType::new()),
+        ));
+        let Datum::Map(object) = decode_one(map_type.clone(), r#"{"b":2,"a":1}"#).unwrap() else {
+            panic!("expected map");
+        };
+        let Datum::Map(entries) =
+            decode_one(map_type, r#"[{"key":"b","value":2},{"key":"a","value":1}]"#).unwrap()
+        else {
+            panic!("expected map");
+        };
+        assert_eq!(object.as_bytes(), entries.as_bytes());
+        assert_eq!(object.key_array().get_string(0).unwrap(), "b");
+        assert_eq!(object.value_array().get_int(1).unwrap(), 1);
+
+        let nested = DataType::Map(MapType::new(
+            DataType::String(StringType::new()),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        ));
+        assert!(decode_one(nested, r#"{"items":[1,2]}"#).is_ok());
+
+        let duplicate = decode_one(
+            DataType::Map(MapType::new(
+                DataType::String(StringType::new()),
+                DataType::Int(IntType::new()),
+            )),
+            r#"{"a":1,"a":2}"#,
+        )
+        .unwrap_err();
+        assert!(duplicate.message().contains("duplicate key `a`"));
+    }
+
+    #[test]
+    fn keeps_object_shorthand_limited_to_string_map_keys() {
+        let map_type = DataType::Map(MapType::new(
+            DataType::Int(IntType::new()),
+            DataType::String(StringType::new()),
+        ));
+        assert!(decode_one(map_type.clone(), r#"{"1":"a"}"#).is_err());
+        assert!(
+            decode_one(map_type, r#"[{"key":1,"value":"a"}]"#).is_ok(),
+            "the canonical entry-array form remains available"
+        );
     }
 
     #[test]
@@ -1904,7 +2119,8 @@ mod tests {
             DataType::String(StringType::new()),
         ));
         let error = SchemaDecoder::new(row_type(vec![field("v", complex_key)])).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(!error.message().contains("FIP-49"));
 
         let mut too_deep = DataType::Int(IntType::new());
         for _ in 0..=MAX_TYPE_NESTING {

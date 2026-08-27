@@ -26,9 +26,9 @@
 //! [`RequestContext`] carries into the backend.
 
 pub mod clusters;
+pub(crate) mod codec;
 pub mod datatype;
 pub mod ddl;
-pub(crate) mod codec;
 pub mod health;
 pub mod metadata;
 pub mod openapi;

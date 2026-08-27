@@ -88,9 +88,8 @@ pub(super) fn parse_time(text: &str) -> Option<(i64, i64)> {
 }
 
 pub(super) fn parse_timestamp(text: &str) -> Option<ParsedTimestamp> {
-    let separator = text.find(['T', ' '])?;
-    let days = parse_date(text.get(..separator)?)?;
-    let rest = text.get(separator + 1..)?;
+    let (date, rest) = text.split_once('T')?;
+    let days = parse_date(date)?;
     let (time_part, offset_seconds) = split_zone(rest)?;
     let (seconds_of_day, frac_nanos) = parse_time(time_part)?;
     Some(ParsedTimestamp {
@@ -248,5 +247,6 @@ mod tests {
                 .offset_seconds,
             Some(0)
         );
+        assert!(parse_timestamp("2026-01-31 12:00:00Z").is_none());
     }
 }

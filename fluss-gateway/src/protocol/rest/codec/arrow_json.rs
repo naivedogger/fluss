@@ -106,7 +106,7 @@ pub(crate) fn value_to_json(array: &dyn Array, index: usize) -> Result<JsonValue
         ArrowDataType::Struct(_) => struct_to_json(array, index),
         ArrowDataType::Map(_, _) => map_to_json(array, index),
         other => Err(GatewayError::internal(format!(
-            "cannot render Arrow type {other} as FIP-49 JSON"
+            "cannot render Arrow type {other} as JSON"
         ))),
     }
 }
