@@ -1074,7 +1074,7 @@ TEST_F(LogTableTest, FilterPushdownWithProjection) {
     ASSERT_OK(adm.DropTable(table_path, false));
 }
 
-TEST_F(LogTableTest, FilterPushdownLiteralValidation) {
+TEST_F(LogTableTest, FilterPushdownLiteralTypes) {
     auto& adm = admin();
     auto& conn = connection();
 
@@ -1098,18 +1098,62 @@ TEST_F(LogTableTest, FilterPushdownLiteralValidation) {
     fluss::Table table;
     ASSERT_OK(conn.GetTable(table_path, table));
 
-    const auto timestamp = fluss::Timestamp::FromMillisNanos(1769163227123, 456000);
-    fluss::RecordBatchLogScanner scanner;
-    ASSERT_OK(
-        table.NewScan()
-            .Filter(fluss::Col("amount")
-                        .Equal(fluss::PredicateLiteral::Decimal("12.34"))
-                        .And(fluss::Col("event_time")
-                                 .GreaterOrEqual(fluss::PredicateLiteral::TimestampNtz(timestamp)))
-                        .And(fluss::Col("event_time_ltz")
-                                 .LessOrEqual(fluss::PredicateLiteral::TimestampLtz(timestamp)))
-                        .And(fluss::Col("id").Equal(5L).Or(fluss::Col("id").Equal(5u))))
-            .CreateRecordBatchLogScanner(scanner));
+    const auto boundary = fluss::Timestamp::FromMillisNanos(1769163227123, 456000);
+    const auto before_boundary = fluss::Timestamp::FromMillisNanos(1769163227000, 123000);
+    const auto after_boundary = fluss::Timestamp::FromMillisNanos(1769163228000, 789000);
+
+    fluss::AppendWriter writer;
+    ASSERT_OK(table.NewAppend().CreateWriter(writer));
+    {
+        fluss::GenericRow row(4);
+        row.SetInt32(0, 1);
+        row.SetDecimal(1, "10.00");
+        row.SetTimestampNtz(2, before_boundary);
+        row.SetTimestampLtz(3, after_boundary);
+        ASSERT_OK(writer.Append(row));
+        ASSERT_OK(writer.Flush());
+    }
+    {
+        fluss::GenericRow row(4);
+        row.SetInt32(0, 2);
+        row.SetDecimal(1, "12.34");
+        row.SetTimestampNtz(2, after_boundary);
+        row.SetTimestampLtz(3, before_boundary);
+        ASSERT_OK(writer.Append(row));
+        ASSERT_OK(writer.Flush());
+    }
+
+    auto extract_ids = [](const fluss::ArrowRecordBatches& batches) {
+        std::vector<int32_t> ids;
+        for (const auto& batch : batches) {
+            auto array = std::static_pointer_cast<arrow::Int32Array>(
+                batch->GetArrowRecordBatch()->column(0));
+            for (int64_t i = 0; i < array->length(); ++i) {
+                ids.push_back(array->Value(i));
+            }
+        }
+        return ids;
+    };
+
+    auto expect_only_second_row = [&](fluss::Predicate predicate) {
+        fluss::RecordBatchLogScanner scanner;
+        ASSERT_OK(table.NewScan()
+                      .Filter(std::move(predicate))
+                      .ProjectByName({"id"})
+                      .CreateRecordBatchLogScanner(scanner));
+        ASSERT_OK(scanner.Subscribe(0, fluss::EARLIEST_OFFSET));
+
+        std::vector<int32_t> ids;
+        fluss_test::PollRecordBatches(scanner, 1, extract_ids, ids);
+        EXPECT_EQ(ids, (std::vector<int32_t>{2}));
+    };
+
+    expect_only_second_row(fluss::Col("amount").Equal(fluss::PredicateLiteral::Decimal("12.34")));
+    expect_only_second_row(
+        fluss::Col("event_time").GreaterOrEqual(fluss::PredicateLiteral::TimestampNtz(boundary)));
+    expect_only_second_row(
+        fluss::Col("event_time_ltz").LessOrEqual(fluss::PredicateLiteral::TimestampLtz(boundary)));
+    expect_only_second_row(fluss::Col("id").Equal(2L).Or(fluss::Col("id").Equal(2u)));
 
     fluss::RecordBatchLogScanner decimal_scanner;
     auto decimal_result =
@@ -1123,8 +1167,8 @@ TEST_F(LogTableTest, FilterPushdownLiteralValidation) {
     fluss::RecordBatchLogScanner timestamp_scanner;
     auto timestamp_result =
         table.NewScan()
-            .Filter(fluss::Col("event_time_ltz")
-                        .Equal(fluss::PredicateLiteral::TimestampNtz(timestamp)))
+            .Filter(
+                fluss::Col("event_time_ltz").Equal(fluss::PredicateLiteral::TimestampNtz(boundary)))
             .CreateRecordBatchLogScanner(timestamp_scanner);
     EXPECT_FALSE(timestamp_result.Ok());
     EXPECT_NE(timestamp_result.error_message.find("does not match"), std::string::npos);
