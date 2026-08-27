@@ -899,6 +899,10 @@ public class FlinkSourceEnumerator
             return;
         }
         if (t != null) {
+            if (boundedness == Boundedness.BOUNDED) {
+                throw new FlinkRuntimeException(
+                        String.format("Failed to list partitions for %s.", tablePath), t);
+            }
             LOG.error("Failed to list partitions for {}", tablePath, t);
             return;
         }

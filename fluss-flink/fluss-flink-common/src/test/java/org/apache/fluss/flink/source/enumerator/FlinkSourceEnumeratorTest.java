@@ -68,6 +68,7 @@ import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitsAssignment;
 import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -443,7 +444,10 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                         null,
                                         OffsetsInitializer.full(),
                                         0L,
+                                        FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
+                                                .defaultValue(),
                                         new RowDataDeserializationSchema(),
+                                        null,
                                         streaming,
                                         null,
                                         lakeSource,
@@ -1415,6 +1419,42 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
             assertThat(context.getSplitsAssignmentSequence()).isEmpty();
             assertThat(context.hasNoMoreSplits(0)).isTrue();
             assertThat(context.hasNoMoreSplits(1)).isTrue();
+        }
+    }
+
+    @Test
+    void testBoundedPartitionDiscoveryFailureIsPropagated() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bounded-discovery-failure");
+        createTable(tablePath, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
+
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                        new MockSplitEnumeratorContext<>(1);
+                FlinkSourceEnumerator enumerator =
+                        new FlinkSourceEnumerator(
+                                tablePath,
+                                flussConf,
+                                false,
+                                true,
+                                context,
+                                OffsetsInitializer.earliest(),
+                                OffsetsInitializer.latest(),
+                                Boundedness.BOUNDED,
+                                DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE
+                                        .defaultValue(),
+                                true,
+                                null,
+                                null,
+                                LeaseContext.DEFAULT,
+                                false)) {
+            enumerator.start();
+            assertThat(context.getPeriodicCallables()).isEmpty();
+            assertThat(context.getOneTimeCallables()).hasSize(1);
+            admin.dropTable(tablePath, false).get();
+
+            assertThatThrownBy(context::runNextOneTimeCallable)
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining("Failed to list partitions for " + tablePath);
         }
     }
 

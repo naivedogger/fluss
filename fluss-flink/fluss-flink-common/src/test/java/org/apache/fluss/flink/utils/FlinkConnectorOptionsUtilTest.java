@@ -19,6 +19,7 @@ package org.apache.fluss.flink.utils;
 
 import org.apache.fluss.client.initializer.LatestOffsetsInitializer;
 import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
+import org.apache.fluss.client.initializer.TimestampOffsetsInitializer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions.ScanBoundedMode;
 
@@ -101,11 +102,18 @@ class FlinkConnectorOptionsUtilTest {
         assertThat(FlinkConnectorOptionsUtils.toBoundedness(false, boundedOptions))
                 .isEqualTo(Boundedness.BOUNDED);
 
-        boundedOptions.boundedMode = ScanBoundedMode.LATEST_OFFSET;
+        boundedOptions = FlinkConnectorOptionsUtils.BoundedOptions.latestOffset();
+        assertThat(boundedOptions.getBoundedMode()).isEqualTo(ScanBoundedMode.LATEST_OFFSET);
         assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(true, boundedOptions))
                 .isInstanceOf(LatestOffsetsInitializer.class);
         assertThat(FlinkConnectorOptionsUtils.toBoundedness(true, boundedOptions))
                 .isEqualTo(Boundedness.BOUNDED);
+
+        boundedOptions = FlinkConnectorOptionsUtils.BoundedOptions.timestamp(123L);
+        assertThat(boundedOptions.getBoundedMode()).isEqualTo(ScanBoundedMode.TIMESTAMP);
+        assertThat(boundedOptions.getBoundedTimestampMs()).isEqualTo(123L);
+        assertThat(FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(true, boundedOptions))
+                .isInstanceOf(TimestampOffsetsInitializer.class);
     }
 
     @Test

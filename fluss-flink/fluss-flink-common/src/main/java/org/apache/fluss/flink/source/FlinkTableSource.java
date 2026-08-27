@@ -213,6 +213,53 @@ public class FlinkTableSource
                 leaseContext);
     }
 
+    /**
+     * Creates a table source with the legacy default bounded options.
+     *
+     * @deprecated Use the constructor that explicitly accepts bounded options.
+     */
+    @Deprecated
+    public FlinkTableSource(
+            TablePath tablePath,
+            Configuration flussConfig,
+            TableConfig tableConfig,
+            org.apache.flink.table.types.logical.RowType tableOutputType,
+            int[] primaryKeyIndexes,
+            int[] bucketKeyIndexes,
+            int[] partitionKeyIndexes,
+            boolean streaming,
+            FlinkConnectorOptionsUtils.StartupOptions startupOptions,
+            boolean lookupAsync,
+            boolean insertIfNotExists,
+            @Nullable LookupCache cache,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            boolean isDataLakeEnabled,
+            @Nullable MergeEngineType mergeEngineType,
+            Map<String, String> tableOptions,
+            LeaseContext leaseContext) {
+        this(
+                tablePath,
+                flussConfig,
+                tableConfig,
+                tableOutputType,
+                primaryKeyIndexes,
+                bucketKeyIndexes,
+                partitionKeyIndexes,
+                streaming,
+                startupOptions,
+                FlinkConnectorOptionsUtils.BoundedOptions.unbounded(),
+                lookupAsync,
+                insertIfNotExists,
+                cache,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                isDataLakeEnabled,
+                mergeEngineType,
+                tableOptions,
+                leaseContext);
+    }
+
     public FlinkTableSource(
             TablePath tablePath,
             Configuration flussConfig,
@@ -277,7 +324,7 @@ public class FlinkTableSource
         this.partitionKeyIndexes = source.partitionKeyIndexes.clone();
         this.streaming = source.streaming;
         this.startupOptions = copyStartupOptions(source.startupOptions);
-        this.boundedOptions = copyBoundedOptions(source.boundedOptions);
+        this.boundedOptions = source.boundedOptions;
         this.lookupAsync = source.lookupAsync;
         this.insertIfNotExists = source.insertIfNotExists;
         this.cache = source.cache;
@@ -502,7 +549,7 @@ public class FlinkTableSource
 
     /** Creates the stopping offsets initializer from the configured bounded options. */
     private OffsetsInitializer createStoppingOffsetsInitializer() {
-        if (boundedOptions.boundedMode != FlinkConnectorOptions.ScanBoundedMode.UNBOUNDED) {
+        if (boundedOptions.getBoundedMode() != FlinkConnectorOptions.ScanBoundedMode.UNBOUNDED) {
             validateBoundedModeSupported();
         }
         return FlinkConnectorOptionsUtils.toStoppingOffsetsInitializer(streaming, boundedOptions);
@@ -855,15 +902,6 @@ public class FlinkTableSource
                 new FlinkConnectorOptionsUtils.StartupOptions();
         copy.startupMode = startupOptions.startupMode;
         copy.startupTimestampMs = startupOptions.startupTimestampMs;
-        return copy;
-    }
-
-    private static FlinkConnectorOptionsUtils.BoundedOptions copyBoundedOptions(
-            FlinkConnectorOptionsUtils.BoundedOptions boundedOptions) {
-        FlinkConnectorOptionsUtils.BoundedOptions copy =
-                new FlinkConnectorOptionsUtils.BoundedOptions();
-        copy.boundedMode = boundedOptions.boundedMode;
-        copy.boundedTimestampMs = boundedOptions.boundedTimestampMs;
         return copy;
     }
 

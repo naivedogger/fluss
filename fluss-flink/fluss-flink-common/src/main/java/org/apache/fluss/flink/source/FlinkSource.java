@@ -121,6 +121,50 @@ public class FlinkSource<OUT>
                 leaseContext);
     }
 
+    /**
+     * Creates a source with the legacy boundedness derived from the streaming flag.
+     *
+     * @deprecated Use the constructor that explicitly accepts stopping offsets and boundedness.
+     */
+    @Deprecated
+    public FlinkSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType scanRowType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            @Nullable RowType producedRowType,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                scanRowType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest(),
+                streaming ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                deserializationSchema,
+                producedRowType,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                leaseContext);
+    }
+
     public FlinkSource(
             Configuration flussConf,
             TablePath tablePath,
