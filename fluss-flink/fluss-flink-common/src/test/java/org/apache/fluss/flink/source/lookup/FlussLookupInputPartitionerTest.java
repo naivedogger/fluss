@@ -206,6 +206,53 @@ class FlussLookupInputPartitionerTest {
     }
 
     @Test
+    void testFewerBucketsThanSubtasksUseAllSubtasks() {
+        RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        List<String> bucketKeyNames = Collections.singletonList("id");
+        int numBuckets = 2;
+        int numPartitions = 5;
+        FlussLookupInputPartitioner partitioner =
+                partitionerFor(keyRowType, bucketKeyNames, numBuckets);
+
+        Set<Integer> usedPartitions = new HashSet<>();
+        for (int id = 0; id < 1000; id++) {
+            RowData key = GenericRowData.of(id);
+            int actual = partitioner.partition(key, numPartitions);
+            int bucket = flussBucketOf(keyRowType, bucketKeyNames, key, numBuckets);
+
+            assertThat(actual).as("id=%d, bucket=%d", id, bucket).isBetween(0, numPartitions - 1);
+            assertThat(actual % numBuckets)
+                    .as("the target subtask must belong to bucket %d's candidate set", bucket)
+                    .isEqualTo(bucket);
+            assertThat(partitioner.partition(key, numPartitions))
+                    .as("the same lookup key must stay on one subtask")
+                    .isEqualTo(actual);
+            usedPartitions.add(actual);
+        }
+
+        assertThat(usedPartitions)
+                .as("bucket-aware spreading should make all lookup subtasks usable")
+                .containsExactlyInAnyOrder(0, 1, 2, 3, 4);
+    }
+
+    @Test
+    void testSingleBucketUsesAllSubtasks() {
+        RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        int numPartitions = 4;
+        FlussLookupInputPartitioner partitioner =
+                partitionerFor(keyRowType, Collections.singletonList("id"), 1);
+
+        Set<Integer> usedPartitions = new HashSet<>();
+        for (int id = 0; id < 1000; id++) {
+            usedPartitions.add(partitioner.partition(GenericRowData.of(id), numPartitions));
+        }
+
+        assertThat(usedPartitions)
+                .as("the default single-bucket table must not collapse onto one lookup subtask")
+                .containsExactlyInAnyOrder(0, 1, 2, 3);
+    }
+
+    @Test
     void testNullLookupKeyUsesStablePartition() {
         RowType keyRowType =
                 RowType.of(
@@ -220,10 +267,9 @@ class FlussLookupInputPartitionerTest {
     }
 
     @Test
-    void testPartitionedTableSpreadsBucketAcrossPartitions() {
-        // A partitioned table with bucket.num == 1: without partition-aware routing every row would
-        // collapse onto partition 0 (bucketId 0 % numPartitions). Including the partition key must
-        // spread different partitions across subtasks.
+    void testPartitionedRoutingUsesPartitionAndBucket() {
+        // A partitioned table with bucket.num == 1: different partitions should be spread across
+        // subtasks, while keys in the same partition and bucket must remain co-located.
         RowType keyRowType =
                 RowType.of(
                         new LogicalType[] {
@@ -236,6 +282,12 @@ class FlussLookupInputPartitionerTest {
         int numPartitions = 4;
         FlussLookupInputPartitioner partitioner =
                 partitionerFor(keyRowType, bucketKeyNames, partitionKeyNames, numBuckets);
+
+        RowData first = GenericRowData.of(1, StringData.fromString("2024-same-partition"));
+        RowData second = GenericRowData.of(2, StringData.fromString("2024-same-partition"));
+        assertThat(partitioner.partition(second, numPartitions))
+                .as("keys targeting the same partition and bucket must share a subtask")
+                .isEqualTo(partitioner.partition(first, numPartitions));
 
         Set<Integer> usedPartitions = new HashSet<>();
         for (int p = 0; p < 20; p++) {
@@ -418,7 +470,7 @@ class FlussLookupInputPartitionerTest {
         }
     }
 
-    /** Builds a partitioner exactly the way {@code FlinkLookupShuffleTableSource} does. */
+    /** Builds a partitioner exactly the way {@code FlinkTableSource} does. */
     private static FlussLookupInputPartitioner buildPartitioner(
             RowType tableSchema,
             int[][] lookupKeyIndexes,

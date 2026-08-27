@@ -23,20 +23,25 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
+import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter;
+import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter.InputDataPartitionerAdapter;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
 import org.apache.fluss.flink.source.lookup.FlinkAsyncLookupFunction;
 import org.apache.fluss.flink.source.lookup.FlinkLookupFunction;
+import org.apache.fluss.flink.source.lookup.FlussLookupInputPartitioner;
 import org.apache.fluss.flink.source.lookup.LookupNormalizer;
 import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
 import org.apache.fluss.flink.utils.FlinkConversions;
+import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.PredicateConverter;
 import org.apache.fluss.flink.utils.PushdownUtils;
 import org.apache.fluss.flink.utils.PushdownUtils.FieldEqual;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
@@ -114,7 +119,8 @@ public class FlinkTableSource
                 SupportsRowLevelModificationScan,
                 SupportsLimitPushDown,
                 SupportsAggregatePushDown,
-                SupportsWatermarkPushDown {
+                SupportsWatermarkPushDown,
+                SupportsLookupCustomShuffleAdapter {
 
     public static final Logger LOG = LoggerFactory.getLogger(FlinkTableSource.class);
 
@@ -165,6 +171,7 @@ public class FlinkTableSource
     @Nullable private Predicate partitionFilters;
 
     private final Map<String, String> tableOptions;
+    @Nullable private final Integer numBuckets;
 
     @Nullable private LakeSource<LakeSplit> lakeSource;
     @Nullable private Predicate logRecordBatchFilter;
@@ -172,8 +179,8 @@ public class FlinkTableSource
     /** Watermark strategy that is pushed down by the Flink optimizer. */
     @Nullable private WatermarkStrategy<RowData> watermarkStrategy;
 
-    /** Stashed at getLookupRuntimeProvider time, used by Flink-2.x custom lookup shuffle. */
-    @Nullable private LookupNormalizer lastLookupNormalizer;
+    /** Custom partitioner prepared for the current lookup runtime provider. */
+    @Nullable private InputDataPartitionerAdapter lookupInputPartitioner;
 
     public FlinkTableSource(
             TablePath tablePath,
@@ -253,6 +260,10 @@ public class FlinkTableSource
         this.leaseContext = leaseContext;
         this.mergeEngineType = mergeEngineType;
         this.tableOptions = tableOptions;
+        this.numBuckets =
+                org.apache.flink.configuration.Configuration.fromMap(tableOptions)
+                        .getOptional(FlinkConnectorOptions.BUCKET_NUMBER)
+                        .orElse(null);
         if (isDataLakeEnabled) {
             this.lakeSource =
                     checkNotNull(
@@ -267,12 +278,7 @@ public class FlinkTableSource
                 PushdownUtils.computeAvailableStatsColumns(flussRowType, tableConfig);
     }
 
-    /**
-     * Copy constructor used by {@link #copy()} and by version-specific subclasses (e.g. the Flink
-     * 2.x custom-lookup-shuffle variant) to wrap an already-built source while preserving its
-     * state, including the stashed lookup normalizer.
-     */
-    protected FlinkTableSource(FlinkTableSource source) {
+    private FlinkTableSource(FlinkTableSource source) {
         this.tablePath = source.tablePath;
         this.flussConfig = new Configuration(source.flussConfig);
         this.tableOutputType = source.tableOutputType;
@@ -300,10 +306,10 @@ public class FlinkTableSource
         this.limit = source.limit;
         this.partitionFilters = source.partitionFilters;
         this.tableOptions = new HashMap<>(source.tableOptions);
+        this.numBuckets = source.numBuckets;
         this.lakeSource = source.lakeSource == null ? null : source.lakeSource.copy();
         this.logRecordBatchFilter = source.logRecordBatchFilter;
         this.watermarkStrategy = source.watermarkStrategy;
-        this.lastLookupNormalizer = source.lastLookupNormalizer;
     }
 
     @Override
@@ -510,8 +516,7 @@ public class FlinkTableSource
                         partitionKeyIndexes,
                         tableOutputType,
                         projectedFields);
-        // Stash for SupportsLookupCustomShuffle (Flink 2.x). Harmless for Flink 1.x.
-        this.lastLookupNormalizer = lookupNormalizer;
+        this.lookupInputPartitioner = createLookupInputPartitioner(lookupNormalizer);
         if (lookupAsync) {
             AsyncLookupFunction asyncLookupFunction =
                     new FlinkAsyncLookupFunction(
@@ -543,40 +548,42 @@ public class FlinkTableSource
         }
     }
 
+    @Nullable
+    private InputDataPartitionerAdapter createLookupInputPartitioner(
+            LookupNormalizer lookupNormalizer) {
+        if (numBuckets == null || numBuckets <= 0) {
+            return null;
+        }
+
+        org.apache.flink.table.types.logical.RowType lookupKeyType =
+                FlinkUtils.projectRowType(tableOutputType, lookupNormalizer.getLookupKeyIndexes());
+        List<String> fieldNames = tableOutputType.getFieldNames();
+        List<String> bucketKeyNames = new ArrayList<>(bucketKeyIndexes.length);
+        for (int bucketKeyIndex : bucketKeyIndexes) {
+            bucketKeyNames.add(fieldNames.get(bucketKeyIndex));
+        }
+        List<String> partitionKeyNames = new ArrayList<>(partitionKeyIndexes.length);
+        for (int partitionKeyIndex : partitionKeyIndexes) {
+            partitionKeyNames.add(fieldNames.get(partitionKeyIndex));
+        }
+        DataLakeFormat lakeFormat = tableConfig.getDataLakeFormat().orElse(null);
+        return new FlussLookupInputPartitioner(
+                lookupNormalizer,
+                lookupKeyType,
+                bucketKeyNames,
+                partitionKeyNames,
+                lakeFormat,
+                numBuckets);
+    }
+
     @Override
     public DynamicTableSource copy() {
         return new FlinkTableSource(this);
     }
 
-    // ---- accessors for version-specific (Flink 2.x) custom lookup shuffle ----
-
-    /** Returns the indexes of the bucket-key columns within the table output row. */
-    protected int[] bucketKeyIndexes() {
-        return bucketKeyIndexes;
-    }
-
-    /** Returns the indexes of the partition-key columns within the table output row. */
-    protected int[] partitionKeyIndexes() {
-        return partitionKeyIndexes;
-    }
-
-    /** Returns the Flink logical row type produced by this source. */
-    protected org.apache.flink.table.types.logical.RowType tableOutputType() {
-        return tableOutputType;
-    }
-
-    /** Returns the table config, e.g. to resolve the data lake format for bucketing. */
-    protected TableConfig tableConfigInternal() {
-        return tableConfig;
-    }
-
-    /**
-     * Returns the lookup normalizer stashed by the last {@link #getLookupRuntimeProvider}, or
-     * {@code null} if the lookup runtime provider has not been requested yet.
-     */
-    @Nullable
-    protected LookupNormalizer lastLookupNormalizer() {
-        return lastLookupNormalizer;
+    @Override
+    public Optional<InputDataPartitionerAdapter> getPartitionerAdapter() {
+        return Optional.ofNullable(lookupInputPartitioner);
     }
 
     @Override

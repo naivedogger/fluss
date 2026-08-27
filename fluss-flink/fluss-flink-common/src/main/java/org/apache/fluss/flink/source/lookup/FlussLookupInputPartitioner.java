@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.source.lookup;
 
 import org.apache.fluss.bucketing.BucketingFunction;
+import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter.InputDataPartitionerAdapter;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.metadata.DataLakeFormat;
@@ -27,29 +28,28 @@ import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.utils.MathUtils;
 import org.apache.fluss.utils.MurmurHashUtils;
 
-import org.apache.flink.table.connector.source.abilities.SupportsLookupCustomShuffle.InputDataPartitioner;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
 
 import javax.annotation.Nullable;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
-import static org.apache.fluss.utils.UnsafeUtils.BYTE_ARRAY_BASE_OFFSET;
 
 /**
  * Partitions the lookup-join probe stream by Fluss bucket, consistent with the client-side
- * bucketing used by {@code PrimaryKeyLookuper}/{@code PrefixKeyLookuper} (bucket key encoding +
- * {@link BucketingFunction}). Rows mapping to the same Fluss bucket are always routed to the same
- * partition.
+ * bucketing used by {@code PrimaryKeyLookuper}/{@code PrefixKeyLookuper} (bucket-key encoding +
+ * {@link BucketingFunction}).
  *
- * <p>For partitioned tables the client routes by {@code (partitionId, bucketId)}: the same bucket
- * id in different partitions is a different tablet. The partition keys therefore join the bucket
- * key in the channel computation, so rows targeting the same tablet stay co-located while different
- * partitions are spread across subtasks instead of collapsing onto one.
+ * <p>For partitioned tables, rows targeting the same {@code (partition, bucket)} tablet are always
+ * co-located on one subtask. For non-partitioned tables with fewer buckets than lookup subtasks,
+ * each bucket is assigned a subset of subtasks and normalized lookup keys are hashed within that
+ * subset. This avoids leaving lookup subtasks idle for small-bucket tables while keeping every
+ * lookup key on a stable subtask and bounding each bucket's RPC fan-out.
  */
-public class FlussLookupInputPartitioner implements InputDataPartitioner {
+public class FlussLookupInputPartitioner implements InputDataPartitionerAdapter {
 
     private static final long serialVersionUID = 1L;
 
@@ -67,6 +67,7 @@ public class FlussLookupInputPartitioner implements InputDataPartitioner {
     private transient KeyEncoder bucketKeyEncoder;
     // null when the table is not partitioned.
     @Nullable private transient KeyEncoder partitionKeyEncoder;
+    private transient KeyEncoder lookupKeyEncoder;
     private transient BucketingFunction bucketingFunction;
     private transient FlinkAsFlussRow reuseRow;
 
@@ -111,6 +112,9 @@ public class FlussLookupInputPartitioner implements InputDataPartitioner {
                 partitionKeyEncoder =
                         CompactedKeyEncoder.createKeyEncoder(flussKeyType, partitionKeyNames);
             }
+            lookupKeyEncoder =
+                    CompactedKeyEncoder.createKeyEncoder(
+                            flussKeyType, keyFlinkRowType.getFieldNames());
             bucketingFunction = BucketingFunction.of(lakeFormat);
             reuseRow = new FlinkAsFlussRow();
         }
@@ -132,15 +136,26 @@ public class FlussLookupInputPartitioner implements InputDataPartitioner {
         // BucketingFunction always returns a non-negative bucket id.
         int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
         if (partitionKeyEncoder == null) {
+            if (numBuckets < numPartitions) {
+                // Give each bucket a disjoint round-robin subset of subtasks, then use the
+                // normalized lookup key to balance records within that subset. For example, with 2
+                // buckets and 5 subtasks, bucket 0 uses [0, 2, 4] and bucket 1 uses [1, 3].
+                byte[] lookupKeyBytes = lookupKeyEncoder.encodeKey(flussKeyRow);
+                // Do not derive this hash from the bucket hash. The low bits of that hash determine
+                // the bucket id, so reusing it can make some candidates unreachable. Use an
+                // independent, deterministic byte-array hash before mixing it for subtask
+                // selection.
+                int lookupKeyHash = MathUtils.murmurHash(Arrays.hashCode(lookupKeyBytes));
+                int candidateCount = (numPartitions - 1 - bucketId) / numBuckets + 1;
+                return (lookupKeyHash % candidateCount) * numBuckets + bucketId;
+            }
             return bucketId % numPartitions;
         }
         // Route by (partition, bucket) so different partitions of the same bucket id are spread
         // across subtasks while rows targeting the same tablet stay co-located. Mix in the bucket
         // id using the same Murmur hash family the client bucketing uses (FlussBucketingFunction).
         byte[] partitionKeyBytes = partitionKeyEncoder.encodeKey(flussKeyRow);
-        int partitionHash =
-                MurmurHashUtils.hashUnsafeBytes(
-                        partitionKeyBytes, BYTE_ARRAY_BASE_OFFSET, partitionKeyBytes.length);
+        int partitionHash = MurmurHashUtils.hashBytes(partitionKeyBytes);
         // murmurHash returns a non-negative int, so the modulo is always a valid channel.
         return MathUtils.murmurHash(partitionHash * 31 + bucketId) % numPartitions;
     }
