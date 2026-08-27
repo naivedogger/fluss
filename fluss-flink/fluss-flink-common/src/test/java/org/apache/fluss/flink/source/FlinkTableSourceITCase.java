@@ -2075,12 +2075,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         LookupNormalizer normalizer =
                 LookupNormalizer.createPrimaryKeyLookupNormalizer(new int[] {0}, lookupKeyType);
         return new FlussLookupInputPartitioner(
-                normalizer,
-                lookupKeyType,
-                Collections.singletonList("id"),
-                Collections.emptyList(),
-                null,
-                numBuckets);
+                normalizer, lookupKeyType, Collections.singletonList("id"), null, numBuckets);
     }
 
     private static class LookupSubtaskTagger extends RichMapFunction<Row, Row> {

@@ -286,10 +286,10 @@ of Fluss tablets.
 - For a non-partitioned table, Fluss routes by bucket. If there are fewer buckets than lookup
   subtasks, each bucket uses a disjoint subset of subtasks and the complete lookup key is used to
   balance requests within that subset.
-- For a partitioned table, Fluss routes each `(partition, bucket)` tablet to one lookup subtask.
-  This preserves tablet locality, but the effective lookup parallelism is bounded by the number of
-  active tablets. Some lookup subtasks may therefore remain idle when the number of active tablets
-  is smaller than the configured lookup parallelism.
+- Partitioned tables use the same strategy as non-partitioned tables. The partition key is part of
+  the normalized lookup key, so the same lookup key is routed consistently. When there are fewer
+  buckets than lookup subtasks, requests for one `(partition, bucket)` tablet may be handled by
+  multiple subtasks in order to use the configured lookup parallelism.
 
 Lookup custom shuffle requires Fluss to know the table's positive `bucket.num`. Fluss Catalog
 tables expose the resolved bucket number automatically.

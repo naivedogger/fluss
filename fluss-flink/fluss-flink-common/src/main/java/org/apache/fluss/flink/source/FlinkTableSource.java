@@ -563,18 +563,9 @@ public class FlinkTableSource
         for (int bucketKeyIndex : bucketKeyIndexes) {
             bucketKeyNames.add(fieldNames.get(bucketKeyIndex));
         }
-        List<String> partitionKeyNames = new ArrayList<>(partitionKeyIndexes.length);
-        for (int partitionKeyIndex : partitionKeyIndexes) {
-            partitionKeyNames.add(fieldNames.get(partitionKeyIndex));
-        }
         DataLakeFormat lakeFormat = tableConfig.getDataLakeFormat().orElse(null);
         return new FlussLookupInputPartitioner(
-                lookupNormalizer,
-                lookupKeyType,
-                bucketKeyNames,
-                partitionKeyNames,
-                lakeFormat,
-                numBuckets);
+                lookupNormalizer, lookupKeyType, bucketKeyNames, lakeFormat, numBuckets);
     }
 
     @Override

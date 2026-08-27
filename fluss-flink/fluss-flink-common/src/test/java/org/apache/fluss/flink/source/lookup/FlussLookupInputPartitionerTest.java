@@ -120,12 +120,7 @@ class FlussLookupInputPartitionerTest {
                 LookupNormalizer.createPrimaryKeyLookupNormalizer(new int[] {0}, keyRowType);
         FlussLookupInputPartitioner partitioner =
                 new FlussLookupInputPartitioner(
-                        normalizer,
-                        keyRowType,
-                        bucketKeyNames,
-                        Collections.emptyList(),
-                        lakeFormat,
-                        GOLDEN_NUM_BUCKETS);
+                        normalizer, keyRowType, bucketKeyNames, lakeFormat, GOLDEN_NUM_BUCKETS);
         for (Map.Entry<Integer, Integer> entry : goldenBucketById.entrySet()) {
             int id = entry.getKey();
             int goldenBucket = entry.getValue();
@@ -147,15 +142,7 @@ class FlussLookupInputPartitionerTest {
 
     private static FlussLookupInputPartitioner partitionerFor(
             RowType keyRowType, List<String> bucketKeyNames, int numBuckets) {
-        return partitionerFor(keyRowType, bucketKeyNames, Collections.emptyList(), numBuckets);
-    }
-
-    private static FlussLookupInputPartitioner partitionerFor(
-            RowType keyRowType,
-            List<String> bucketKeyNames,
-            List<String> partitionKeyNames,
-            int numBuckets) {
-        // primary key == bucket key -> identity normalizer (no reordering)
+        // Full primary-key lookup in the same order as the key row -> identity normalizer.
         int[] pkIndexes = new int[keyRowType.getFieldCount()];
         for (int i = 0; i < pkIndexes.length; i++) {
             pkIndexes[i] = i;
@@ -163,12 +150,7 @@ class FlussLookupInputPartitionerTest {
         LookupNormalizer normalizer =
                 LookupNormalizer.createPrimaryKeyLookupNormalizer(pkIndexes, keyRowType);
         return new FlussLookupInputPartitioner(
-                normalizer,
-                keyRowType,
-                bucketKeyNames,
-                partitionKeyNames,
-                /* lakeFormat */ null,
-                numBuckets);
+                normalizer, keyRowType, bucketKeyNames, /* lakeFormat */ null, numBuckets);
     }
 
     @Test
@@ -267,9 +249,9 @@ class FlussLookupInputPartitionerTest {
     }
 
     @Test
-    void testPartitionedRoutingUsesPartitionAndBucket() {
-        // A partitioned table with bucket.num == 1: different partitions should be spread across
-        // subtasks, while keys in the same partition and bucket must remain co-located.
+    void testPartitionedTableUsesSameLowBucketStrategy() {
+        // A partitioned table with bucket.num == 1 uses the complete normalized lookup key,
+        // including the partition key, to spread one bucket across all lookup subtasks.
         RowType keyRowType =
                 RowType.of(
                         new LogicalType[] {
@@ -277,31 +259,28 @@ class FlussLookupInputPartitionerTest {
                         },
                         new String[] {"id", "p_date"});
         List<String> bucketKeyNames = Collections.singletonList("id");
-        List<String> partitionKeyNames = Collections.singletonList("p_date");
         int numBuckets = 1;
         int numPartitions = 4;
         FlussLookupInputPartitioner partitioner =
-                partitionerFor(keyRowType, bucketKeyNames, partitionKeyNames, numBuckets);
-
-        RowData first = GenericRowData.of(1, StringData.fromString("2024-same-partition"));
-        RowData second = GenericRowData.of(2, StringData.fromString("2024-same-partition"));
-        assertThat(partitioner.partition(second, numPartitions))
-                .as("keys targeting the same partition and bucket must share a subtask")
-                .isEqualTo(partitioner.partition(first, numPartitions));
+                partitionerFor(keyRowType, bucketKeyNames, numBuckets);
 
         Set<Integer> usedPartitions = new HashSet<>();
-        for (int p = 0; p < 20; p++) {
-            RowData key = GenericRowData.of(1, StringData.fromString("2024-" + p));
-            usedPartitions.add(partitioner.partition(key, numPartitions));
+        for (int id = 0; id < 1000; id++) {
+            RowData key = GenericRowData.of(id, StringData.fromString("2024-same-partition"));
+            int actual = partitioner.partition(key, numPartitions);
+            assertThat(partitioner.partition(key, numPartitions))
+                    .as("the same partitioned lookup key must stay on one subtask")
+                    .isEqualTo(actual);
+            usedPartitions.add(actual);
         }
         assertThat(usedPartitions)
-                .as("partitioned rows sharing bucket id 0 must not collapse onto one subtask")
-                .hasSizeGreaterThan(1);
+                .as("a partitioned single-bucket table should use all lookup subtasks")
+                .containsExactlyInAnyOrder(0, 1, 2, 3);
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("lakeFormatCoLocationCases")
-    void testCompositePartitionKeysCoLocateSameTabletForLakeFormat(
+    void testPartitionedLakeFormatUsesBucketRouting(
             String formatName, DataLakeFormat lakeFormat, int firstId, int secondId) {
         RowType keyRowType =
                 RowType.of(
@@ -318,7 +297,6 @@ class FlussLookupInputPartitionerTest {
                         normalizer,
                         keyRowType,
                         Collections.singletonList("id"),
-                        Arrays.asList("region", "p_date"),
                         lakeFormat,
                         GOLDEN_NUM_BUCKETS);
 
@@ -327,10 +305,10 @@ class FlussLookupInputPartitionerTest {
                         firstId, StringData.fromString("cn"), StringData.fromString("2026-08-20"));
         RowData second =
                 GenericRowData.of(
-                        secondId, StringData.fromString("cn"), StringData.fromString("2026-08-20"));
+                        secondId, StringData.fromString("us"), StringData.fromString("2026-08-21"));
 
         assertThat(partitioner.partition(second, 4))
-                .as("%s rows targeting the same tablet must share a channel", formatName)
+                .as("%s rows in the same bucket must share a channel", formatName)
                 .isEqualTo(partitioner.partition(first, 4));
     }
 
@@ -493,11 +471,6 @@ class FlussLookupInputPartitionerTest {
             bucketKeyNames.add(allNames.get(idx));
         }
         return new FlussLookupInputPartitioner(
-                normalizer,
-                keyRowType,
-                bucketKeyNames,
-                Collections.emptyList(),
-                /* lakeFormat */ null,
-                numBuckets);
+                normalizer, keyRowType, bucketKeyNames, /* lakeFormat */ null, numBuckets);
     }
 }
