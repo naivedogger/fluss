@@ -74,7 +74,7 @@ GATEWAY_IMAGE_BUILD_DIR="${BUILD_DIR}" \
     "${SCRIPT_DIR}/prepare_build.sh"
 
 image_version="${FLUSS_VERSION:-${gateway_version}}"
-image_revision="${VCS_REF:-$(git -C "${REPOSITORY_ROOT}" rev-parse HEAD)}"
+image_revision="${VCS_REF:-$(git -C "${REPOSITORY_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)}"
 docker buildx build \
     --load \
     --platform "linux/${GATEWAY_ARCH}" \
