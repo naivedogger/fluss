@@ -44,8 +44,8 @@ gateway.rest.listen: 127.0.0.1:8080
 # Maximum time allowed for receiving the complete HTTP request headers.
 gateway.rest.header-read-timeout: 10s
 
-# Server-side deadline for one REST write request.
-gateway.rest.write.request-timeout: 30s
+# Server-side deadline for one REST request.
+gateway.rest.request-timeout: 30s
 
 # Maximum accepted request body size.
 gateway.rest.write.max-request-bytes: 32MiB
@@ -63,6 +63,9 @@ gateway.cluster.default.bootstrap.servers: 127.0.0.1:9123
 
 # Timeout for establishing the native Fluss client connection.
 gateway.cluster.default.connect-timeout: 10s
+
+# Use plaintext or sasl. SASL requires both service account and service secret.
+gateway.cluster.default.connection.security.protocol: plaintext
 
 # The default service mode shares one connection authenticated with the
 # configured service account. User mode uses bounded per-user connections.
@@ -96,6 +99,9 @@ gateway.security.authentication: trust
 #==============================================================================
 # Request Admission
 #==============================================================================
+
+# Maximum number of concurrent metadata requests accessing Fluss.
+gateway.rest.metadata.max-concurrent-requests: 16
 
 gateway.rest.write.max-rows: 10000
 gateway.rest.write.max-concurrent-requests: 64
