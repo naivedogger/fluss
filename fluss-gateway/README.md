@@ -30,26 +30,33 @@ lock file or its generated dependency inventories.
 
 ## Status
 
-The gateway currently serves the process runtime and REST metadata discovery:
-configuration loading and validation (`gateway.yaml` with flat dotted keys), the
-HTTP listener with its request-id, body-size and deadline middleware,
-`GET /health`, `GET /ready`, `GET /v1/openapi.json`, `GET /v1/clusters`,
-`GET /v1/clusters/{cluster}/databases`,
-`GET /v1/clusters/{cluster}/databases/{database}/tables`, the Prometheus
-listener, and the backend runtime that owns one shared service connection per
-configured cluster. A connection is opened lazily on the first request that
-needs it, shared by every request to that cluster, released after the configured
+The gateway provides configuration validation, lifecycle management, request-id,
+body-size and deadline middleware, and a Prometheus listener. Its REST API
+currently supports:
+
+- health, readiness, the generated OpenAPI document, and cluster discovery;
+- paginated metadata reads for databases, tables, table definitions, and
+  partitions;
+- DDL operations to create and drop databases, create, alter, and drop tables,
+  and add and drop partitions; and
+- schema-aware batched append, upsert, and delete records through
+  `POST /v1/clusters/{cluster}/databases/{database}/tables/{table}/records`,
+  with per-entry outcomes.
+
+The backend runtime owns one shared service connection per configured cluster. A
+connection is opened lazily on the first request that needs it, shared by every
+request to that cluster, released after the configured
 `connection.idle-timeout`, and drained during shutdown. Concurrent cold requests
 serialize behind one connection attempt. Cancelling that request cancels its
-attempt and lets the next waiter retry; bootstrap timeout and retry behavior remain
-owned by `fluss-rust`.
+attempt and lets the next waiter retry; bootstrap timeout and retry behavior
+remain owned by `fluss-rust`.
 Connections use Fluss's default plaintext protocol unless
 `connection.security.protocol: sasl` selects the configured service account. A
 broken transport is left to the native client, which reconnects the affected
 server on its own.
 `connection.identity-mode: user` is refused at startup until Fluss supports
-act-as. The describe-table, partition, DDL, write, and lookup APIs, and client
-authentication, land in follow-up pull requests.
+act-as. Lookup and prefix-lookup APIs, HTTP caller authentication, and user
+identity propagation remain follow-up work.
 
 ## Distribution and container
 

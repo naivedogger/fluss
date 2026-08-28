@@ -227,7 +227,11 @@ def gateway_notice(repository_root: Path) -> str:
 
 
 def indent(text: str) -> str:
-    return "\n".join("| " + line for line in text.rstrip().splitlines())
+    lines = []
+    for line in text.rstrip().splitlines():
+        line = line.rstrip()
+        lines.append(f"| {line}" if line else "|")
+    return "\n".join(lines)
 
 
 def generate_license(repository_root: Path, packages: Iterable[dict]) -> str:

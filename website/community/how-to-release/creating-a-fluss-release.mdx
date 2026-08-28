@@ -534,7 +534,7 @@ $ cd docker/fluss-gateway
 docker/fluss-gateway $ docker buildx build \
     --push \
     --platform linux/arm64,linux/amd64 \
-    --build-arg FLUSS_VERSION=${RELEASE_VERSION}-rc${RC_NUM} \
+    --build-arg FLUSS_VERSION=${RELEASE_VERSION} \
     --build-arg VCS_REF=$(git rev-parse HEAD) \
     --tag apache/fluss-gateway:${RELEASE_VERSION}-rc${RC_NUM} \
     .

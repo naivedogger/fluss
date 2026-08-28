@@ -84,4 +84,18 @@ if [[ "$(docker inspect --format '{{.State.ExitCode}}' "${CONTAINER}")" != "0" ]
 fi
 docker rm "${CONTAINER}" >/dev/null
 
+if docker run \
+    --name "${CONTAINER}" \
+    --env FLUSS_GATEWAY__REST__LISTEN=not-an-address \
+    "${IMAGE}" >/dev/null 2>&1; then
+    echo "Gateway container accepted an invalid configuration." >&2
+    exit 1
+fi
+if [[ "$(docker inspect --format '{{.State.ExitCode}}' "${CONTAINER}")" != "2" ]]; then
+    docker logs "${CONTAINER}"
+    echo "Gateway container must exit with code 2 for an invalid configuration." >&2
+    exit 1
+fi
+docker rm "${CONTAINER}" >/dev/null
+
 echo "Gateway container smoke tests passed."
