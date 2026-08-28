@@ -337,6 +337,7 @@ Tag the release commit:
 
 ```bash
 git tag -s ${TAG} -m "${TAG}"
+RELEASE_COMMIT="$(git rev-parse "${TAG}^{}")"
 ```
 
 ### 2. Create source release files
@@ -524,7 +525,9 @@ If you build the images on a different machine than the one that created the
 archives, download both `fluss-gateway-${RELEASE_VERSION}-bin-linux-*.tgz` files
 from `https://dist.apache.org/repos/dist/dev/fluss/fluss-${RELEASE_VERSION}-rc${RC_NUM}/`
 into any directory and point `GATEWAY_RELEASE_DIR` there instead. Only the `.tgz`
-files are needed.
+files are needed. Also copy the `RELEASE_COMMIT` value recorded when the RC tag
+was created and export it on the image-build machine; do not derive it from that
+machine's checkout.
 
 The Dockerfile selects the matching `build-target/<arch>` directory for each
 target platform:
@@ -535,7 +538,7 @@ docker/fluss-gateway $ docker buildx build \
     --push \
     --platform linux/arm64,linux/amd64 \
     --build-arg FLUSS_VERSION=${RELEASE_VERSION} \
-    --build-arg VCS_REF=$(git rev-parse HEAD) \
+    --build-arg VCS_REF=${RELEASE_COMMIT} \
     --tag apache/fluss-gateway:${RELEASE_VERSION}-rc${RC_NUM} \
     .
 ```

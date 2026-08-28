@@ -67,15 +67,16 @@ gateway.cluster.default.connect-timeout: 10s
 # Use plaintext or sasl. SASL requires both service account and service secret.
 gateway.cluster.default.connection.security.protocol: plaintext
 
-# The default service mode shares one connection authenticated with the
-# configured service account. User mode uses bounded per-user connections.
+# Service mode shares one connection authenticated with the configured service
+# account. It is the only supported mode today; user mode is reserved for
+# per-caller identity propagation and is rejected at startup.
 gateway.cluster.default.connection.identity-mode: service
 
 # Configure both values when the Fluss cluster requires SASL/PLAIN.
 # gateway.cluster.default.connection.service.account: gateway-service
 # gateway.cluster.default.connection.service.secret: change-me
 
-# Required only for connection.identity-mode: user.
+# Reserved for the unsupported connection.identity-mode: user.
 # gateway.cluster.default.connection.max: 512
 # gateway.cluster.default.connection.idle-timeout: 10m
 
@@ -83,17 +84,19 @@ gateway.cluster.default.connection.identity-mode: service
 # HTTP Caller Authentication
 #==============================================================================
 
-# trust, password, token, or trusted-header. Trust mode is suitable only for
-# local development or a deployment protected by a trusted network boundary.
+# Only trust mode is implemented today. The password, token, and trusted-header
+# values are reserved for the caller-authentication follow-up and do not protect
+# requests in this release. Trust mode is suitable only for local development or
+# a deployment protected by a trusted network boundary.
 gateway.security.authentication: trust
 
-# Password mode uses comma-separated user:password entries.
+# Reserved password-mode user table.
 # gateway.security.users: alice:change-me
 
-# Token mode uses comma-separated token:principal entries.
+# Reserved token-mode token table.
 # gateway.security.tokens: change-me:alice
 
-# Header consumed in trusted-header mode.
+# Reserved trusted-header-mode header name.
 # gateway.security.trusted-header.name: x-forwarded-user
 
 #==============================================================================

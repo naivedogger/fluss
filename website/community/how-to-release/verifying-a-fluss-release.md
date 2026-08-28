@@ -128,6 +128,10 @@ Then verify the image on matching `amd64` and `arm64` Docker hosts:
 
 ```bash
 docker pull apache/fluss-gateway:${RELEASE_VERSION}-rc${RC_NUM}
+
+# Run the checked-in smoke test from the root of the extracted Fluss source
+# release, not from the Gateway binary distribution used above.
+cd /path/to/fluss-${RELEASE_VERSION}
 GATEWAY_IMAGE=apache/fluss-gateway:${RELEASE_VERSION}-rc${RC_NUM} \
   docker/fluss-gateway/smoke-test.sh
 ```
