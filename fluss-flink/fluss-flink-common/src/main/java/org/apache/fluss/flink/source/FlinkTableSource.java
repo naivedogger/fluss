@@ -109,7 +109,6 @@ import static org.apache.fluss.flink.utils.PredicateConverter.convertToFlussPred
 import static org.apache.fluss.flink.utils.PushdownUtils.ValueConversion.FLINK_INTERNAL_VALUE;
 import static org.apache.fluss.flink.utils.PushdownUtils.extractFieldEquals;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
-import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Flink table source to scan Fluss data. */
 public class FlinkTableSource
@@ -172,7 +171,6 @@ public class FlinkTableSource
     @Nullable private Predicate partitionFilters;
 
     private final Map<String, String> tableOptions;
-    @Nullable private final Integer numBuckets;
 
     @Nullable private LakeSource<LakeSplit> lakeSource;
     @Nullable private Predicate logRecordBatchFilter;
@@ -261,10 +259,6 @@ public class FlinkTableSource
         this.leaseContext = leaseContext;
         this.mergeEngineType = mergeEngineType;
         this.tableOptions = tableOptions;
-        this.numBuckets =
-                org.apache.flink.configuration.Configuration.fromMap(tableOptions)
-                        .getOptional(FlinkConnectorOptions.BUCKET_NUMBER)
-                        .orElse(null);
         if (isDataLakeEnabled) {
             this.lakeSource =
                     checkNotNull(
@@ -307,7 +301,6 @@ public class FlinkTableSource
         this.limit = source.limit;
         this.partitionFilters = source.partitionFilters;
         this.tableOptions = new HashMap<>(source.tableOptions);
-        this.numBuckets = source.numBuckets;
         this.lakeSource = source.lakeSource == null ? null : source.lakeSource.copy();
         this.logRecordBatchFilter = source.logRecordBatchFilter;
         this.watermarkStrategy = source.watermarkStrategy;
@@ -552,10 +545,16 @@ public class FlinkTableSource
     @Nullable
     private InputDataPartitionerAdapter createLookupInputPartitioner(
             LookupNormalizer lookupNormalizer) {
-        if (numBuckets == null) {
+        if (bucketKeyIndexes.length == 0) {
             return null;
         }
 
+        int numBuckets =
+                checkNotNull(
+                        org.apache.flink.configuration.Configuration.fromMap(tableOptions)
+                                .get(FlinkConnectorOptions.BUCKET_NUMBER),
+                        "The resolved table option '%s' must be present for bucket shuffle.",
+                        FlinkConnectorOptions.BUCKET_NUMBER.key());
         org.apache.flink.table.types.logical.RowType lookupKeyType =
                 FlinkUtils.projectRowType(tableOutputType, lookupNormalizer.getLookupKeyIndexes());
         List<String> fieldNames = tableOutputType.getFieldNames();
@@ -575,13 +574,7 @@ public class FlinkTableSource
 
     @Override
     public Optional<InputDataPartitionerAdapter> getPartitionerAdapter() {
-        checkState(
-                lookupInputPartitioner != null,
-                "Lookup custom shuffle was requested for table %s, but no partitioner could be "
-                        + "created. Ensure '%s' is configured with a positive value.",
-                tablePath,
-                FlinkConnectorOptions.BUCKET_NUMBER.key());
-        return Optional.of(lookupInputPartitioner);
+        return Optional.ofNullable(lookupInputPartitioner);
     }
 
     @Override

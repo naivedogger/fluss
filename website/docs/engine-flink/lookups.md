@@ -283,16 +283,18 @@ Fluss then partitions the lookup probe stream consistently with its bucket routi
 lookup-cache locality and reduces RPC fan-out compared with distributing lookup keys independently
 of Fluss tablets.
 
-- For a non-partitioned table, Fluss routes by bucket. If there are fewer buckets than lookup
-  subtasks, each bucket uses a disjoint subset of subtasks and the complete lookup key is used to
-  balance requests within that subset.
-- Partitioned tables use the same strategy as non-partitioned tables. The partition key is part of
-  the normalized lookup key, so the same lookup key is routed consistently. When there are fewer
-  buckets than lookup subtasks, requests for one `(partition, bucket)` tablet may be handled by
-  multiple subtasks in order to use the configured lookup parallelism.
+- When the bucket and lookup-subtask counts evenly divide each other, Fluss preserves direct bucket
+  affinity: each bucket maps to one subtask, or to an equal-size disjoint subtask subset.
+- Otherwise, Fluss uses weighted logical slots. The complete normalized lookup key selects a slot
+  within its bucket, and logical slots are evenly assigned to subtasks. This keeps routing
+  deterministic and bucket fan-out bounded while balancing the expected load across subtasks.
+- Partitioned and non-partitioned tables use the same strategy. Partition keys are included in the
+  normalized lookup key, so the same lookup key is routed consistently. A `(partition, bucket)`
+  tablet may be accessed by multiple subtasks when weighted logical slots are used.
 
-Lookup custom shuffle requires Fluss to know the table's positive `bucket.num`. Fluss Catalog
-tables expose the resolved bucket number automatically.
+Bucket custom shuffle applies to hash-distributed tables with bucket keys. Tables without bucket
+keys use Flink's default lookup distribution. Fluss Catalog tables expose the resolved `bucket.num`
+automatically.
 
 ## Historical Partition Lookup
 

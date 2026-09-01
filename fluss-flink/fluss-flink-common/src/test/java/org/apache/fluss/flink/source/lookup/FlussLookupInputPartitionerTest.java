@@ -22,8 +22,10 @@ import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.testutils.common.MultiVersionTest;
+import org.apache.fluss.utils.MathUtils;
 
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -49,6 +51,7 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 /**
@@ -154,7 +157,7 @@ class FlussLookupInputPartitionerTest {
     }
 
     @Test
-    void testNonPartitionedRoutingMatchesBucketAndIsDeterministic() {
+    void testDivisibleBucketRoutingMatchesOriginalAssignment() {
         RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
         List<String> bucketKeyNames = Collections.singletonList("id");
         int numBuckets = 8;
@@ -162,7 +165,7 @@ class FlussLookupInputPartitionerTest {
                 partitionerFor(keyRowType, bucketKeyNames, numBuckets);
 
         assertThat(partitioner.isDeterministic()).isTrue();
-        for (int numPartitions : new int[] {1, 2, 3, 5, 8}) {
+        for (int numPartitions : new int[] {1, 2, 4, 8}) {
             Map<Integer, Integer> channelByBucket = new HashMap<>();
             for (int id = 0; id < 100; id++) {
                 RowData key = GenericRowData.of(id);
@@ -188,33 +191,107 @@ class FlussLookupInputPartitionerTest {
     }
 
     @Test
-    void testFewerBucketsThanSubtasksUseAllSubtasks() {
+    void testWeightedLogicalSlotsWithFewerBucketsThanSubtasks() {
         RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
         List<String> bucketKeyNames = Collections.singletonList("id");
-        int numBuckets = 2;
-        int numPartitions = 5;
+        int numBuckets = 3;
+        int numPartitions = 10;
         FlussLookupInputPartitioner partitioner =
                 partitionerFor(keyRowType, bucketKeyNames, numBuckets);
 
+        Map<Integer, Set<Integer>> partitionsByBucket = new HashMap<>();
         Set<Integer> usedPartitions = new HashSet<>();
-        for (int id = 0; id < 1000; id++) {
+        for (int id = 0; id < 10_000; id++) {
             RowData key = GenericRowData.of(id);
             int actual = partitioner.partition(key, numPartitions);
             int bucket = flussBucketOf(keyRowType, bucketKeyNames, key, numBuckets);
 
-            assertThat(actual).as("id=%d, bucket=%d", id, bucket).isBetween(0, numPartitions - 1);
-            assertThat(actual % numBuckets)
-                    .as("the target subtask must belong to bucket %d's candidate set", bucket)
-                    .isEqualTo(bucket);
+            assertThat(actual)
+                    .as("id=%d, bucket=%d", id, bucket)
+                    .isEqualTo(
+                            weightedPartition(
+                                    bucket,
+                                    lookupKeyHash(keyRowType, key),
+                                    numBuckets,
+                                    numPartitions))
+                    .isBetween(0, numPartitions - 1);
             assertThat(partitioner.partition(key, numPartitions))
                     .as("the same lookup key must stay on one subtask")
                     .isEqualTo(actual);
+            partitionsByBucket.computeIfAbsent(bucket, ignored -> new HashSet<>()).add(actual);
             usedPartitions.add(actual);
         }
 
+        assertThat(partitionsByBucket.get(0)).containsExactlyInAnyOrder(0, 1, 2, 3);
+        assertThat(partitionsByBucket.get(1)).containsExactlyInAnyOrder(3, 4, 5, 6);
+        assertThat(partitionsByBucket.get(2)).containsExactlyInAnyOrder(6, 7, 8, 9);
         assertThat(usedPartitions)
-                .as("bucket-aware spreading should make all lookup subtasks usable")
-                .containsExactlyInAnyOrder(0, 1, 2, 3, 4);
+                .as("weighted logical slots should make all lookup subtasks usable")
+                .containsExactlyInAnyOrder(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+        assertLogicalSlotsEvenlyAssigned(numBuckets, numPartitions);
+    }
+
+    @Test
+    void testWeightedLogicalSlotsWithMoreBucketsThanSubtasks() {
+        RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        List<String> bucketKeyNames = Collections.singletonList("id");
+        int numBuckets = 10;
+        int numPartitions = 3;
+        FlussLookupInputPartitioner partitioner =
+                partitionerFor(keyRowType, bucketKeyNames, numBuckets);
+
+        Map<Integer, Set<Integer>> partitionsByBucket = new HashMap<>();
+        for (int id = 0; id < 10_000; id++) {
+            RowData key = GenericRowData.of(id);
+            int bucket = flussBucketOf(keyRowType, bucketKeyNames, key, numBuckets);
+            int actual = partitioner.partition(key, numPartitions);
+
+            assertThat(actual)
+                    .as("id=%d, bucket=%d", id, bucket)
+                    .isEqualTo(
+                            weightedPartition(
+                                    bucket,
+                                    lookupKeyHash(keyRowType, key),
+                                    numBuckets,
+                                    numPartitions))
+                    .isBetween(0, numPartitions - 1);
+            partitionsByBucket.computeIfAbsent(bucket, ignored -> new HashSet<>()).add(actual);
+        }
+
+        assertThat(partitionsByBucket.get(0)).containsExactly(0);
+        assertThat(partitionsByBucket.get(1)).containsExactly(0);
+        assertThat(partitionsByBucket.get(2)).containsExactly(0);
+        assertThat(partitionsByBucket.get(3)).containsExactlyInAnyOrder(0, 1);
+        assertThat(partitionsByBucket.get(4)).containsExactly(1);
+        assertThat(partitionsByBucket.get(5)).containsExactly(1);
+        assertThat(partitionsByBucket.get(6)).containsExactlyInAnyOrder(1, 2);
+        assertThat(partitionsByBucket.get(7)).containsExactly(2);
+        assertThat(partitionsByBucket.get(8)).containsExactly(2);
+        assertThat(partitionsByBucket.get(9)).containsExactly(2);
+        assertLogicalSlotsEvenlyAssigned(numBuckets, numPartitions);
+    }
+
+    @Test
+    void testDivisibleLowBucketRoutingPreservesRoundRobinAssignment() {
+        RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        List<String> bucketKeyNames = Collections.singletonList("id");
+        int numBuckets = 2;
+        int numPartitions = 6;
+        FlussLookupInputPartitioner partitioner =
+                partitionerFor(keyRowType, bucketKeyNames, numBuckets);
+
+        Map<Integer, Set<Integer>> partitionsByBucket = new HashMap<>();
+        for (int id = 0; id < 1000; id++) {
+            RowData key = GenericRowData.of(id);
+            int bucket = flussBucketOf(keyRowType, bucketKeyNames, key, numBuckets);
+            int actual = partitioner.partition(key, numPartitions);
+
+            assertThat(actual % numBuckets).isEqualTo(bucket);
+            partitionsByBucket.computeIfAbsent(bucket, ignored -> new HashSet<>()).add(actual);
+        }
+
+        assertThat(partitionsByBucket.get(0)).containsExactlyInAnyOrder(0, 2, 4);
+        assertThat(partitionsByBucket.get(1)).containsExactlyInAnyOrder(1, 3, 5);
     }
 
     @Test
@@ -246,6 +323,30 @@ class FlussLookupInputPartitionerTest {
         assertThat(partitioner.partition(GenericRowData.of(null, 1), 4)).isZero();
         assertThat(partitioner.partition(GenericRowData.of(1, null), 4)).isZero();
         assertThat(partitioner.partition(GenericRowData.of(null, null), 4)).isZero();
+    }
+
+    @Test
+    void testRejectsInvalidBucketKeys() {
+        RowType keyRowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        LookupNormalizer normalizer =
+                LookupNormalizer.createPrimaryKeyLookupNormalizer(new int[] {0}, keyRowType);
+
+        assertThatThrownBy(
+                        () ->
+                                new FlussLookupInputPartitioner(
+                                        normalizer, keyRowType, Collections.emptyList(), null, 1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be a non-empty subset of lookup keys");
+        assertThatThrownBy(
+                        () ->
+                                new FlussLookupInputPartitioner(
+                                        normalizer,
+                                        keyRowType,
+                                        Collections.singletonList("missing"),
+                                        null,
+                                        1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be a non-empty subset of lookup keys");
     }
 
     @Test
@@ -378,7 +479,7 @@ class FlussLookupInputPartitionerTest {
                         new LogicalType[] {new VarCharType(VarCharType.MAX_LENGTH)},
                         new String[] {"region"});
         List<String> bucketKeyNames = Collections.singletonList("region");
-        int numPartitions = 3;
+        int numPartitions = 5;
         for (int i = 0; i < 40; i++) {
             RowData joinKeys = GenericRowData.of(StringData.fromString("region-" + i));
             int actual = partitioner.partition(joinKeys, numPartitions);
@@ -428,7 +529,7 @@ class FlussLookupInputPartitionerTest {
                         new LogicalType[] {new VarCharType(VarCharType.MAX_LENGTH), new IntType()},
                         new String[] {"region", "id"});
         List<String> bucketKeyNames = Arrays.asList("region", "id");
-        int numPartitions = 4;
+        int numPartitions = 7;
         for (int id = 0; id < 40; id++) {
             StringData region = StringData.fromString("region-" + (id % 5));
             // probe delivers the join key row in ascending field order (id, region)
@@ -472,5 +573,46 @@ class FlussLookupInputPartitionerTest {
         }
         return new FlussLookupInputPartitioner(
                 normalizer, keyRowType, bucketKeyNames, /* lakeFormat */ null, numBuckets);
+    }
+
+    private static int lookupKeyHash(RowType keyRowType, RowData key) {
+        org.apache.fluss.types.RowType flussKeyType = FlinkConversions.toFlussRowType(keyRowType);
+        KeyEncoder encoder =
+                CompactedKeyEncoder.createKeyEncoder(flussKeyType, keyRowType.getFieldNames());
+        byte[] bytes = encoder.encodeKey(new FlinkAsFlussRow().replace(key));
+        return MathUtils.murmurHash(Arrays.hashCode(bytes));
+    }
+
+    private static int weightedPartition(
+            int bucketId, int lookupKeyHash, int numBuckets, int numPartitions) {
+        int gcd = greatestCommonDivisor(numBuckets, numPartitions);
+        int slotsPerBucket = numPartitions / gcd;
+        int slotsPerSubtask = numBuckets / gcd;
+        int slotWithinBucket = lookupKeyHash % slotsPerBucket;
+        long logicalSlot = (long) bucketId * slotsPerBucket + slotWithinBucket;
+        return (int) (logicalSlot / slotsPerSubtask);
+    }
+
+    private static void assertLogicalSlotsEvenlyAssigned(int numBuckets, int numPartitions) {
+        int gcd = greatestCommonDivisor(numBuckets, numPartitions);
+        int slotsPerBucket = numPartitions / gcd;
+        int slotsPerSubtask = numBuckets / gcd;
+        int[] assignedSlots = new int[numPartitions];
+        for (int bucketId = 0; bucketId < numBuckets; bucketId++) {
+            for (int slotWithinBucket = 0; slotWithinBucket < slotsPerBucket; slotWithinBucket++) {
+                long logicalSlot = (long) bucketId * slotsPerBucket + slotWithinBucket;
+                assignedSlots[(int) (logicalSlot / slotsPerSubtask)]++;
+            }
+        }
+        assertThat(assignedSlots).containsOnly(slotsPerSubtask);
+    }
+
+    private static int greatestCommonDivisor(int first, int second) {
+        while (second != 0) {
+            int remainder = first % second;
+            first = second;
+            second = remainder;
+        }
+        return first;
     }
 }

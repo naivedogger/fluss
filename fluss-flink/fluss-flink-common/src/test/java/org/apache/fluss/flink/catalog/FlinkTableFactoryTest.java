@@ -191,16 +191,17 @@ abstract class FlinkTableFactoryTest {
     }
 
     @Test
-    void testLookupCustomShuffleRequiresBucketNumber() {
+    void testLookupCustomShuffleEligibilityUsesBucketKeys() {
         ResolvedSchema schema = createBasicSchema();
-        FlinkTableSource tableSource =
+        FlinkTableSource hashDistributedSource =
                 (FlinkTableSource) createTableSource(schema, getBasicOptionsWithBucketKey());
-        tableSource.getLookupRuntimeProvider(createLookupContext(new int[][] {{0}, {2}}));
+        hashDistributedSource.getLookupRuntimeProvider(createLookupContext(new int[][] {{0}, {2}}));
+        assertThat(hashDistributedSource.getPartitionerAdapter()).isPresent();
 
-        assertThatThrownBy(tableSource::getPartitionerAdapter)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Lookup custom shuffle was requested")
-                .hasMessageContaining(BUCKET_NUMBER.key());
+        FlinkTableSource randomlyDistributedSource =
+                (FlinkTableSource) createTableSource(schema, getBasicOptions());
+        assertThat(randomlyDistributedSource.getBucketKeyIndexes()).isEmpty();
+        assertThat(randomlyDistributedSource.getPartitionerAdapter()).isEmpty();
     }
 
     @Test
@@ -322,6 +323,7 @@ abstract class FlinkTableFactoryTest {
     private static Map<String, String> getBasicOptionsWithBucketKey() {
         Map<String, String> basicOptions = getBasicOptions();
         basicOptions.put(BUCKET_KEY.key(), "first");
+        basicOptions.put(BUCKET_NUMBER.key(), "1");
         return basicOptions;
     }
 

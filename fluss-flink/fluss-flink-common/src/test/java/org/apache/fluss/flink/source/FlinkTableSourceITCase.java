@@ -780,7 +780,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
 
     @ParameterizedTest(name = "bucket.num={0}")
     @MultiVersionTest
-    @ValueSource(ints = {1, 8})
+    @ValueSource(ints = {1, 3, 8, 10})
     void testLookupCustomShuffle(int numBuckets) throws Exception {
         assumeThat(supportsLookupCustomShuffle()).isTrue();
 
@@ -870,7 +870,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                             .isEqualTo(previousSubtask);
                 }
 
-                if (numBuckets >= parallelism) {
+                if (numBuckets >= parallelism && numBuckets % parallelism == 0) {
                     int bucketId = expectedPartitioner.partition(GenericRowData.of(id), numBuckets);
                     Integer previousBucketSubtask =
                             subtaskByBucket.putIfAbsent(bucketId, actualSubtask);
