@@ -1104,6 +1104,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluss-lake"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "fluss-rs",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "fluss-rs"
 version = "1.0.0"
 dependencies = [

@@ -29,6 +29,7 @@ categories = { workspace = true }
 [dependencies]
 arrow = { workspace = true }
 fluss = { package = "fluss-rs", path = "../fluss" }
+futures = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "1.0"

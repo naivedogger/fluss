@@ -17,7 +17,8 @@
 
 //! FIP-48 table, scan, and reader APIs.
 
-use crate::{FlussLakeError, Result};
+use crate::planner::plan_union_read;
+use crate::{FlussLakeError, FlussLakeReadPlan, Result};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
@@ -116,7 +117,6 @@ impl Debug for FlussLakeTable {
 /// This is the planner and reader input itself; it is not translated through a
 /// second request model before planning or execution.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
     table_path: TablePath,
@@ -127,7 +127,6 @@ pub struct FlussLakeScan {
     catalog_property_overrides: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl FlussLakeScan {
     /// Restricts output to table field indexes, in the requested order.
     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
@@ -160,6 +159,11 @@ impl FlussLakeScan {
     pub fn with_lake_only(mut self, lake_only: bool) -> Self {
         self.lake_only = lake_only;
         self
+    }
+
+    /// Freezes the readable lake snapshot and bounded log ranges.
+    pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
+        plan_union_read(self).await
     }
 
     pub(crate) fn connection(&self) -> &Arc<FlussConnection> {
@@ -217,6 +221,7 @@ impl FlussLakeScan {
         self.filter.as_ref()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn batch_size(&self) -> Option<usize> {
         self.batch_size
     }
