@@ -21,6 +21,7 @@
 
 mod bucket_pruning;
 mod error;
+mod executor;
 #[cfg(feature = "paimon")]
 mod paimon;
 mod plan;
@@ -35,7 +36,7 @@ pub use error::{FlussLakeError, Result};
 pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
 pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;
 pub use split::{FlussLakePartitionIdentity, FlussLakeReadSplit};
-pub use table::{FlussLakeScan, FlussLakeTable};
+pub use table::{FlussLakeReader, FlussLakeScan, FlussLakeTable};
 
 use arrow::record_batch::RecordBatch;
 use futures::Stream;

@@ -17,12 +17,14 @@
 
 //! FIP-48 table, scan, and reader APIs.
 
+use crate::executor::execute_split;
 use crate::planner::plan_union_read;
-use crate::{FlussLakeError, FlussLakeReadPlan, Result};
+use crate::{FlussLakeError, FlussLakeReadPlan, FlussLakeReadSplit, RecordBatchStream, Result};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
 use fluss::predicate::Predicate;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -166,6 +168,11 @@ impl FlussLakeScan {
         plan_union_read(self).await
     }
 
+    /// Creates a reusable reader using this scan's immutable configuration.
+    pub fn new_reader(&self) -> FlussLakeReader {
+        FlussLakeReader { scan: self.clone() }
+    }
+
     pub(crate) fn connection(&self) -> &Arc<FlussConnection> {
         &self.connection
     }
@@ -221,7 +228,6 @@ impl FlussLakeScan {
         self.filter.as_ref()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn batch_size(&self) -> Option<usize> {
         self.batch_size
     }
@@ -275,6 +281,48 @@ impl Debug for FlussLakeScan {
     }
 }
 
+/// Reusable bounded reader created by [`FlussLakeScan`].
+#[derive(Clone)]
+pub struct FlussLakeReader {
+    scan: FlussLakeScan,
+}
+
+impl FlussLakeReader {
+    /// Reads one logical split as a finite Arrow batch stream.
+    ///
+    /// The stream terminates after its first error. In particular,
+    /// [`FlussLakeError::DataUnavailable`] invalidates this plan attempt and no
+    /// later rows from the same split are emitted.
+    pub async fn read_split(&self, split: &FlussLakeReadSplit) -> Result<RecordBatchStream> {
+        execute_split(split.clone(), &self.scan).map(stop_after_first_error)
+    }
+
+    /// Reads all logical splits as one unordered finite stream.
+    ///
+    /// The first split error terminates the merged stream and drops every
+    /// sibling stream. If that error is [`FlussLakeError::DataUnavailable`],
+    /// callers must discard rows already produced by this plan, create a new
+    /// plan, and execute it from the beginning.
+    pub async fn read_splits(&self, splits: &[FlussLakeReadSplit]) -> Result<RecordBatchStream> {
+        let streams = splits
+            .iter()
+            .map(|split| execute_split(split.clone(), &self.scan))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(stop_after_first_error(Box::pin(
+            futures::stream::select_all(streams),
+        )))
+    }
+}
+
+impl Debug for FlussLakeReader {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FlussLakeReader")
+            .field("scan", &self.scan)
+            .finish()
+    }
+}
+
 pub(crate) fn validate_lake_readable(table_info: &TableInfo) -> Result<()> {
     match table_info.table_config.is_datalake_enabled() {
         Ok(true) => {}
@@ -313,10 +361,89 @@ fn table_client_error(action: &str, error: ClientError) -> FlussLakeError {
     }
 }
 
+/// Makes the first stream error terminal and immediately drops the source.
+///
+/// This is especially important for `read_splits`: dropping `select_all`
+/// cancels every sibling split as soon as one split invalidates the attempt.
+fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
+    Box::pin(futures::stream::unfold(Some(stream), |stream| async move {
+        let mut stream = stream?;
+        match stream.next().await {
+            Some(Ok(batch)) => Some((Ok(batch), Some(stream))),
+            Some(Err(error)) => Some((Err(error), None)),
+            None => None,
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Array, ArrayRef, Int32Array};
     use fluss::metadata::{DataTypes, Schema};
+    use futures::TryStreamExt;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn reader_is_send_and_sync() {
+        assert_send_sync::<FlussLakeReader>();
+    }
+
+    #[test]
+    fn multiple_split_streams_are_exposed_as_one_stream() {
+        let batch = |value| {
+            arrow::record_batch::RecordBatch::try_from_iter(vec![(
+                "id",
+                Arc::new(Int32Array::from(vec![value])) as ArrayRef,
+            )])
+            .unwrap()
+        };
+        let streams: Vec<RecordBatchStream> = vec![
+            Box::pin(futures::stream::iter(vec![Ok(batch(1))])),
+            Box::pin(futures::stream::iter(vec![Ok(batch(2))])),
+        ];
+
+        let batches: Vec<_> =
+            futures::executor::block_on(futures::stream::select_all(streams).try_collect())
+                .unwrap();
+        let mut values: Vec<i32> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect();
+        values.sort_unstable();
+
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn reader_stream_stops_after_the_first_error() {
+        let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )])
+        .unwrap();
+        let source: RecordBatchStream = Box::pin(futures::stream::iter(vec![
+            Ok(batch.clone()),
+            Err(FlussLakeError::DataUnavailable(
+                "planned range expired".to_string(),
+            )),
+            Ok(batch),
+        ]));
+
+        let items = futures::executor::block_on(stop_after_first_error(source).collect::<Vec<_>>());
+
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(matches!(items[1], Err(FlussLakeError::DataUnavailable(_))));
+    }
 
     #[test]
     fn preconfigured_lake_format_is_not_readable_until_enabled() {
