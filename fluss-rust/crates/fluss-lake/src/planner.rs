@@ -258,7 +258,7 @@ fn physical_primary_key_indexes(table_info: &TableInfo) -> Result<Vec<usize>> {
         .collect()
 }
 
-#[cfg(any())]
+#[cfg(feature = "paimon")]
 struct PlannedLakeSide {
     snapshot_id: i64,
     splits: std::collections::HashMap<(crate::FlussLakePartitionIdentity, i32), PlannedLakeBucket>,
@@ -281,7 +281,7 @@ impl Default for PlannedLakeBucket {
     }
 }
 
-#[cfg(any())]
+#[cfg(feature = "paimon")]
 async fn plan_lake_side(
     scan: &FlussLakeScan,
     table_info: &TableInfo,
@@ -352,13 +352,13 @@ async fn plan_lake_side(
     })
 }
 
-#[cfg(not(any()))]
+#[cfg(not(feature = "paimon"))]
 struct PlannedLakeSide {
     snapshot_id: i64,
     splits: std::collections::HashMap<(crate::FlussLakePartitionIdentity, i32), PlannedLakeBucket>,
 }
 
-#[cfg(not(any()))]
+#[cfg(not(feature = "paimon"))]
 async fn plan_lake_side(
     scan: &FlussLakeScan,
     _table_info: &TableInfo,
@@ -438,7 +438,7 @@ mod tests {
     /// Catalog configuration belongs to the scan-derived reader and must not
     /// be duplicated into distributable splits.
     #[test]
-    #[cfg(any())]
+    #[cfg(feature = "paimon")]
     fn catalog_configuration_never_reaches_encoded_split_bytes() {
         use crate::split_descriptor::SplitDescriptor;
         use fluss::metadata::TableBucket;

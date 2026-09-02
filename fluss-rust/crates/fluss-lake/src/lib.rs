@@ -21,6 +21,8 @@
 
 mod bucket_pruning;
 mod error;
+#[cfg(feature = "paimon")]
+mod paimon;
 mod plan;
 mod planner;
 mod planning;
