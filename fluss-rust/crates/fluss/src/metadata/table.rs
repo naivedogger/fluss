@@ -1225,6 +1225,32 @@ pub struct TableConfig {
     pub properties: HashMap<String, String>,
 }
 
+/// Merge engine configured for a primary-key table.
+///
+/// The absence of `table.merge-engine` is the ordinary deduplicate/upsert
+/// behavior. These explicit engines require semantics different from the
+/// deduplicate current-view reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[strum(ascii_case_insensitive)]
+pub enum MergeEngineType {
+    #[strum(serialize = "first_row")]
+    FirstRow,
+    #[strum(serialize = "versioned")]
+    Versioned,
+    #[strum(serialize = "aggregation")]
+    Aggregation,
+}
+
+impl Display for MergeEngineType {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FirstRow => "first_row",
+            Self::Versioned => "versioned",
+            Self::Aggregation => "aggregation",
+        })
+    }
+}
+
 impl TableConfig {
     pub fn from_properties(properties: HashMap<String, String>) -> Self {
         TableConfig { properties }
@@ -1290,6 +1316,20 @@ impl TableConfig {
             .map(String::as_str)
             .unwrap_or(DEFAULT_LOG_FORMAT);
         LogFormat::parse(log_format)
+    }
+
+    /// Returns the explicitly configured primary-key merge engine.
+    ///
+    /// `None` is the default deduplicate/upsert behavior.
+    pub fn get_merge_engine_type(&self) -> Result<Option<MergeEngineType>> {
+        self.properties
+            .get("table.merge-engine")
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    Error::invalid_table(format!("Invalid table.merge-engine {value:?}: {error}"))
+                })
+            })
+            .transpose()
     }
 
     pub fn get_auto_partition_strategy(&self) -> AutoPartitionStrategy {
@@ -1678,6 +1718,34 @@ impl LakeSnapshot {
 mod tests {
     use super::*;
     use crate::metadata::DataTypes;
+
+    #[test]
+    fn table_config_parses_explicit_merge_engines_and_keeps_default_deduplicate() {
+        let default = TableConfig::from_properties(HashMap::new());
+        assert_eq!(default.get_merge_engine_type().unwrap(), None);
+
+        for (value, expected) in [
+            ("first_row", MergeEngineType::FirstRow),
+            ("VERSIONED", MergeEngineType::Versioned),
+            ("aggregation", MergeEngineType::Aggregation),
+        ] {
+            let config = TableConfig::from_properties(HashMap::from([(
+                "table.merge-engine".to_string(),
+                value.to_string(),
+            )]));
+            assert_eq!(config.get_merge_engine_type().unwrap(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn table_config_rejects_unknown_merge_engine() {
+        let config = TableConfig::from_properties(HashMap::from([(
+            "table.merge-engine".to_string(),
+            "deduplicate".to_string(),
+        )]));
+
+        assert!(config.get_merge_engine_type().is_err());
+    }
 
     #[test]
     fn table_config_distinguishes_lake_format_from_lake_enablement() {

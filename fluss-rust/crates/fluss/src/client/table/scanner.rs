@@ -2059,11 +2059,10 @@ impl LogFetcher {
                     return Ok(None);
                 }
                 FetchErrorAction::LogOffsetOutOfRange => {
-                    return Err(Error::UnexpectedError {
+                    return Err(Error::LogOffsetOutOfRange {
                         message: format!(
                             "The fetching offset {fetch_offset} is out of range: {error_message}"
                         ),
-                        source: None,
                     });
                 }
                 FetchErrorAction::Authorization => {
