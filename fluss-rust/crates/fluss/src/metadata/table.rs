@@ -1230,6 +1230,21 @@ impl TableConfig {
         TableConfig { properties }
     }
 
+    /// Returns whether lake storage is enabled for the table.
+    ///
+    /// A table may preconfigure `table.datalake.format` while leaving lake
+    /// storage disabled, so callers must not infer enablement from the format.
+    pub fn is_datalake_enabled(&self) -> Result<bool> {
+        match self.properties.get("table.datalake.enabled") {
+            None => Ok(false),
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            Some(value) => Err(Error::invalid_table(format!(
+                "Invalid table.datalake.enabled {value:?}: expected true or false"
+            ))),
+        }
+    }
+
     pub fn get_arrow_compression_info(&self) -> Result<ArrowCompressionInfo> {
         ArrowCompressionInfo::from_conf(&self.properties)
     }
@@ -1663,6 +1678,35 @@ impl LakeSnapshot {
 mod tests {
     use super::*;
     use crate::metadata::DataTypes;
+
+    #[test]
+    fn table_config_distinguishes_lake_format_from_lake_enablement() {
+        let format_only = TableConfig::from_properties(HashMap::from([(
+            "table.datalake.format".to_string(),
+            "paimon".to_string(),
+        )]));
+        assert!(!format_only.is_datalake_enabled().unwrap());
+        assert_eq!(
+            format_only.get_datalake_format().unwrap(),
+            Some(DataLakeFormat::Paimon)
+        );
+
+        let enabled = TableConfig::from_properties(HashMap::from([
+            ("table.datalake.enabled".to_string(), "TRUE".to_string()),
+            ("table.datalake.format".to_string(), "paimon".to_string()),
+        ]));
+        assert!(enabled.is_datalake_enabled().unwrap());
+    }
+
+    #[test]
+    fn table_config_rejects_invalid_lake_enablement() {
+        let config = TableConfig::from_properties(HashMap::from([(
+            "table.datalake.enabled".to_string(),
+            "yes".to_string(),
+        )]));
+
+        assert!(config.is_datalake_enabled().is_err());
+    }
 
     #[test]
     fn auto_increment_column_requires_a_primary_key_table() {
