@@ -238,6 +238,7 @@ impl<'a> TableScan<'a> {
 
     /// Rejects a full KV scan on a log table or when a limit is configured.
     fn ensure_kv_scan_supported(&self) -> Result<()> {
+        self.reject_filter("KV scanner")?;
         if !self.table_info.has_primary_key() {
             return Err(Error::UnsupportedOperation {
                 message: format!(
@@ -297,40 +298,44 @@ impl<'a> TableScan<'a> {
         ))
     }
 
-    /// Creates a full scan of an entire non-partitioned primary-key table,
-    /// scanning every bucket sequentially via the `ScanKv` RPC.
+    /// Creates a full scan of an entire primary-key table, scanning every
+    /// `(partition, bucket)` sequentially via the `ScanKv` RPC.
     ///
-    /// Requires a primary-key table and no configured limit. Partitioned tables
-    /// are not yet supported here; scan each `(partition, bucket)` explicitly
-    /// with [`Self::create_bucket_kv_scanner`].
-    pub fn create_kv_scanner(self) -> Result<KvSnapshotScanner> {
+    /// Requires a primary-key table and no configured limit or filter. For a
+    /// partitioned table, partition metadata is resolved once when the scanner
+    /// is created.
+    pub async fn create_kv_scanner(self) -> Result<KvSnapshotScanner> {
         self.ensure_kv_scan_supported()?;
-        if self.table_info.is_partitioned() {
-            return Err(Error::UnsupportedOperation {
-                message: format!(
-                    "Whole-table KV scan over partitioned tables is not yet supported; scan each (partition, bucket) with create_bucket_kv_scanner. Table: {}",
-                    self.table_info.table_path
-                ),
-            });
-        }
         let schema_getter = self.build_kv_schema_getter()?;
         let batch_size_bytes = self.conn.config().scanner_kv_fetch_max_bytes;
         let rpc_client = self.conn.get_connections();
         let table_id = self.table_info.table_id;
         let num_buckets = self.table_info.get_num_buckets();
-        let scanners = (0..num_buckets)
-            .map(|bucket_id| {
-                KvBatchScanner::new(
+        let partition_ids = if self.table_info.is_partitioned() {
+            self.conn
+                .get_admin()?
+                .list_partition_infos(&self.table_info.table_path)
+                .await?
+                .into_iter()
+                .map(|partition| Some(partition.get_partition_id()))
+                .collect()
+        } else {
+            vec![None]
+        };
+        let mut scanners = Vec::with_capacity(partition_ids.len() * num_buckets as usize);
+        for partition_id in partition_ids {
+            for bucket_id in 0..num_buckets {
+                scanners.push(KvBatchScanner::new(
                     rpc_client.clone(),
                     self.metadata.clone(),
                     self.table_info.clone(),
                     schema_getter.clone(),
                     self.projected_fields.clone(),
-                    TableBucket::new(table_id, bucket_id),
+                    TableBucket::new_with_partition(table_id, partition_id, bucket_id),
                     batch_size_bytes,
-                )
-            })
-            .collect();
+                ));
+            }
+        }
         Ok(KvSnapshotScanner::new(scanners))
     }
 

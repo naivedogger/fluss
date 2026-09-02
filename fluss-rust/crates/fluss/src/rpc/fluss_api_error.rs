@@ -177,7 +177,7 @@ pub enum FlussError {
     UnknownScannerId = 67,
     /// The scan request is invalid.
     InvalidScanRequest = 68,
-    /// Too many concurrent scanner sessions; retry later.
+    /// The per-bucket or per-server scanner session limit has been reached.
     TooManyScanners = 69,
     /// The KV storage engine rejected a write due to backpressure.
     StorageBackpressureException = 72,
@@ -312,7 +312,9 @@ impl FlussError {
             FlussError::ScannerExpired => "The scanner session has expired due to inactivity.",
             FlussError::UnknownScannerId => "The scanner id is not recognized by the server.",
             FlussError::InvalidScanRequest => "The scan request is invalid.",
-            FlussError::TooManyScanners => "Too many concurrent scanner sessions; retry later.",
+            FlussError::TooManyScanners => {
+                "The per-bucket or per-server scanner session limit has been reached."
+            }
             FlussError::StorageBackpressureException => {
                 "The tablet server has rejected the write because the KV storage engine has reached its write-pressure threshold."
             }
@@ -437,6 +439,8 @@ mod tests {
             FlussError::for_code(72),
             FlussError::StorageBackpressureException
         );
+        assert_eq!(FlussError::for_code(66), FlussError::ScannerExpired);
+        assert_eq!(FlussError::for_code(69), FlussError::TooManyScanners);
         assert_eq!(FlussError::for_code(9999), FlussError::UnknownServerError);
     }
 
@@ -521,6 +525,10 @@ mod tests {
             FlussError::FencedLeaderEpochException,
             FlussError::FencedTieringEpochException,
             FlussError::RetriableAuthenticateException,
+            FlussError::ScannerExpired,
+            FlussError::UnknownScannerId,
+            FlussError::InvalidScanRequest,
+            FlussError::TooManyScanners,
         ];
         for err in &non_retriable {
             assert!(!err.is_retriable(), "{err:?} should not be retriable");

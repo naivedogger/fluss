@@ -587,6 +587,15 @@ mod tests {
     }
 
     #[test]
+    fn test_scanner_kv_fetch_max_bytes_zero() {
+        let config = Config {
+            scanner_kv_fetch_max_bytes: 0,
+            ..Config::default()
+        };
+        assert!(config.validate_scanner().is_err());
+    }
+
+    #[test]
     fn test_scanner_fetch_negative_wait() {
         let config = Config {
             scanner_log_fetch_wait_max_time_ms: -1,
