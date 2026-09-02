@@ -20,14 +20,21 @@ use crate::table::FlussLakeScan;
 use crate::{FlussLakeError, FlussLakeReadSplit, RecordBatchStream, Result};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
-use fluss::client::{FlussTable, RecordBatchLogReader};
+use fluss::client::{DeduplicateCurrentView, FlussTable, RecordBatchLogReader};
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableBucket};
 use fluss::predicate::{BoundPredicate, Predicate};
+use fluss::record::ChangeType;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+
+/// Poll interval used while folding a bounded changelog tail.
+///
+/// This is only the duration of one scanner poll. It is not a UnionRead
+/// no-progress deadline; cancellation and query timeouts belong to the caller.
+const TAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Executes one opaque split with the configuration held by its scan.
 pub(crate) fn execute_split(
@@ -109,10 +116,16 @@ async fn open_logical_stream(
         ));
     }
     if descriptor.is_primary_key() {
-        return Err(FlussLakeError::UnsupportedMergeEngine(format!(
-            "primary-key UnionRead execution is not implemented yet for table {}",
-            descriptor.table_path()
-        )));
+        let mut current_view =
+            DeduplicateCurrentView::try_new(physical_schema, physical.key_positions.clone())
+                .map_err(reconciliation_error)?;
+        fold_logical_changelog_tail(&table, &descriptor, &physical, &mut current_view).await?;
+        return Ok(apply_output_processing(
+            reconciled_stream(current_view, lake_stream),
+            &filter,
+            output_column_count,
+            batch_size,
+        ));
     }
 
     let log_stream = normalize_stream_schema(
@@ -233,14 +246,62 @@ async fn open_logical_append_log_stream(
     })))
 }
 
+async fn fold_logical_changelog_tail(
+    table: &FlussTable<'_>,
+    descriptor: &SplitDescriptor,
+    physical: &PhysicalProjection,
+    current_view: &mut DeduplicateCurrentView,
+) -> Result<()> {
+    if descriptor.start_offset() == descriptor.stop_offset() {
+        return Ok(());
+    }
+    let scanner = table
+        .new_scan()
+        .project(&physical.field_indexes)
+        .map_err(|error| execution_client_error("apply changelog projection", error))?
+        .create_log_scanner()
+        .map_err(|error| execution_client_error("create changelog scanner", error))?;
+    let table_bucket = descriptor.table_bucket().clone();
+    match table_bucket.partition_id() {
+        Some(partition_id) => scanner
+            .subscribe_partition(
+                partition_id,
+                table_bucket.bucket_id(),
+                descriptor.start_offset(),
+            )
+            .await
+            .map_err(|error| execution_client_error("subscribe partition bucket", error))?,
+        None => scanner
+            .subscribe(table_bucket.bucket_id(), descriptor.start_offset())
+            .await
+            .map_err(|error| execution_client_error("subscribe table bucket", error))?,
+    }
+
+    let mut next_offset = descriptor.start_offset();
+    while next_offset < descriptor.stop_offset() {
+        let records = scanner
+            .poll(TAIL_POLL_INTERVAL)
+            .await
+            .map_err(|error| execution_client_error("poll bounded changelog tail", error))?;
+        let bucket_records = records.records(&table_bucket);
+        if bucket_records.is_empty() {
+            continue;
+        }
+        next_offset = fold_tail_records(
+            bucket_records,
+            next_offset,
+            descriptor.stop_offset(),
+            current_view,
+        )?;
+    }
+    Ok(())
+}
+
 /// Physical columns are ordered as engine output, predicate-only columns,
 /// then primary-key-only columns. The reader filters first and strips the
 /// hidden suffix only after exact filtering.
 struct PhysicalProjection {
     field_indexes: Vec<usize>,
-    /// The positions of the physical primary-key columns inside
-    /// `field_indexes`. Populated in the deduplicate primary-key PR.
-    #[allow(dead_code)]
     key_positions: Vec<usize>,
 }
 
@@ -271,9 +332,15 @@ impl PhysicalProjection {
                 field_indexes.push(*primary_key_index);
             }
         }
-        // The actual key positions are resolved by the deduplicate
-        // primary-key execution PR.
-        let key_positions = Vec::new();
+        let key_positions = primary_key_indexes
+            .iter()
+            .map(|primary_key_index| {
+                field_indexes
+                    .iter()
+                    .position(|field_index| field_index == primary_key_index)
+                    .expect("primary-key columns were included in the physical projection")
+            })
+            .collect();
         Ok(Self {
             field_indexes,
             key_positions,
@@ -295,6 +362,113 @@ impl PhysicalProjection {
                 ))
             })
     }
+}
+
+/// Folds one poll's records, returning the next unread offset.
+///
+/// Records are grouped into runs sharing an Arrow batch so that keys are
+/// encoded per batch rather than per row. Records at or beyond the frozen
+/// stop offset are discarded: the boundary belongs to the plan, and a server
+/// that returns more must not widen the result.
+fn fold_tail_records(
+    records: &[fluss::record::ScanRecord],
+    next_offset: i64,
+    stop_offset: i64,
+    current_view: &mut DeduplicateCurrentView,
+) -> Result<i64> {
+    let mut next_offset = next_offset;
+    // Records of one poll arrive grouped by their backing Arrow batch, so
+    // runs are detected by batch identity (address comparison only — the
+    // records keep every batch alive for the whole loop).
+    let mut run_source: Option<*const RecordBatch> = None;
+    let mut run_batch: Option<RecordBatch> = None;
+    let mut run_rows: Vec<usize> = Vec::new();
+    let mut run_change_types: Vec<ChangeType> = Vec::new();
+
+    for record in records {
+        if record.offset() < next_offset {
+            continue;
+        }
+        if next_offset >= stop_offset {
+            break;
+        }
+        if record.offset() != next_offset {
+            return Err(FlussLakeError::DataUnavailable(format!(
+                "bounded changelog tail expected offset {next_offset}, but the next returned record was at offset {}; the frozen range [{}, {}) is no longer complete",
+                record.offset(),
+                next_offset,
+                stop_offset
+            )));
+        }
+        let row = record.row();
+        let batch = row.get_record_batch().ok_or_else(|| {
+            FlussLakeError::Internal(
+                "changelog record has no backing Arrow batch; the ARROW log format is required to merge a primary-key table"
+                    .to_string(),
+            )
+        })?;
+        let batch_address = batch as *const RecordBatch;
+        if run_source != Some(batch_address) {
+            flush_tail_run(
+                &mut run_batch,
+                &mut run_rows,
+                &mut run_change_types,
+                current_view,
+            )?;
+            run_source = Some(batch_address);
+            run_batch = Some(batch.clone());
+        }
+        run_rows.push(row.get_row_id());
+        run_change_types.push(*record.change_type());
+        next_offset = record.offset() + 1;
+    }
+    flush_tail_run(
+        &mut run_batch,
+        &mut run_rows,
+        &mut run_change_types,
+        current_view,
+    )?;
+    Ok(next_offset)
+}
+
+fn flush_tail_run(
+    run_batch: &mut Option<RecordBatch>,
+    run_rows: &mut Vec<usize>,
+    run_change_types: &mut Vec<ChangeType>,
+    current_view: &mut DeduplicateCurrentView,
+) -> Result<()> {
+    let Some(batch) = run_batch.take() else {
+        return Ok(());
+    };
+    if run_rows.is_empty() {
+        return Ok(());
+    }
+    // The polled batch may cover offsets outside the frozen range, so only
+    // the selected rows are folded, in offset order.
+    let selected = take_rows(&batch, run_rows)?;
+    current_view
+        .fold_changelog_batch(selected, run_change_types)
+        .map_err(reconciliation_error)?;
+    run_rows.clear();
+    run_change_types.clear();
+    Ok(())
+}
+
+fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> Result<RecordBatch> {
+    // The common case is a run covering the whole batch in order, which needs
+    // no copy at all.
+    if row_indexes.len() == batch.num_rows()
+        && row_indexes
+            .iter()
+            .enumerate()
+            .all(|(position, row)| position == *row)
+    {
+        return Ok(batch.clone());
+    }
+    let indices: Vec<(usize, usize)> = row_indexes.iter().map(|row| (0, *row)).collect();
+    arrow::compute::interleave_record_batch(&[batch], &indices).map_err(|error| {
+        FlussLakeError::Internal(format!("failed to select changelog tail rows: {error}"))
+    })
 }
 
 /// Rejects a split whose frozen identity no longer matches the live table.
@@ -333,6 +507,77 @@ where
     F: Future<Output = Result<RecordBatchStream>> + Send + 'static,
 {
     Box::pin(futures::stream::once(setup).try_flatten())
+}
+
+/// Reconciles a source-neutral deduplicate state with a lake baseline stream.
+fn reconciled_stream(
+    current_view: DeduplicateCurrentView,
+    baseline_stream: RecordBatchStream,
+) -> RecordBatchStream {
+    enum Phase {
+        Baseline {
+            current_view: DeduplicateCurrentView,
+            stream: RecordBatchStream,
+        },
+        Survivors(DeduplicateCurrentView),
+        Done,
+    }
+
+    Box::pin(futures::stream::try_unfold(
+        Phase::Baseline {
+            current_view,
+            stream: baseline_stream,
+        },
+        |phase| async move {
+            let mut phase = phase;
+            loop {
+                match phase {
+                    Phase::Baseline {
+                        current_view,
+                        mut stream,
+                    } => match stream.next().await {
+                        Some(Ok(batch)) => {
+                            match current_view
+                                .reconcile_baseline_batch(&batch)
+                                .map_err(reconciliation_error)?
+                            {
+                                Some(batch) => {
+                                    return Ok(Some((
+                                        batch,
+                                        Phase::Baseline {
+                                            current_view,
+                                            stream,
+                                        },
+                                    )));
+                                }
+                                None => {
+                                    phase = Phase::Baseline {
+                                        current_view,
+                                        stream,
+                                    };
+                                }
+                            }
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => phase = Phase::Survivors(current_view),
+                    },
+                    Phase::Survivors(current_view) => {
+                        return match current_view.finish().map_err(reconciliation_error)? {
+                            Some(batch) => Ok(Some((batch, Phase::Done))),
+                            None => Ok(None),
+                        };
+                    }
+                    Phase::Done => return Ok(None),
+                }
+            }
+        },
+    ))
+}
+
+fn reconciliation_error(error: ClientError) -> FlussLakeError {
+    FlussLakeError::Internal(format!(
+        "failed to reconcile the primary-key current view: {error}"
+    ))
 }
 
 fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
@@ -565,8 +810,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(physical.field_indexes, vec![2, 0, 1]);
-        // The key-position assertion is introduced by the deduplicate
-        // primary-key execution PR together with the reconciliation logic.
+        assert_eq!(physical.key_positions, vec![1, 2]);
+    }
+
+    #[test]
+    fn take_rows_avoids_copying_a_run_covering_the_whole_batch() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef],
+        )
+        .unwrap();
+
+        let whole = take_rows(&batch, &[0, 1, 2]).unwrap();
+        let subset = take_rows(&batch, &[2, 0]).unwrap();
+
+        assert_eq!(whole.num_rows(), 3);
+        assert_eq!(subset.num_rows(), 2);
+        let ids = subset
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[3, 1]);
     }
 
     #[test]
@@ -802,5 +1070,42 @@ mod tests {
                 FlussLakeError::DataUnavailable(_)
             ));
         }
+    }
+
+    #[test]
+    fn changelog_offset_gap_invalidates_the_frozen_plan() {
+        use arrow::array::{ArrayRef, Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use fluss::record::{ArrowReader, ScanRecord};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = Arc::new(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["US"])) as ArrayRef,
+                    Arc::new(arrow::array::Int64Array::from(vec![10])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        );
+        let reader = ArrowReader::new(batch, Arc::new(pk_row_type())).unwrap();
+        let records = vec![ScanRecord::new(
+            reader.read(0),
+            6,
+            0,
+            ChangeType::UpdateAfter,
+        )];
+        let mut current_view = DeduplicateCurrentView::try_new(schema, vec![0]).unwrap();
+
+        assert!(matches!(
+            fold_tail_records(&records, 5, 7, &mut current_view),
+            Err(FlussLakeError::DataUnavailable(_))
+        ));
     }
 }
