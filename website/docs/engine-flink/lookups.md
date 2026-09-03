@@ -294,7 +294,9 @@ of Fluss tablets.
 
 Bucket custom shuffle applies to hash-distributed tables with bucket keys. Tables without bucket
 keys use Flink's default lookup distribution. Fluss Catalog tables expose the resolved `bucket.num`
-automatically.
+automatically. For Fluss connector tables declared outside the Fluss Catalog, configure a matching
+positive `bucket.num` to enable custom shuffle; otherwise, Flink uses its default lookup
+distribution.
 
 ## Historical Partition Lookup
 

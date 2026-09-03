@@ -205,6 +205,26 @@ abstract class FlinkTableFactoryTest {
     }
 
     @Test
+    void testLookupCustomShuffleFallsBackWithoutValidBucketNumber() {
+        ResolvedSchema schema = createBasicSchema();
+        Map<String, String> missingBucketNumberOptions = getBasicOptionsWithBucketKey();
+        missingBucketNumberOptions.remove(BUCKET_NUMBER.key());
+        FlinkTableSource missingBucketNumberSource =
+                (FlinkTableSource) createTableSource(schema, missingBucketNumberOptions);
+        missingBucketNumberSource.getLookupRuntimeProvider(
+                createLookupContext(new int[][] {{0}, {2}}));
+        assertThat(missingBucketNumberSource.getPartitionerAdapter()).isEmpty();
+
+        Map<String, String> invalidBucketNumberOptions = getBasicOptionsWithBucketKey();
+        invalidBucketNumberOptions.put(BUCKET_NUMBER.key(), "0");
+        FlinkTableSource invalidBucketNumberSource =
+                (FlinkTableSource) createTableSource(schema, invalidBucketNumberOptions);
+        invalidBucketNumberSource.getLookupRuntimeProvider(
+                createLookupContext(new int[][] {{0}, {2}}));
+        assertThat(invalidBucketNumberSource.getPartitionerAdapter()).isEmpty();
+    }
+
+    @Test
     void testVirtualLogTableSourceSupportsBatchMode() {
         ResolvedSchema schema = createBasicSchema();
         Map<String, String> properties = getBasicOptions();
