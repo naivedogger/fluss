@@ -543,7 +543,13 @@ impl SchemaBuilder {
             )));
         }
         for column in columns {
-            Self::validate_nested_row_fields(column.data_type())?;
+            column
+                .data_type()
+                .validate_row_field_names()
+                .map_err(|error| match error {
+                    IllegalArgument { message } => Error::invalid_table(message),
+                    other => other,
+                })?;
         }
 
         let Some(pk) = primary_key else {
@@ -581,36 +587,6 @@ impl SchemaBuilder {
                 }
             })
             .collect())
-    }
-
-    fn validate_nested_row_fields(data_type: &DataType) -> Result<()> {
-        match data_type {
-            DataType::Array(array) => {
-                Self::validate_nested_row_fields(array.get_element_type())?;
-            }
-            DataType::Map(map) => {
-                Self::validate_nested_row_fields(map.key_type())?;
-                Self::validate_nested_row_fields(map.value_type())?;
-            }
-            DataType::Row(row) => {
-                let names: Vec<_> = row.fields().iter().map(|field| &field.name).collect();
-                if names.iter().any(|name| name.trim().is_empty()) {
-                    return Err(Error::invalid_table(
-                        "Field names must contain at least one non-whitespace character.",
-                    ));
-                }
-                if let Some(duplicates) = Self::find_duplicates(&names) {
-                    return Err(Error::invalid_table(format!(
-                        "Field names must be unique. Found duplicates: {duplicates:?}"
-                    )));
-                }
-                for field in row.fields() {
-                    Self::validate_nested_row_fields(field.data_type())?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     fn find_duplicates<'a>(names: &'a [&String]) -> Option<HashSet<&'a String>> {
@@ -1760,19 +1736,9 @@ mod tests {
 
     #[test]
     fn invalid_nested_row_field_names_are_rejected() {
-        for (data_type, expected_message) in [
-            (
-                DataTypes::row(vec![DataTypes::field(" \t", DataTypes::int())]),
-                "Field names must contain at least one non-whitespace character.",
-            ),
-            (
-                DataTypes::row(vec![
-                    DataTypes::field("id", DataTypes::int()),
-                    DataTypes::field("id", DataTypes::string()),
-                ]),
-                "Field names must be unique. Found duplicates:",
-            ),
-            (
+        let err = Schema::builder()
+            .column(
+                "payload",
                 DataTypes::array(DataTypes::map(
                     DataTypes::string(),
                     DataTypes::row(vec![
@@ -1780,19 +1746,15 @@ mod tests {
                         DataTypes::field("value", DataTypes::bigint()),
                     ]),
                 )),
-                "Field names must be unique. Found duplicates:",
-            ),
-        ] {
-            let err = Schema::builder()
-                .column("payload", data_type)
-                .build()
-                .unwrap_err();
+            )
+            .build()
+            .unwrap_err();
 
-            assert!(
-                err.to_string().contains(expected_message),
-                "unexpected error: {err}"
-            );
-        }
+        assert!(
+            err.to_string()
+                .contains("Field names must be unique. Found duplicates:"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -1365,6 +1365,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_nested_row_fields_are_rejected_before_alter_table() {
+        let (backend, app) = gateway();
+
+        for fields in [
+            json!([{"name": " ", "field_type": {"type": "INTEGER"}}]),
+            json!([
+                {"name": "value", "field_type": {"type": "INTEGER"}},
+                {"name": "value", "field_type": {"type": "STRING"}}
+            ]),
+        ] {
+            let (status, _, body) = send(
+                &app,
+                Method::PATCH,
+                "/v1/clusters/default/databases/sales/tables/orders",
+                Some(json!({
+                    "changes": [{
+                        "kind": "add_column",
+                        "name": "payload",
+                        "data_type": {"type": "ROW", "fields": fields}
+                    }]
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_argument");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Field names must"),
+                "{body}"
+            );
+        }
+
+        assert!(backend.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_mutation_is_checked_before_its_body() {
         let (backend, app) = gateway();
 
