@@ -281,7 +281,7 @@ fn to_native(data_type: WireDataType, depth: usize) -> GatewayResult<DataType> {
             "the data type nests deeper than {MAX_TYPE_NESTING} levels"
         )));
     }
-    // TODO: Delegate length and ROW field validation once fluss-rs supports it.
+    // TODO: Delegate length validation once fluss-rs supports it.
     let converted = match data_type {
         WireDataType::Boolean { nullable } => {
             DataType::Boolean(BooleanType::with_nullable(nullable))
