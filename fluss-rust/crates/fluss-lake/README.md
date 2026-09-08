@@ -19,8 +19,8 @@ limitations under the License.
 # Bounded UnionRead
 
 `fluss-lake` defines a bounded view of a lake-enabled Fluss table and provides
-a default reader for append union reads and lake-only reads. Primary-key union execution is explicitly rejected in
-this stage; the following reconciliation and PK-reader PRs add that path.
+a complete default reader for that view. It supports append union reads,
+deduplicate primary-key current views, and lake-only reads.
 
 ## Rust version
 
@@ -55,8 +55,7 @@ Engines must not decode default splits to implement a native reader.
 
 Enable `paimon` when reading a Paimon baseline. The caller schedules logical
 `(partition, bucket)` splits; the default reader opens lake files, reads the
-bounded append log tail, and applies exact supported predicates. PK union
-execution is not yet available.
+bounded log tail, reconciles PK changes, and applies exact supported predicates.
 
 ```rust,no_run
 use fluss::client::FlussConnection;
@@ -144,8 +143,9 @@ The native adapter must:
    output before preparing another context. Do not mix old and new boundaries.
 
 SR can implement these operators in its own execution layer. This crate does
-not provide SR FE/BE bindings, a DataFusion provider, or a scheduler. Native
-engines implement reconciliation under the same semantics.
+not provide SR FE/BE bindings, a DataFusion provider, or a scheduler. Rust
+consumers may reuse core `DeduplicateCurrentView`; native engines can use an
+equivalent algorithm under the same semantics.
 
 ## Limits and compatibility
 
@@ -156,6 +156,9 @@ engines implement reconciliation under the same semantics.
   context. Scoped contexts would need an explicit coverage contract.
 - Default plans use one logical split per selected `(partition, bucket)`.
   Native plans may use file/row-group tasks and engine-controlled parallelism.
+- The default PK overlay has no spill or hard memory cap. Fully superseded
+  batches are released; partially live batches can retain obsolete buffers.
+  Survivor output is incremental, but survivor indexes also consume memory.
 - The optional backend uses Paimon 0.3 and supports Parquet. Its Arrow 58 batches
   cross into workspace Arrow 59 through the Arrow C Data Interface.
 - Context version 1 is separate from the default split descriptor version.
@@ -174,6 +177,7 @@ Run from the Rust workspace:
 ```bash
 cargo test -p fluss-lake
 cargo test -p fluss-lake --features paimon
+cargo test -p fluss-rs --lib current_view
 cargo test -p fluss-lake --features integration_tests --test test_union_read
 ```
 

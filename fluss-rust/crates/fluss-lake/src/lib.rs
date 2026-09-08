@@ -20,8 +20,8 @@
 //! finite stream of Arrow record batches.
 //!
 //! Two integration levels share the same source contract:
-//! - [`FlussLakeScan::plan`] and [`FlussLakeReader`] provide default append
-//!   and lake-only execution. PK union execution is not available yet.
+//! - [`FlussLakeScan::plan`] and [`FlussLakeReader`] provide the complete default
+//!   reader, including lake access and current-view reconciliation.
 //! - [`FlussLakeScan::prepare`] returns a portable [`FlussLakeReadContext`]
 //!   without a lake backend. Engines can use their own lake planners, readers,
 //!   reconciliation operators, and schedulers against these frozen inputs.

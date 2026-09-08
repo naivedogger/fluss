@@ -29,6 +29,8 @@ use fluss::metadata::{
 };
 use fluss::predicate::col;
 #[cfg(feature = "paimon")]
+use fluss::row::GenericRow;
+#[cfg(feature = "paimon")]
 use fluss_lake::FlussLakePartitionIdentity;
 use fluss_lake::{FlussLakeError, FlussLakeReadContext, FlussLakeReadSplit, FlussLakeTable};
 use futures::TryStreamExt;
@@ -110,6 +112,38 @@ fn extract_ids(batches: &[RecordBatch]) -> Vec<i32> {
         .collect();
     ids.sort_unstable();
     ids
+}
+
+#[cfg(feature = "paimon")]
+fn pk_row(id: i32, name: Option<&str>) -> GenericRow<'_> {
+    let mut row = GenericRow::new(2);
+    row.set_field(0, id);
+    if let Some(name) = name {
+        row.set_field(1, name);
+    }
+    row
+}
+
+#[cfg(feature = "paimon")]
+fn extract_pk_rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be an Int32Array");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column should be a StringArray");
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), names.value(row).to_string()));
+        }
+    }
+    rows.sort_unstable();
+    rows
 }
 
 #[cfg(feature = "paimon")]
@@ -205,6 +239,196 @@ fn serialized_execution_descriptor(split: &FlussLakeReadSplit) -> Vec<u8> {
                 .expect("Execution descriptor must contain bytes")
         })
         .collect()
+}
+
+/// Real PK UnionRead across a Paimon snapshot produced by Fluss' production
+/// Java/Flink tiering pipeline and a bounded Fluss changelog tail.
+#[cfg(feature = "paimon")]
+#[tokio::test]
+async fn paimon_pk_union_read_merges_update_delete_and_insert_end_to_end() {
+    let cluster = support::get_shared_cluster();
+    let connection = Arc::new(cluster.get_fluss_connection().await);
+    let admin = connection.get_admin().expect("Failed to get Fluss admin");
+    let table_path = TablePath::new("fluss", "test_paimon_pk_union_read_e2e");
+    let table_descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .primary_key(vec!["id"])
+                .unwrap()
+                .build()
+                .expect("Failed to build Paimon PK UnionRead schema"),
+        )
+        .distributed_by(Some(1), vec!["id".to_string()])
+        .property("table.datalake.enabled", "true")
+        .property("table.datalake.format", "paimon")
+        .property("table.datalake.freshness", "1s")
+        .custom_property("paimon.file.format", "parquet")
+        .build()
+        .expect("Failed to build Paimon PK UnionRead table descriptor");
+    support::create_table(&admin, &table_path, &table_descriptor).await;
+
+    let table = connection
+        .get_table(&table_path)
+        .await
+        .expect("Failed to open Paimon PK UnionRead table");
+    let writer = table
+        .new_upsert()
+        .expect("Failed to create Paimon PK upsert operation")
+        .create_writer()
+        .expect("Failed to create Paimon PK writer");
+    for row in [
+        pk_row(1, Some("lake-old")),
+        pk_row(2, Some("lake-delete")),
+        pk_row(3, Some("lake-keep")),
+    ] {
+        writer
+            .upsert(&row)
+            .expect("Failed to queue Fluss baseline upsert")
+            .await
+            .expect("Failed to acknowledge Fluss baseline upsert");
+    }
+    writer
+        .flush()
+        .await
+        .expect("Failed to flush Fluss baseline");
+
+    let table_info = admin
+        .get_table_info(&table_path)
+        .await
+        .expect("Failed to resolve Paimon PK table metadata");
+    let seam_offset = admin
+        .list_offsets(&table_path, &[0], fluss::rpc::message::OffsetSpec::Latest)
+        .await
+        .expect("Failed to resolve Paimon PK seam offset")[&0];
+    assert!(seam_offset > 0);
+
+    support::run_java_paimon_tiering_until_offset(
+        cluster.plaintext_bootstrap_servers(),
+        &table_path,
+        table_info.table_id,
+        None,
+        seam_offset,
+    )
+    .await;
+    let readable_snapshot = admin
+        .get_readable_lake_snapshot(&table_path)
+        .await
+        .expect("Failed to load Java-tiered readable Paimon snapshot");
+    assert!(readable_snapshot.snapshot_id >= 0);
+    assert_eq!(readable_snapshot.bucket_snapshots.len(), 1);
+    assert_eq!(
+        readable_snapshot.bucket_snapshots[0].log_offset,
+        Some(seam_offset)
+    );
+
+    writer
+        .upsert(&pk_row(1, Some("tail-new")))
+        .expect("Failed to queue tail update")
+        .await
+        .expect("Failed to acknowledge tail update");
+    writer
+        .delete(&pk_row(2, None))
+        .expect("Failed to queue tail delete")
+        .await
+        .expect("Failed to acknowledge tail delete");
+    writer
+        .upsert(&pk_row(4, Some("tail-insert")))
+        .expect("Failed to queue tail insert")
+        .await
+        .expect("Failed to acknowledge tail insert");
+    writer
+        .flush()
+        .await
+        .expect("Failed to flush Paimon PK changelog tail");
+
+    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
+        .await
+        .expect("Failed to open real Paimon PK lake table");
+    let scan = lake_table.new_scan().with_batch_size(1);
+    let plan = scan
+        .plan()
+        .await
+        .expect("Failed to plan real Paimon PK UnionRead");
+    assert_eq!(
+        plan.splits().len(),
+        1,
+        "one bucket must produce one hybrid split containing all Paimon splits and its log tail"
+    );
+    let transported_split: FlussLakeReadSplit = serde_json::from_slice(
+        &serde_json::to_vec(&plan.splits()[0]).expect("Failed to encode PK split"),
+    )
+    .expect("Failed to decode transported PK split");
+    let read = scan.new_reader();
+
+    let execute = |split| {
+        let read = read.clone();
+        async move {
+            let stream = read
+                .read_split(&split)
+                .await
+                .expect("Failed to execute real Paimon PK UnionRead split");
+            stream.try_collect::<Vec<_>>().await
+        }
+    };
+    let first = tokio::time::timeout(Duration::from_secs(20), execute(transported_split.clone()))
+        .await
+        .expect("Timed out waiting for real Paimon PK UnionRead")
+        .expect("Failed to collect real Paimon PK UnionRead");
+    let retried = tokio::time::timeout(Duration::from_secs(20), execute(transported_split))
+        .await
+        .expect("Timed out waiting for retried Paimon PK UnionRead")
+        .expect("Failed to collect retried Paimon PK UnionRead");
+
+    let expected = vec![
+        (1, "tail-new".to_string()),
+        (3, "lake-keep".to_string()),
+        (4, "tail-insert".to_string()),
+    ];
+    assert_eq!(extract_pk_rows(&first), expected);
+    assert!(first.iter().all(|batch| batch.num_rows() <= 1));
+    assert_eq!(
+        extract_pk_rows(&retried),
+        expected,
+        "retrying an immutable transported split must reproduce the same logical rows"
+    );
+    let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
+    for (name, expected_count) in [("lake-old", 0), ("lake-delete", 0), ("tail-new", 1)] {
+        let filtered = lake_table
+            .new_scan()
+            .with_filter(col("name").eq(name))
+            .with_projection(vec![1])
+            .with_batch_size(1);
+        let filtered_plan = filtered.plan_with_context(&context).await.unwrap();
+        let batches = tokio::time::timeout(
+            Duration::from_secs(20),
+            filtered
+                .new_reader()
+                .read_splits(filtered_plan.splits())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            expected_count
+        );
+        assert!(
+            batches.iter().all(|batch| {
+                batch.num_columns() == 1 && batch.schema().field(0).name() == "name"
+            })
+        );
+    }
+
+    drop(writer);
+    admin
+        .drop_table(&table_path, false)
+        .await
+        .expect("Failed to drop Paimon PK UnionRead table");
 }
 
 /// Real append UnionRead across a Java-tiered Paimon snapshot and a bounded
