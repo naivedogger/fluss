@@ -18,7 +18,9 @@
 name = "fluss-lake"
 version = { workspace = true }
 edition = { workspace = true }
-rust-version = { workspace = true }
+# Paimon 0.3 requires Rust 1.91; this package MSRV applies to all features.
+# Keep in sync with the `lake-msrv` CI job.
+rust-version = "1.91"
 license = { workspace = true }
 authors = { workspace = true }
 description = "Engine-neutral bounded lake and log read kernel for Apache Fluss"
@@ -29,10 +31,17 @@ categories = { workspace = true }
 
 [features]
 integration_tests = ["fluss/integration_tests"]
+# Paimon lake reading. Pinned to the official Apache release that contains
+# apache/paimon-rust#374 (required for PK dedup semantics).
+# Parquet is the only supported lake data file format for now.
+paimon = ["dep:arrow_array_58", "dep:paimon"]
+
 [dependencies]
 arrow = { workspace = true }
+arrow_array_58 = { package = "arrow-array", version = "58.4.0", features = ["ffi"], optional = true }
 fluss = { package = "fluss-rs", path = "../fluss" }
 futures = "0.3"
+paimon = { version = "0.3.0", default-features = false, features = ["storage-memory", "storage-fs", "storage-oss", "storage-s3"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "1.0"

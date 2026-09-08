@@ -17,8 +17,8 @@
 
 //! FIP-48 table, scan, and reader APIs.
 
-use crate::planner::prepare_read_context;
-use crate::{FlussLakeError, FlussLakeReadContext, Result};
+use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
+use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, Result};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
@@ -179,6 +179,27 @@ impl FlussLakeScan {
         prepare_read_context(self).await
     }
 
+    /// Prepares source boundaries and builds the complete default read plan.
+    ///
+    /// Existing `Table -> Scan -> Plan -> Reader` consumers need no changes.
+    /// Lake file planning uses the optional default lake backend.
+    pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
+        plan_union_read(self).await
+    }
+
+    /// Builds a default plan without choosing new snapshots or log offsets.
+    ///
+    /// The context must refer to this table. Metadata drift is rejected.
+    /// Different scans may share a context without sharing predicates or
+    /// projection. Engines implementing their own UnionRead can instead
+    /// consume the public context directly and skip this default planner.
+    pub async fn plan_with_context(
+        &self,
+        context: &FlussLakeReadContext,
+    ) -> Result<FlussLakeReadPlan> {
+        plan_with_context(self, context).await
+    }
+
     pub(crate) fn connection(&self) -> &Arc<FlussConnection> {
         &self.connection
     }
@@ -236,6 +257,10 @@ impl FlussLakeScan {
 
     pub(crate) fn lake_only(&self) -> bool {
         self.lake_only
+    }
+
+    pub(crate) fn catalog_property_overrides(&self) -> &HashMap<String, String> {
+        &self.catalog_property_overrides
     }
 
     pub(crate) fn validate_configuration(&self) -> Result<()> {

@@ -20,7 +20,9 @@
 //! Engines consume the public read context rather than the default reader's
 //! opaque split descriptors or these private planning helpers.
 
-use crate::{FlussLakeError, FlussLakePartitionIdentity, Result};
+use crate::split::{FlussLakeReadSplit, SplitStatistics};
+use crate::split_descriptor::SplitDescriptor;
+use crate::{CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeError, FlussLakePartitionIdentity, Result};
 use fluss::SnapshotId;
 use fluss::client::FlussAdmin;
 use fluss::error::Error as ClientError;
@@ -35,6 +37,65 @@ pub(crate) use crate::FlussLakeLogRange as FrozenBucketRange;
 pub(crate) struct FrozenReadBoundary {
     pub(crate) readable_lake_snapshot_id: Option<SnapshotId>,
     pub(crate) bucket_ranges: Vec<FrozenBucketRange>,
+}
+
+/// Creates one opaque logical `(partition, bucket)` split.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_logical_split(
+    table_path: &TablePath,
+    schema_id: i32,
+    bucket_range: &FrozenBucketRange,
+    snapshot_id: Option<i64>,
+    lake_splits: Vec<String>,
+    primary_key_indexes: Vec<usize>,
+    statistics: SplitStatistics,
+) -> Result<FlussLakeReadSplit> {
+    let descriptor = SplitDescriptor::try_new(
+        table_path.clone(),
+        schema_id,
+        matches!(
+            bucket_range.partition_identity,
+            FlussLakePartitionIdentity::KeyValues(_)
+        ),
+        bucket_range.table_bucket.clone(),
+        bucket_range.start_offset,
+        bucket_range.stop_offset,
+        snapshot_id,
+        lake_splits,
+        primary_key_indexes,
+    )?;
+    let partition = match (
+        &bucket_range.partition_identity,
+        bucket_range.table_bucket.partition_id(),
+    ) {
+        (FlussLakePartitionIdentity::Unpartitioned, None) => "root".to_string(),
+        (FlussLakePartitionIdentity::KeyValues(_), Some(partition_id)) => partition_id.to_string(),
+        (FlussLakePartitionIdentity::KeyValues(key_values), None) => format!(
+            "lake-only({})",
+            key_values
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+        (FlussLakePartitionIdentity::Unpartitioned, Some(partition_id)) => {
+            return Err(FlussLakeError::Internal(format!(
+                "unpartitioned logical split unexpectedly carries partition id {partition_id}"
+            )));
+        }
+    };
+    let split_id = format!(
+        "{table_path}:{partition}:{}",
+        bucket_range.table_bucket.bucket_id()
+    );
+    FlussLakeReadSplit::try_new(
+        split_id,
+        bucket_range.table_bucket.bucket_id(),
+        bucket_range.partition_identity.clone(),
+        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
+        descriptor.encode()?,
+        statistics,
+    )
 }
 
 impl FrozenReadBoundary {
@@ -350,5 +411,70 @@ mod tests {
         let range = root_range(Some(20), 8, 20).unwrap();
 
         assert!(range.is_empty());
+    }
+
+    #[test]
+    fn logical_split_carries_one_partition_bucket_lake_and_log_unit() {
+        let range = FrozenBucketRange {
+            table_bucket: TableBucket::new_with_partition(5, Some(9), 2),
+            partition_identity: FlussLakePartitionIdentity::KeyValues(vec![(
+                "region".to_string(),
+                "US".to_string(),
+            )]),
+            start_offset: 12,
+            stop_offset: 20,
+            earliest_offset: 8,
+        };
+        let split = create_logical_split(
+            &TablePath::new("fluss", "orders"),
+            3,
+            &range,
+            Some(42),
+            vec!["{\"bucket\":2}".to_string()],
+            Vec::new(),
+            SplitStatistics::default(),
+        )
+        .unwrap();
+
+        assert_eq!(split.bucket_id, 2);
+        assert_eq!(
+            split.partition,
+            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string(),)])
+        );
+        let descriptor = split.decode_execution_descriptor().unwrap();
+        assert_eq!(descriptor.snapshot_id(), Some(42));
+        assert_eq!(descriptor.start_offset(), 12);
+        assert_eq!(descriptor.stop_offset(), 20);
+        assert_eq!(descriptor.lake_splits().len(), 1);
+    }
+
+    #[test]
+    fn lake_only_expired_partition_has_identity_without_live_partition_id() {
+        let range = FrozenBucketRange::lake_only(
+            5,
+            2,
+            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())]),
+        );
+        let split = create_logical_split(
+            &TablePath::new("fluss", "orders"),
+            3,
+            &range,
+            Some(42),
+            vec!["{\"bucket\":2}".to_string()],
+            Vec::new(),
+            SplitStatistics::new(Some(3), Some(100)),
+        )
+        .unwrap();
+
+        assert!(split.split_id.contains("lake-only(region=US)"));
+        assert_eq!(
+            split.partition,
+            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())])
+        );
+        let descriptor = split.decode_execution_descriptor().unwrap();
+        assert!(descriptor.is_partitioned());
+        assert_eq!(descriptor.table_bucket().partition_id(), None);
+        assert_eq!(descriptor.start_offset(), 0);
+        assert_eq!(descriptor.stop_offset(), 0);
     }
 }

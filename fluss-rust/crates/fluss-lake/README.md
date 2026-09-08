@@ -16,17 +16,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Bounded UnionRead source preparation
+# Bounded UnionRead planning
 
-This stage provides a portable, table-wide source context. It does not provide
-lake file planning or a default reader yet. No Paimon dependency is resolved.
+The portable `prepare()` path remains lake-backend-independent. This stage
+adds `plan()` and `plan_with_context()` with pinned Paimon file planning,
+opaque logical splits, statistics and conservative pruning. No default reader
+is exposed yet. Enable `paimon` to plan a nonempty lake baseline.
+
+## Rust version
+
+`fluss-lake` requires Rust 1.91 or later. This package-level minimum applies
+with or without the optional `paimon` feature, including preparation-only
+integrations. Disabling Paimon avoids its dependencies, not this compiler
+requirement. The core workspace's MSRV and the development `stable` toolchain
+are unchanged.
+
+### Reuse one boundary across table references
+
+Preparation captures the full table before projection and predicate pruning.
+This lets a query, such as a DataFusion self-join, share source state without
+sharing its physical plan or filter.
 
 ```rust,no_run
+use fluss::predicate::col;
 use fluss_lake::{FlussLakeReadContext, FlussLakeTable, Result};
-async fn prepare(table: &FlussLakeTable) -> Result<()> {
+
+async fn plan_references(table: &FlussLakeTable) -> Result<()> {
     let context = table.prepare().await?;
     let received = FlussLakeReadContext::from_json(&context.to_json()?)?;
-    assert_eq!(context.to_json()?, received.to_json()?);
+
+    let left = table.new_scan().with_filter(col("id").eq(1_i32));
+    let right = table.new_scan().with_projection(vec![0]);
+    let left_plan = left.plan_with_context(&received).await?;
+    let right_plan = right.plan_with_context(&received).await?;
+    assert_eq!(
+        left_plan.read_context().to_json()?,
+        right_plan.read_context().to_json()?
+    );
+    // Default execution is added in the next stage.
     Ok(())
 }
 ```
@@ -64,14 +91,3 @@ The native adapter must:
 
 SR can implement these operators in its own execution layer. This crate does
 not provide SR FE/BE bindings, a DataFusion provider, or a scheduler. Native engines implement reconciliation under the same semantics.
-
-## Source contract limitations
-
-The context is not a global transactional snapshot or a retention lease.
-Preparation queries offsets for all live partitions before pruning. Offsets
-are comparable only within one bucket. Transport validates structure, not
-origin or authenticity; only accept contexts from trusted coordinators.
-
-Run `cargo test -p fluss-lake` for context validation and source-boundary tests.
-The `integration_tests` feature adds a preparation-only Docker/Fluss test;
-it does not require a Paimon reader or a Java tiering job.

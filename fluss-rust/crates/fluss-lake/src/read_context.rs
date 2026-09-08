@@ -89,6 +89,26 @@ impl FlussLakeLogRange {
         }
         Ok(())
     }
+
+    pub(crate) fn estimated_log_rows(&self) -> Option<usize> {
+        self.stop_offset
+            .checked_sub(self.start_offset)
+            .and_then(|rows| usize::try_from(rows).ok())
+    }
+
+    pub(crate) fn lake_only(
+        table_id: i64,
+        bucket_id: i32,
+        partition_identity: FlussLakePartitionIdentity,
+    ) -> Self {
+        Self {
+            table_bucket: TableBucket::new(table_id, bucket_id),
+            partition_identity,
+            start_offset: 0,
+            stop_offset: 0,
+            earliest_offset: 0,
+        }
+    }
 }
 
 /// Immutable source state for one table, independent of physical execution.
