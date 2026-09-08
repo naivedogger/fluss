@@ -228,13 +228,10 @@ async fn kv_scanner_preserves_slow_schema_lookup_across_timeouts_and_cancellatio
     server.await.expect("schema server");
 }
 
-#[tokio::test(start_paused = true)]
-async fn kv_scanner_not_leader_refresh_respects_poll_timeout() {
+async fn assert_not_leader_refresh(partition_id: Option<i64>, refresh_delay: Duration) {
     let table_info = build_two_col_table_info();
-    let bucket = TableBucket::new(table_info.table_id, 0);
+    let bucket = TableBucket::new_with_partition(table_info.table_id, partition_id, 0);
     let (mut scanner, mut stream) = protocol_test_scanner(table_info, bucket);
-    let (refresh_tx, refresh_rx) = oneshot::channel();
-    let (finish_tx, finish_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let open = read_framed_request(&mut stream).await;
         write_success_response(
@@ -246,11 +243,20 @@ async fn kv_scanner_not_leader_refresh_respects_poll_timeout() {
             },
         )
         .await;
-        let refresh = read_framed_request(&mut stream).await;
-        assert_eq!(refresh.api_key, i16::from(ApiKey::MetaData));
-        refresh_tx.send(()).expect("refresh requested");
-        // Keep the connection alive without answering the metadata request.
-        finish_rx.await.expect("finish server");
+        let frame = read_framed_request(&mut stream).await;
+        assert_eq!(frame.api_key, i16::from(ApiKey::MetaData));
+        assert_eq!(frame.api_version, 0);
+        let refresh =
+            crate::proto::MetadataRequest::decode(frame.body.as_slice()).expect("metadata request");
+        assert_eq!(
+            refresh.partitions_id,
+            partition_id.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(refresh.table_path.len(), 1);
+        assert_eq!(refresh.table_path[0].database_name, "db");
+        assert_eq!(refresh.table_path[0].table_name, "tbl");
+        tokio::time::sleep(refresh_delay).await;
+        write_error_response(&mut stream, frame.request_id, 1, "refresh failed").await;
     });
     let budget = Duration::from_millis(20);
     let start = Instant::now();
@@ -259,14 +265,25 @@ async fn kv_scanner_not_leader_refresh_respects_poll_timeout() {
         scanner.next_batch_with_timeout(budget),
     )
     .await
-    .expect("stalled refresh must not block error delivery")
+    .expect("refresh must not block error delivery")
     .expect_err("NotLeader is preserved");
     assert_eq!(error.api_error(), Some(FlussError::NotLeaderOrFollower));
-    assert!(start.elapsed() < Duration::from_millis(50));
-    refresh_rx.await.expect("refresh attempted");
+    let expected_wait = refresh_delay.min(budget);
+    assert!(
+        start.elapsed() >= expected_wait,
+        "refresh returned too early"
+    );
+    assert!(start.elapsed() <= expected_wait + Duration::from_millis(2));
+    assert!(scanner.closed);
     assert!(scanner.next_batch().await.is_err());
-    finish_tx.send(()).expect("finish");
     server.await.expect("metadata server");
+}
+
+#[tokio::test(start_paused = true)]
+async fn kv_scanner_not_leader_refresh_respects_poll_timeout() {
+    for partition_id in [None, Some(77)] {
+        assert_not_leader_refresh(partition_id, Duration::from_millis(200)).await;
+    }
 }
 
 #[tokio::test]
@@ -574,84 +591,11 @@ async fn kv_scanner_close_sends_close_for_the_open_session() {
     assert!(error.to_string().contains("closed before every bucket"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn not_leader_refresh_is_partition_aware_and_synchronous() {
-    let table_info = build_two_col_table_info();
-    let partition_id = 77;
-    let bucket = TableBucket::new_with_partition(table_info.table_id, Some(partition_id), 0);
-    let (mut scanner, mut server_stream) = protocol_test_scanner(table_info, bucket);
-    let (refresh_seen_tx, refresh_seen_rx) = oneshot::channel();
-    let (release_refresh_tx, release_refresh_rx) = oneshot::channel();
-
-    let server = tokio::spawn(async move {
-        let scan_frame = read_framed_request(&mut server_stream).await;
-        write_success_response(
-            &mut server_stream,
-            scan_frame.request_id,
-            &ScanKvResponse {
-                error_code: Some(FlussError::NotLeaderOrFollower.code()),
-                error_message: Some("moved".to_string()),
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let refresh_frame = read_framed_request(&mut server_stream).await;
-        assert_eq!(refresh_frame.api_key, i16::from(ApiKey::MetaData));
-        assert_eq!(refresh_frame.api_version, 0);
-        let refresh = crate::proto::MetadataRequest::decode(refresh_frame.body.as_slice())
-            .expect("decode metadata refresh");
-        assert_eq!(refresh.partitions_id, vec![partition_id]);
-        assert_eq!(refresh.table_path.len(), 1);
-        assert_eq!(refresh.table_path[0].database_name, "db");
-        assert_eq!(refresh.table_path[0].table_name, "tbl");
-        refresh_seen_tx.send(()).expect("report metadata refresh");
-        release_refresh_rx.await.expect("release metadata refresh");
-        write_error_response(
-            &mut server_stream,
-            refresh_frame.request_id,
-            1,
-            "refresh failed",
-        )
-        .await;
-    });
-
-    let mut scan = tokio::spawn(async move {
-        let result = scanner
-            .next_batch_with_timeout(Duration::from_secs(5))
-            .await;
-        (scanner, result)
-    });
-    tokio::select! {
-        refresh = refresh_seen_rx => {
-            refresh.expect("partition metadata refresh request");
-        }
-        completed = &mut scan => {
-            let (_, result) = completed.expect("scanner task");
-            panic!("scanner returned before sending metadata refresh: {result:?}");
-        }
-        _ = tokio::time::sleep(Duration::from_secs(1)) => {
-            panic!("partition metadata refresh must be sent");
-        }
+    for partition_id in [None, Some(77)] {
+        assert_not_leader_refresh(partition_id, Duration::from_millis(5)).await;
     }
-    assert!(
-        !scan.is_finished(),
-        "NotLeader must not return before metadata refresh completes"
-    );
-    release_refresh_tx
-        .send(())
-        .expect("complete metadata refresh");
-    let (scanner, result) = tokio::time::timeout(Duration::from_secs(1), &mut scan)
-        .await
-        .expect("scanner must return after refresh completes")
-        .expect("scanner task");
-    let error = result.expect_err("NotLeader remains the authoritative error");
-    assert_eq!(error.api_error(), Some(FlussError::NotLeaderOrFollower));
-    assert!(scanner.closed);
-    tokio::time::timeout(Duration::from_secs(1), server)
-        .await
-        .expect("NotLeader protocol server must complete")
-        .expect("NotLeader protocol server");
 }
 
 #[tokio::test]

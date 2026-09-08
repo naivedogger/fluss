@@ -195,7 +195,7 @@ impl KvBatchScanner {
                 let Some(remaining) = remaining_timeout(start, timeout) else {
                     return Ok(KvBatchReadOutcome::TimedOut);
                 };
-                let Some(decoded) = wait_for_task(task, remaining).await else {
+                let Ok(decoded) = tokio::time::timeout(remaining, task).await else {
                     return Ok(KvBatchReadOutcome::TimedOut);
                 };
                 let batch = match decoded {
@@ -252,12 +252,12 @@ impl KvBatchScanner {
                     .in_flight
                     .as_mut()
                     .expect("ScanKV request must be in flight");
-                wait_for_task(task, remaining).await
+                tokio::time::timeout(remaining, task).await
             };
 
             let joined = match task_result {
-                Some(joined) => joined,
-                None => return Ok(KvBatchReadOutcome::TimedOut),
+                Ok(joined) => joined,
+                Err(_) => return Ok(KvBatchReadOutcome::TimedOut),
             };
             self.in_flight = None;
 
@@ -360,23 +360,7 @@ impl KvBatchScanner {
     /// A scanner closed before it is drained remains incomplete; subsequent
     /// reads return an error rather than reporting normal end-of-scan.
     pub async fn close(&mut self) -> Result<()> {
-        if self.closed || self.is_fully_drained() {
-            return Ok(());
-        }
-        self.closed = true;
-        // A terminal response may already have arrived while its records are
-        // still waiting to be decoded. Discarding those records is an
-        // incomplete close, not a successfully drained scan.
-        self.drained = false;
-        if let Some(task) = self.in_flight.take() {
-            task.abort();
-        }
-        if let Some(task) = self.pending_decode.take() {
-            task.abort();
-        }
-        // Dispatch the close in an owned task. The RPC is best effort, and this
-        // keeps close cancellation-safe if the caller drops this future.
-        self.send_best_effort_close();
+        self.terminate();
         Ok(())
     }
 
@@ -525,7 +509,7 @@ impl KvBatchScanner {
     }
 
     async fn refresh_bucket_metadata(&self) {
-        let partition_ids = metadata_refresh_partition_ids(&self.bucket);
+        let partition_ids: Vec<_> = self.bucket.partition_id().into_iter().collect();
         let result = if partition_ids.is_empty() {
             self.metadata
                 .update_table_metadata(&self.table_info.table_path)
@@ -562,6 +546,7 @@ impl KvBatchScanner {
         if let Some(task) = self.pending_decode.take() {
             task.abort();
         }
+        // Discarding an unread terminal batch is an incomplete close, not EOF.
         if !fully_drained {
             self.drained = false;
         }
@@ -729,10 +714,6 @@ impl KvSnapshotScanner {
     }
 }
 
-fn metadata_refresh_partition_ids(bucket: &TableBucket) -> Vec<i64> {
-    bucket.partition_id().into_iter().collect()
-}
-
 fn remaining_timeout(start: Instant, timeout: Duration) -> Option<Duration> {
     let elapsed = start.elapsed();
     if elapsed >= timeout {
@@ -740,13 +721,6 @@ fn remaining_timeout(start: Instant, timeout: Duration) -> Option<Duration> {
     } else {
         Some(timeout - elapsed)
     }
-}
-
-async fn wait_for_task<T>(
-    task: &mut JoinHandle<T>,
-    timeout: Duration,
-) -> Option<std::result::Result<T, tokio::task::JoinError>> {
-    tokio::time::timeout(timeout, task).await.ok()
 }
 
 #[cfg(test)]

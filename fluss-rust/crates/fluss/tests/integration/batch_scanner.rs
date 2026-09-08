@@ -624,12 +624,8 @@ mod batch_scanner_test {
         let admin = connection.get_admin().expect("admin");
         let table_path = TablePath::new("fluss", table_name);
         create_table(&admin, &table_path, &id_name_pk_descriptor(num_buckets)).await;
-        if num_buckets == 1 {
-            wait_for_table_ready(&admin, &table_path).await;
-        } else {
-            let buckets: Vec<i32> = (0..num_buckets).collect();
-            wait_for_table_buckets_ready(&admin, &table_path, &buckets).await;
-        }
+        let buckets: Vec<i32> = (0..num_buckets).collect();
+        wait_for_table_buckets_ready(&admin, &table_path, &buckets).await;
         connection.get_table(&table_path).await.expect("table")
     }
 
@@ -865,16 +861,11 @@ mod batch_scanner_test {
         );
 
         let post_snapshot_id = 20;
-        let writer = table
-            .new_upsert()
-            .expect("upsert")
-            .create_writer()
-            .expect("writer");
-        let mut row = GenericRow::new(2);
-        row.set_field(0, post_snapshot_id);
-        row.set_field(1, "post-snapshot");
-        writer.upsert(&row).expect("upsert post-snapshot row");
-        writer.flush().await.expect("flush post-snapshot row");
+        upsert_id_name_rows(
+            &table,
+            &HashMap::from([(post_snapshot_id, "post-snapshot".to_string())]),
+        )
+        .await;
 
         let mut batches = vec![first_batch];
         batches.extend(
@@ -885,7 +876,6 @@ mod batch_scanner_test {
         );
         let seen = collect_id_name(&batches);
         assert_eq!(seen, initial_rows);
-        assert!(!seen.contains_key(&post_snapshot_id));
     }
 
     /// Unsupported table shapes, pushdowns, and bucket coordinates fail before ScanKV.

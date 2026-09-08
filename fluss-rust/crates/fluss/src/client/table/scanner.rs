@@ -177,6 +177,25 @@ impl<'a> TableScan<'a> {
                 .to_string(),
         })?;
         validate_limit_scan_fixed_schema(&self.table_info, self.fixed_schema)?;
+        self.validate_bucket(&table_bucket)?;
+        // Log tables decode as Arrow IPC, so only ARROW format is supported (KV
+        // tables use the value-record path and are exempt).
+        if !self.table_info.has_primary_key() {
+            validate_scan_support(&self.table_info.table_path, &self.table_info)?;
+        }
+        let schema_getter = self.build_schema_getter()?;
+        Ok(LimitBatchScanner::new(
+            self.conn.get_connections(),
+            self.metadata.clone(),
+            self.table_info,
+            schema_getter,
+            self.projected_fields,
+            table_bucket,
+            limit,
+        ))
+    }
+
+    fn validate_bucket(&self, table_bucket: &TableBucket) -> Result<()> {
         if table_bucket.table_id() != self.table_info.table_id {
             return Err(Error::IllegalArgument {
                 message: format!(
@@ -195,36 +214,12 @@ impl<'a> TableScan<'a> {
                 ),
             });
         }
-        // Log tables decode as Arrow IPC, so only ARROW format is supported (KV
-        // tables use the value-record path and are exempt).
-        if !self.table_info.has_primary_key() {
-            validate_scan_support(&self.table_info.table_path, &self.table_info)?;
-        }
-        // Pre-seed the current schema; older versions are fetched lazily while
-        // decoding log or KV batches. Mirrors `Table::new_lookup`.
-        let latest = SchemaInfo::new(
-            self.table_info.get_schema().clone(),
-            self.table_info.get_schema_id(),
-        );
-        let schema_getter = Arc::new(ClientSchemaGetter::new(
-            self.table_info.table_path.clone(),
-            self.conn.get_admin()?,
-            latest,
-        ));
-        Ok(LimitBatchScanner::new(
-            self.conn.get_connections(),
-            self.metadata.clone(),
-            self.table_info,
-            schema_getter,
-            self.projected_fields,
-            table_bucket,
-            limit,
-        ))
+        Ok(())
     }
 
     /// Pre-seeds a schema getter with the current schema; older versions are
-    /// fetched lazily during KV decode. Mirrors `Table::new_lookup`.
-    fn build_kv_schema_getter(&self) -> Result<Arc<ClientSchemaGetter>> {
+    /// fetched lazily during batch decoding. Mirrors `Table::new_lookup`.
+    fn build_schema_getter(&self) -> Result<Arc<ClientSchemaGetter>> {
         let latest = SchemaInfo::new(
             self.table_info.get_schema().clone(),
             self.table_info.get_schema_id(),
@@ -267,25 +262,8 @@ impl<'a> TableScan<'a> {
     /// [`KvBatchScanner::next_batch`].
     pub fn create_bucket_kv_scanner(self, table_bucket: TableBucket) -> Result<KvBatchScanner> {
         self.ensure_kv_scan_supported()?;
-        if table_bucket.table_id() != self.table_info.table_id {
-            return Err(Error::IllegalArgument {
-                message: format!(
-                    "Bucket table_id {} does not match scan table_id {}",
-                    table_bucket.table_id(),
-                    self.table_info.table_id
-                ),
-            });
-        }
-        let num_buckets = self.table_info.get_num_buckets();
-        if table_bucket.bucket_id() < 0 || table_bucket.bucket_id() >= num_buckets {
-            return Err(Error::IllegalArgument {
-                message: format!(
-                    "Bucket id {} out of range for table with {num_buckets} buckets",
-                    table_bucket.bucket_id()
-                ),
-            });
-        }
-        let schema_getter = self.build_kv_schema_getter()?;
+        self.validate_bucket(&table_bucket)?;
+        let schema_getter = self.build_schema_getter()?;
         let batch_size_bytes = self.conn.config().scanner_kv_fetch_max_bytes;
         Ok(KvBatchScanner::new(
             self.conn.get_connections(),
@@ -306,7 +284,7 @@ impl<'a> TableScan<'a> {
     /// is created.
     pub async fn create_kv_scanner(self) -> Result<KvSnapshotScanner> {
         self.ensure_kv_scan_supported()?;
-        let schema_getter = self.build_kv_schema_getter()?;
+        let schema_getter = self.build_schema_getter()?;
         let batch_size_bytes = self.conn.config().scanner_kv_fetch_max_bytes;
         let rpc_client = self.conn.get_connections();
         let table_id = self.table_info.table_id;
