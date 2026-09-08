@@ -181,9 +181,41 @@ The `lake-msrv` CI job checks default and all-feature targets on Rust 1.91.0
 and runs the Paimon library unit tests. Its all-feature check compiles, but
 does not execute, service-backed integration tests.
 
-The integration feature requires Docker. Real Paimon tiering tests additionally
-need the Java test runtime; use `scripts/run-paimon-union-read-e2e.sh` from the
-Rust workspace, after reviewing its build and container prerequisites.
+The `integration_tests` feature requires Docker for the Fluss log-only tests.
 If the Docker VM cannot bind-mount the worktree, set
-`FLUSS_RUST_UNION_READ_TEST_DATA_DIR` to an absolute directory shared with that
-VM. This is a test-fixture setting, not a production client configuration.
+`FLUSS_RUST_UNION_READ_TEST_DATA_DIR` to an absolute directory shared with that VM.
+
+Real tiering interoperability is tested separately by `RustUnionReadITCase` in
+`fluss-lake-paimon`. Java owns the Fluss cluster, Flink MiniCluster, temporary
+Paimon warehouse, baseline writes and log tail. A precompiled Rust test discovers
+the readable snapshot and log boundaries through the public UnionRead API and
+reads the same local warehouse. The append scenario checks both sides, transported split retries and lake-only
+reads. PK union coverage is added with PK execution in PR7.
+No Docker, S3 service, warehouse copying or production CLI is needed for this suite.
+
+The path-scoped `Rust UnionRead Integration` workflow builds both runtimes and
+runs this suite in one Linux job. It is triggered by relevant Rust code/build
+files, the Java driver and the workflow itself, not by every Java tiering/server
+change; run it manually when validating an upstream contract change. Fork PRs
+may require maintainer approval. The ordinary Java suite does not require Rust.
+
+To reproduce locally, from the repository root:
+
+```bash
+./mvnw -pl fluss-lake/fluss-lake-paimon -am -DskipTests install
+cd fluss-rust
+cargo +1.91.0 test -p fluss-lake --locked --features paimon \
+  --test test_tiered_union_read --no-run --message-format=json > /tmp/union-read-build.json
+# Use the compiler-artifact executable for target test_tiered_union_read from
+# that JSON output (see the workflow for automatic extraction).
+export FLUSS_RUST_UNION_READ_TEST_BIN=/absolute/path/to/test_tiered_union_read-HASH
+cd ..
+./mvnw -pl fluss-lake/fluss-lake-paimon -Dtest=RustUnionReadITCase \
+  -Dfluss.rust.union-read.enabled=true test
+```
+
+The Rust test is ignored in standalone Cargo runs because it needs a live
+Java-owned fixture. The dedicated job explicitly executes it; a missing binary,
+missing fixture setting, timeout or failed assertion fails the suite.
+Object-storage transport, missing-file and expired-partition full-chain scenarios
+from the earlier manual fixture are not claimed as coverage of this smaller suite.
