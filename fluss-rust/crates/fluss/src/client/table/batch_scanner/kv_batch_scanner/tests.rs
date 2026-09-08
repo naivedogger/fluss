@@ -19,7 +19,9 @@ use super::*;
 use crate::client::admin::FlussAdmin;
 use crate::client::metadata::Metadata;
 use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
-use crate::metadata::{DataField, DataTypes, PhysicalTablePath, SchemaInfo, TableInfo, TablePath};
+use crate::metadata::{
+    DataField, DataTypes, JsonSerde, PhysicalTablePath, SchemaInfo, TableInfo, TablePath,
+};
 use crate::record::kv::{SCHEMA_ID_LENGTH, ValueRecordBatch};
 use crate::row::binary::BinaryWriter;
 use crate::row::compacted::CompactedRowWriter;
@@ -74,7 +76,7 @@ fn protocol_test_cluster(table_info: &TableInfo, bucket: &TableBucket) -> Arc<Cl
         .map(|partition_id| HashMap::from([(Arc::clone(&physical_table_path), partition_id)]))
         .unwrap_or_default();
     Arc::new(Cluster::new(
-        None,
+        Some(server.clone()),
         HashMap::from([(server.id(), server)]),
         HashMap::from([(Arc::clone(&physical_table_path), vec![location.clone()])]),
         HashMap::from([(bucket.clone(), location)]),
@@ -155,6 +157,164 @@ fn compacted(field_count: usize, write: impl FnOnce(&mut CompactedRowWriter)) ->
     let mut writer = CompactedRowWriter::new(field_count);
     write(&mut writer);
     writer.to_bytes().as_ref().to_vec()
+}
+
+#[tokio::test(start_paused = true)]
+async fn kv_scanner_preserves_slow_schema_lookup_across_timeouts_and_cancellation() {
+    let table_info = build_two_col_table_info();
+    let old_schema_id = table_info.get_schema_id() - 1;
+    let schema_json = serde_json::to_vec(
+        &table_info
+            .get_schema()
+            .serialize_json()
+            .expect("schema JSON"),
+    )
+    .expect("encode schema");
+    let bucket = TableBucket::new(table_info.table_id, 0);
+    let (mut scanner, mut stream) = protocol_test_scanner(table_info, bucket);
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let open = read_framed_request(&mut stream).await;
+        write_success_response(
+            &mut stream,
+            open.request_id,
+            &ScanKvResponse {
+                has_more_results: Some(false),
+                records: Some(kv_record_bytes(old_schema_id as i16, 1, "one")),
+                ..Default::default()
+            },
+        )
+        .await;
+        let schema = read_framed_request(&mut stream).await;
+        assert_eq!(schema.api_key, i16::from(ApiKey::GetTableSchema));
+        // Slower than next_batch's internal 500 ms poll, but still healthy.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        write_success_response(
+            &mut stream,
+            schema.request_id,
+            &crate::proto::GetTableSchemaResponse {
+                schema_id: old_schema_id,
+                schema_json,
+            },
+        )
+        .await;
+        tokio::select! {
+            _ = finished_rx => {}
+            request = read_framed_request(&mut stream) => {
+                panic!("unexpected repeated request: {}", request.api_key);
+            }
+        }
+    });
+    assert!(matches!(
+        scanner
+            .next_batch_with_timeout(Duration::from_millis(20))
+            .await
+            .expect("poll"),
+        KvBatchReadOutcome::TimedOut
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), scanner.next_batch())
+            .await
+            .is_err()
+    );
+    let batch = tokio::time::timeout(Duration::from_secs(1), scanner.next_batch())
+        .await
+        .expect("slow schema must eventually complete")
+        .expect("decode")
+        .expect("terminal response still contains a batch");
+    assert_eq!(batch.batch().num_rows(), 1);
+    assert!(scanner.next_batch().await.expect("drained").is_none());
+    finished_tx.send(()).expect("finish server");
+    server.await.expect("schema server");
+}
+
+#[tokio::test(start_paused = true)]
+async fn kv_scanner_not_leader_refresh_respects_poll_timeout() {
+    let table_info = build_two_col_table_info();
+    let bucket = TableBucket::new(table_info.table_id, 0);
+    let (mut scanner, mut stream) = protocol_test_scanner(table_info, bucket);
+    let (refresh_tx, refresh_rx) = oneshot::channel();
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let open = read_framed_request(&mut stream).await;
+        write_success_response(
+            &mut stream,
+            open.request_id,
+            &ScanKvResponse {
+                error_code: Some(FlussError::NotLeaderOrFollower.code()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let refresh = read_framed_request(&mut stream).await;
+        assert_eq!(refresh.api_key, i16::from(ApiKey::MetaData));
+        refresh_tx.send(()).expect("refresh requested");
+        // Keep the connection alive without answering the metadata request.
+        finish_rx.await.expect("finish server");
+    });
+    let budget = Duration::from_millis(20);
+    let start = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        scanner.next_batch_with_timeout(budget),
+    )
+    .await
+    .expect("stalled refresh must not block error delivery")
+    .expect_err("NotLeader is preserved");
+    assert_eq!(error.api_error(), Some(FlussError::NotLeaderOrFollower));
+    assert!(start.elapsed() < Duration::from_millis(50));
+    refresh_rx.await.expect("refresh attempted");
+    assert!(scanner.next_batch().await.is_err());
+    finish_tx.send(()).expect("finish");
+    server.await.expect("metadata server");
+}
+
+#[tokio::test]
+async fn kv_scanner_aborts_pending_decode_on_close_and_drop() {
+    for explicit_close in [true, false] {
+        let table_info = build_two_col_table_info();
+        let bucket = TableBucket::new(table_info.table_id, 0);
+        let (mut scanner, _stream) = protocol_test_scanner(table_info, bucket);
+        scanner.drained = true;
+        let task = tokio::spawn(std::future::pending::<Result<RecordBatch>>());
+        let abort_handle = task.abort_handle();
+        scanner.pending_decode = Some(task);
+        if explicit_close {
+            scanner.close().await.expect("close");
+            assert!(scanner.next_batch().await.is_err());
+        }
+        drop(scanner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending decode must be aborted");
+    }
+}
+
+#[tokio::test]
+async fn kv_scanner_decode_failure_is_not_end_of_scan() {
+    let table_info = build_two_col_table_info();
+    let bucket = TableBucket::new(table_info.table_id, 0);
+    let (mut scanner, mut stream) = protocol_test_scanner(table_info, bucket);
+    let server = tokio::spawn(async move {
+        let open = read_framed_request(&mut stream).await;
+        write_success_response(
+            &mut stream,
+            open.request_id,
+            &ScanKvResponse {
+                has_more_results: Some(false),
+                records: Some(Bytes::from_static(&[0])),
+                ..Default::default()
+            },
+        )
+        .await;
+    });
+    assert!(scanner.next_batch().await.is_err());
+    assert!(scanner.next_batch().await.is_err());
+    server.await.expect("server");
 }
 
 #[tokio::test]

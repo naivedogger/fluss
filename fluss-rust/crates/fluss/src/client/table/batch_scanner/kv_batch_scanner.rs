@@ -24,7 +24,7 @@ use crate::proto::{PbScanReqForBucket, ScanKvResponse};
 use crate::record::ScanBatch;
 use crate::rpc::message::ScanKvRequest;
 use crate::rpc::{RpcClient, ServerConnection};
-use bytes::Bytes;
+use arrow::record_batch::RecordBatch;
 use log::debug;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -72,9 +72,9 @@ pub struct KvBatchScanner {
     log_offset: Option<i64>,
     /// The single open or continuation RPC currently executing.
     in_flight: Option<JoinHandle<Result<ScanKvRpcResult>>>,
-    /// Raw records from the last completed RPC. Retained until decoding succeeds
-    /// so cancellation during an asynchronous schema lookup cannot lose rows.
-    pending_records: Option<Bytes>,
+    /// Owned decode task, including any schema lookup. Poll timeouts must not
+    /// cancel and restart a slow lookup or discard an already decoded batch.
+    pending_decode: Option<JoinHandle<Result<RecordBatch>>>,
     drained: bool,
     closed: bool,
 }
@@ -127,7 +127,7 @@ impl KvBatchScanner {
             open_retry_at: None,
             log_offset: None,
             in_flight: None,
-            pending_records: None,
+            pending_decode: None,
             drained: false,
             closed: false,
         }
@@ -169,7 +169,8 @@ impl KvBatchScanner {
     ///
     /// A timeout never cancels or resends the current `ScanKv` request. The
     /// owned RPC task remains stored in the scanner, and a later call continues
-    /// waiting for that exact request and `call_seq_id`.
+    /// waiting for that exact request and `call_seq_id`. Record decoding and
+    /// schema lookups also retain their progress across timeouts.
     pub async fn next_batch_with_timeout(
         &mut self,
         timeout: Duration,
@@ -190,34 +191,28 @@ impl KvBatchScanner {
                 });
             }
 
-            if let Some(raw) = self.pending_records.clone() {
+            if let Some(task) = self.pending_decode.as_mut() {
                 let Some(remaining) = remaining_timeout(start, timeout) else {
                     return Ok(KvBatchReadOutcome::TimedOut);
                 };
-                let decoded = tokio::time::timeout(
-                    remaining,
-                    decode_kv_batch(
-                        &self.table_info,
-                        &self.schema_getter,
-                        self.projected_fields.as_deref(),
-                        raw,
-                        usize::MAX,
-                    ),
-                )
-                .await;
+                let Some(decoded) = wait_for_task(task, remaining).await else {
+                    return Ok(KvBatchReadOutcome::TimedOut);
+                };
                 let batch = match decoded {
                     Ok(Ok(batch)) => batch,
                     Ok(Err(error)) => {
                         self.terminate();
                         return Err(error);
                     }
-                    Err(_) => return Ok(KvBatchReadOutcome::TimedOut),
+                    Err(error) => {
+                        self.terminate();
+                        return Err(Error::UnexpectedError {
+                            message: format!("ScanKV decode task failed: {error}"),
+                            source: Some(Box::new(error)),
+                        });
+                    }
                 };
-
-                // Clear only after decoding succeeds. If the decode future is
-                // cancelled while fetching an older schema, the original bytes
-                // remain available for the next call.
-                self.pending_records = None;
+                self.pending_decode = None;
                 return Ok(KvBatchReadOutcome::Batch(ScanBatch::new(
                     self.bucket.clone(),
                     batch,
@@ -287,7 +282,11 @@ impl KvBatchScanner {
                 && code != FlussError::None.code()
             {
                 let retry_delay = self
-                    .handle_error_response(code, response.error_message.take())
+                    .handle_error_response(
+                        code,
+                        response.error_message.take(),
+                        remaining_timeout(start, timeout).unwrap_or_default(),
+                    )
                     .await?;
                 if let Some(delay) = retry_delay {
                     self.open_retry_at = Some(Instant::now() + delay);
@@ -319,8 +318,6 @@ impl KvBatchScanner {
                 });
             }
 
-            self.pending_records = response.records.take().filter(|raw| !raw.is_empty());
-
             if has_more_results {
                 // Pipeline the next continuation before decoding or returning
                 // the current records, matching the Java scanner.
@@ -329,6 +326,21 @@ impl KvBatchScanner {
                 // A terminal response means the server has already closed the
                 // session; no explicit close request is needed.
                 self.drained = true;
+            }
+            if let Some(raw) = response.records.take().filter(|raw| !raw.is_empty()) {
+                let table_info = self.table_info.clone();
+                let schema_getter = Arc::clone(&self.schema_getter);
+                let projected_fields = self.projected_fields.clone();
+                self.pending_decode = Some(tokio::spawn(async move {
+                    decode_kv_batch(
+                        &table_info,
+                        &schema_getter,
+                        projected_fields.as_deref(),
+                        raw,
+                        usize::MAX,
+                    )
+                    .await
+                }));
             }
         }
     }
@@ -359,7 +371,9 @@ impl KvBatchScanner {
         if let Some(task) = self.in_flight.take() {
             task.abort();
         }
-        self.pending_records = None;
+        if let Some(task) = self.pending_decode.take() {
+            task.abort();
+        }
         // Dispatch the close in an owned task. The RPC is best effort, and this
         // keeps close cancellation-safe if the caller drops this future.
         self.send_best_effort_close();
@@ -461,6 +475,7 @@ impl KvBatchScanner {
         &mut self,
         code: i32,
         message: Option<String>,
+        refresh_timeout: Duration,
     ) -> Result<Option<Duration>> {
         let error = FlussError::for_code(code);
         let api_error = ApiError {
@@ -483,7 +498,17 @@ impl KvBatchScanner {
             // snapshot and break snapshot isolation.
             FlussError::NotLeaderOrFollower => {
                 self.terminate();
-                self.refresh_bucket_metadata().await;
+                // Refresh only within the caller's remaining poll budget.
+                // The original error must still be returned if refresh stalls.
+                if tokio::time::timeout(refresh_timeout, self.refresh_bucket_metadata())
+                    .await
+                    .is_err()
+                {
+                    debug!(
+                        "Metadata refresh timed out after NotLeaderOrFollower for {}",
+                        self.bucket
+                    );
+                }
                 Err(Error::FlussAPIError { api_error })
             }
             // The server-side session is already gone; skip the close request.
@@ -534,7 +559,9 @@ impl KvBatchScanner {
             task.abort();
         }
         self.open_retry_at = None;
-        self.pending_records = None;
+        if let Some(task) = self.pending_decode.take() {
+            task.abort();
+        }
         if !fully_drained {
             self.drained = false;
         }
@@ -566,7 +593,7 @@ impl KvBatchScanner {
     }
 
     fn is_fully_drained(&self) -> bool {
-        self.drained && self.pending_records.is_none()
+        self.drained && self.pending_decode.is_none()
     }
 }
 
