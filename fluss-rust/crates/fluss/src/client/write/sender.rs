@@ -385,9 +385,21 @@ impl Sender {
                 }
             };
 
-            // Put batches back into records_by_bucket since response handling
-            // will use them.
-            for request_batch in request_batches {
+            // Snapshot after connection setup and request construction, immediately before
+            // dispatch. Refresh on every attempt, including retries, so an old out-of-order
+            // response can be distinguished from one with no subsequent ACK progress.
+            // Put batches back into records_by_bucket for response handling.
+            for mut request_batch in request_batches {
+                if self.idempotence_manager.is_enabled()
+                    && request_batch.write_batch.has_batch_sequence()
+                {
+                    let last_acked = self
+                        .idempotence_manager
+                        .last_acked_sequence(&request_batch.table_bucket);
+                    request_batch
+                        .write_batch
+                        .set_last_acked_sequence_at_send(last_acked);
+                }
                 records_by_bucket.insert(request_batch.table_bucket.clone(), request_batch);
             }
 
@@ -822,6 +834,7 @@ impl Sender {
                 &ready_write_batch.table_bucket,
                 seq,
                 ready_write_batch.write_batch.batch_id(),
+                ready_write_batch.write_batch.last_acked_sequence_at_send(),
                 error,
             );
         }
@@ -1219,6 +1232,7 @@ mod tests {
     use crate::row::{Datum, GenericRow};
     use crate::rpc::FlussError;
     use crate::test_utils::{build_cluster_arc, build_cluster_arc_with_port, build_table_info};
+    use futures::FutureExt;
     use prost::Message;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicUsize;
@@ -1892,6 +1906,232 @@ mod tests {
                 if code == FlussError::OutOfOrderSequenceException.code()
         ));
         Ok(())
+    }
+
+    /// Responses are released by the test, independently of request arrival order.
+    fn spawn_controlled_produce_server(
+        listener: TcpListener,
+        requests: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<FlussError>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, writer) = stream.into_split();
+            let writer = Arc::new(tokio::sync::Mutex::new(writer));
+            loop {
+                let mut len_buf = [0u8; 4];
+                if reader.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
+                let mut payload = vec![0u8; i32::from_be_bytes(len_buf) as usize];
+                reader.read_exact(&mut payload).await.expect("request");
+                let api_key = i16::from_be_bytes([payload[0], payload[1]]);
+                let request_id =
+                    i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                match api_key {
+                    1000 => {
+                        let response = ApiVersionsResponse {
+                            api_versions: vec![
+                                PbApiVersion {
+                                    api_key: 1000, // ApiVersions
+                                    min_version: 0,
+                                    max_version: 0,
+                                },
+                                PbApiVersion {
+                                    api_key: 1014, // ProduceLog
+                                    min_version: 0,
+                                    max_version: 0,
+                                },
+                            ],
+                            server_type: Some(ServerType::TabletServer.to_type_id()),
+                        };
+                        write_controlled_response(
+                            &mut *writer.lock().await,
+                            request_id,
+                            response.encode_to_vec(),
+                        )
+                        .await;
+                    }
+                    1014 => {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        requests.send(reply_tx).expect("test receives request");
+                        let writer = Arc::clone(&writer);
+                        tokio::spawn(async move {
+                            if let Ok(error) = reply_rx.await {
+                                let response = ProduceLogResponse {
+                                    buckets_resp: vec![PbProduceLogRespForBucket {
+                                        bucket_id: 0,
+                                        error_code: Some(error.code()),
+                                        ..Default::default()
+                                    }],
+                                };
+                                write_controlled_response(
+                                    &mut *writer.lock().await,
+                                    request_id,
+                                    response.encode_to_vec(),
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                    _ => panic!("unexpected API key {api_key}"),
+                }
+            }
+        })
+    }
+
+    async fn write_controlled_response(
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        request_id: i32,
+        body: Vec<u8>,
+    ) {
+        writer
+            .write_all(&((5 + body.len()) as i32).to_be_bytes())
+            .await
+            .expect("response length");
+        writer.write_all(&[0]).await.expect("success response type");
+        writer
+            .write_all(&request_id.to_be_bytes())
+            .await
+            .expect("request id");
+        writer.write_all(&body).await.expect("response body");
+        writer.flush().await.expect("flush");
+    }
+
+    fn send_controlled_batch(
+        sender: &Arc<Sender>,
+        batch: ReadyWriteBatch,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let mut batches = HashMap::from([(1, vec![batch])]);
+        sender.add_to_inflight_batches(&batches);
+        let batches = batches.remove(&1).unwrap();
+        let sender = Arc::clone(sender);
+        tokio::spawn(async move { sender.send_write_request(1, -1, batches).await })
+    }
+
+    #[derive(Clone, Copy)]
+    enum OutOfOrderScenario {
+        Stale,
+        Genuine,
+        Repeated,
+    }
+
+    async fn check_out_of_order_response(scenario: OutOfOrderScenario) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = spawn_controlled_produce_server(listener, request_tx);
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc_with_port(table_path.as_ref(), 1, 1, port as u32);
+        let idempotence = enabled_idempotence();
+        idempotence.set_writer_id(42);
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Arc::new(Sender::new(
+            Arc::new(Metadata::new_for_test(cluster.clone())),
+            accumulator.clone(),
+            1024 * 1024,
+            10_000,
+            -1,
+            i32::MAX,
+            Arc::clone(&idempotence),
+            Arc::new(crate::metrics::WriterMetrics::new()),
+        ));
+        let (batch0, handle0) =
+            build_ready_batch(&accumulator, cluster.clone(), table_path.clone())?;
+        let bucket = batch0.table_bucket.clone();
+        assert_eq!(batch0.write_batch.batch_sequence(), 0);
+        let send0 = send_controlled_batch(&sender, batch0);
+        let response0 = request_rx.recv().await.expect("first request");
+        let mut first_response = Some((response0, send0));
+
+        if matches!(scenario, OutOfOrderScenario::Genuine) {
+            // No predecessor is pending when seq1 is sent: an OOO must still reset.
+            let (response, send) = first_response.take().unwrap();
+            response.send(FlussError::None).expect("ack seq0");
+            send.await.expect("send seq0")?;
+        }
+
+        let (batch1, handle1) = build_ready_batch(&accumulator, cluster.clone(), table_path)?;
+        assert_eq!(batch1.write_batch.batch_sequence(), 1);
+        let send1 = send_controlled_batch(&sender, batch1);
+        let response1 = request_rx.recv().await.expect("second request");
+
+        if let Some((response, send)) = first_response {
+            // Both sends saw last_acked=-1. Process seq0's ACK before seq1's old error.
+            response.send(FlussError::None).expect("ack seq0");
+            send.await.expect("send seq0")?;
+        }
+        assert!(handle0.wait().await?.is_ok());
+        assert!(idempotence.is_next_sequence(&bucket, 1));
+        response1
+            .send(FlussError::OutOfOrderSequenceException)
+            .expect("out of order");
+        send1.await.expect("send seq1")?;
+
+        if !matches!(scenario, OutOfOrderScenario::Genuine) {
+            assert_eq!(
+                idempotence.writer_id(),
+                42,
+                "stale error must not reset writer"
+            );
+            assert!(
+                handle1.wait().now_or_never().is_none(),
+                "batch must remain pending"
+            );
+            assert_eq!(idempotence.in_flight_count(&bucket), 1);
+
+            let node = cluster.get_tablet_server(1).expect("server").clone();
+            let mut batches =
+                accumulator.drain(cluster.clone(), &HashSet::from([node]), 1024 * 1024)?;
+            let retry = batches.remove(&1).expect("retry queued").pop().unwrap();
+            assert_eq!(retry.write_batch.batch_sequence(), 1);
+            assert_eq!(retry.write_batch.attempts(), 1);
+            let send_retry = send_controlled_batch(&sender, retry);
+            let response_retry = request_rx.recv().await.expect("retry request");
+            let error = if matches!(scenario, OutOfOrderScenario::Repeated) {
+                // No new ACK since the resend: the refreshed snapshot must prevent retry.
+                FlussError::OutOfOrderSequenceException
+            } else {
+                FlussError::None
+            };
+            response_retry.send(error).expect("retry response");
+            send_retry.await.expect("send retry")?;
+        }
+
+        let result = handle1.wait().now_or_never().expect("batch completed")?;
+        if matches!(scenario, OutOfOrderScenario::Stale) {
+            assert!(result.is_ok());
+            assert_eq!(idempotence.writer_id(), 42);
+            assert!(idempotence.is_next_sequence(&bucket, 2));
+        } else {
+            assert!(!idempotence.has_writer_id());
+            assert!(matches!(
+                result,
+                Err(broadcast::Error::WriteFailed { code, .. })
+                    if code == FlussError::OutOfOrderSequenceException.code()
+            ));
+        }
+        assert_eq!(idempotence.in_flight_count(&bucket), 0);
+        assert!(sender.in_flight_batches.lock().is_empty());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_out_of_order_response_retries_without_reset() -> Result<()> {
+        check_out_of_order_response(OutOfOrderScenario::Stale).await
+    }
+
+    #[tokio::test]
+    async fn test_genuine_out_of_order_response_resets_writer() -> Result<()> {
+        check_out_of_order_response(OutOfOrderScenario::Genuine).await
+    }
+
+    #[tokio::test]
+    async fn test_repeated_out_of_order_response_refreshes_snapshot() -> Result<()> {
+        check_out_of_order_response(OutOfOrderScenario::Repeated).await
     }
 
     #[tokio::test]
