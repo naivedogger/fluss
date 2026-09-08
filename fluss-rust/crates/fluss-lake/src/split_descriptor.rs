@@ -137,6 +137,14 @@ impl SplitDescriptor {
         })
     }
 
+    pub(crate) fn table_path(&self) -> &TablePath {
+        &self.table_path
+    }
+
+    pub(crate) fn schema_id(&self) -> i32 {
+        self.schema_id
+    }
+
     pub(crate) fn is_partitioned(&self) -> bool {
         self.partitioned
     }
@@ -145,28 +153,32 @@ impl SplitDescriptor {
         &self.table_bucket
     }
 
-    #[cfg(test)]
     pub(crate) fn start_offset(&self) -> i64 {
         self.start_offset
     }
 
-    #[cfg(test)]
     pub(crate) fn stop_offset(&self) -> i64 {
         self.stop_offset
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
     }
 
-    #[cfg(test)]
     pub(crate) fn lake_splits(&self) -> &[String] {
         &self.lake_splits
     }
 
+    pub(crate) fn primary_key_indexes(&self) -> &[usize] {
+        &self.primary_key_indexes
+    }
+
     pub(crate) fn is_primary_key(&self) -> bool {
         !self.primary_key_indexes.is_empty()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start_offset == self.stop_offset && self.lake_splits.is_empty()
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {

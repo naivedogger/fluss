@@ -27,9 +27,12 @@
 //! reads disabled, so an ORC table fails at read time with an explicit
 //! unsupported-format error.
 
-use crate::{FlussLakeError, FlussLakePartitionIdentity, Result};
-use fluss::metadata::{DataType, TableInfo, TablePath};
+use crate::{FlussLakeError, FlussLakePartitionIdentity, RecordBatchStream, Result};
+use arrow::array::StructArray;
+use arrow::record_batch::RecordBatch;
+use fluss::metadata::{DataType, RowType, TableInfo, TablePath};
 use fluss::predicate::{BoundLiteral, BoundPredicate, CompoundFunction, LeafFunction};
+use futures::StreamExt;
 use paimon::catalog::Identifier;
 use paimon::spec::{
     BucketFunctionType, CoreOptions, Datum as PaimonDatum, Predicate as PaimonPredicate,
@@ -146,6 +149,42 @@ async fn open_pinned_table(
         snapshot_id.to_string(),
     );
     Ok(table.copy_with_options(pinned))
+}
+
+/// Resolves a scan output projection into explicit Paimon field names.
+///
+/// Paimon projects by name while UnionRead requests project by Fluss field
+/// index, so the planner resolves indexes once against the frozen schema.
+///
+/// The resolved projection is explicit even when the request carries none:
+/// Fluss tiering appends the `__bucket`, `__offset` and `__timestamp` system
+/// columns to the Paimon table, so an unprojected Paimon read would leak
+/// columns that are not part of the plan's output schema. Enumerating the
+/// Fluss columns strips them by construction (the Java connector's
+/// `PaimonRecordReader` applies the same rule with a positional
+/// `ProjectedRow`).
+pub(crate) fn projected_field_names(
+    row_type: &RowType,
+    output_projection: Option<&[usize]>,
+) -> Result<Vec<String>> {
+    let Some(projection) = output_projection else {
+        return Ok(row_type
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect());
+    };
+    let mut names = Vec::with_capacity(projection.len());
+    for field_index in projection {
+        let field = row_type.fields().get(*field_index).ok_or_else(|| {
+            FlussLakeError::PlanningFailed(format!(
+                "output projection field index {field_index} exceeds table width {}",
+                row_type.fields().len()
+            ))
+        })?;
+        names.push(field.name().to_string());
+    }
+    Ok(names)
 }
 
 /// Selects the part of the exact core predicate that is safe to evaluate
@@ -627,6 +666,150 @@ fn encode_portable_split(split: &DataSplit, table_location: &str) -> Result<Stri
     })
 }
 
+/// Reads several frozen Paimon splits as one finite Arrow batch stream.
+///
+/// All splits must come from the same pinned snapshot. Reading them through
+/// one Paimon reader matters for primary-key tables: since
+/// apache/paimon-rust#374 the reader deduplicates keys across the splits it
+/// is given, which is exactly the per-bucket exactly-once guarantee the
+/// primary-key merge presumes.
+pub(crate) async fn read_snapshot_splits(
+    table_path: &TablePath,
+    catalog_options: &PaimonCatalogOptions,
+    snapshot_id: i64,
+    expected_bucket_id: i32,
+    projected_fields: Option<&[String]>,
+    encoded_splits: &[String],
+    pushdown_filter: Option<&BoundPredicate>,
+) -> Result<RecordBatchStream> {
+    let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
+    let splits = encoded_splits
+        .iter()
+        .map(|encoded| decode_portable_split(encoded, table.location()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut expected_bucket_path: Option<&str> = None;
+    for split in &splits {
+        if split.snapshot_id() != snapshot_id {
+            return Err(FlussLakeError::Internal(format!(
+                "Paimon split snapshot id {} does not match frozen snapshot id {snapshot_id}",
+                split.snapshot_id()
+            )));
+        }
+        if split.bucket() != expected_bucket_id {
+            return Err(FlussLakeError::Internal(format!(
+                "Paimon split bucket id {} does not match logical split bucket id {expected_bucket_id}",
+                split.bucket()
+            )));
+        }
+        match expected_bucket_path {
+            Some(path) if path != split.bucket_path() => {
+                return Err(FlussLakeError::Internal(format!(
+                    "one logical bucket split contains multiple Paimon bucket paths: '{path}' and '{}'",
+                    split.bucket_path()
+                )));
+            }
+            None => expected_bucket_path = Some(split.bucket_path()),
+            _ => {}
+        }
+    }
+    let mut read_builder = table.new_read_builder();
+    if let Some(field_names) = projected_fields {
+        let borrowed: Vec<&str> = field_names.iter().map(String::as_str).collect();
+        read_builder
+            .with_projection(&borrowed)
+            .map_err(|error| paimon_error("apply Paimon read projection", error))?;
+    }
+    if let Some(filter) =
+        pushdown_filter.and_then(|filter| to_paimon_predicate(filter, table.schema().fields()))
+    {
+        read_builder.with_filter(filter);
+    }
+    let stream = read_builder
+        .new_read()
+        .map_err(|error| paimon_error("create Paimon reader", error))?
+        .to_arrow(&splits)
+        .map_err(|error| paimon_error("read Paimon splits", error))?;
+
+    Ok(Box::pin(stream.map(|result| {
+        result
+            .map_err(|error| paimon_error("read Paimon split batch", error))
+            .and_then(upgrade_paimon_arrow_batch)
+    })))
+}
+
+/// Imports a Paimon Arrow 58 batch into the workspace Arrow 59 ABI without
+/// copying its buffers.
+///
+/// Both versions implement the stable Arrow C Data Interface. The producer's
+/// release callbacks remain attached to the exported structs, so imported
+/// Arrow 59 arrays keep the Arrow 58 buffers alive until their final drop.
+fn upgrade_paimon_arrow_batch(batch: arrow_array_58::RecordBatch) -> Result<RecordBatch> {
+    use arrow::array::ffi::{
+        FFI_ArrowArray as ArrowArray59, FFI_ArrowSchema as ArrowSchema59, from_ffi,
+    };
+    use arrow_array_58::StructArray as StructArray58;
+    use std::mem::{align_of, size_of};
+    use std::ptr::addr_of_mut;
+    use std::sync::Arc;
+
+    if size_of::<ArrowArray59>() != size_of::<arrow_array_58::ffi::FFI_ArrowArray>()
+        || align_of::<ArrowArray59>() != align_of::<arrow_array_58::ffi::FFI_ArrowArray>()
+        || size_of::<ArrowSchema59>() != size_of::<arrow_array_58::ffi::FFI_ArrowSchema>()
+        || align_of::<ArrowSchema59>() != align_of::<arrow_array_58::ffi::FFI_ArrowSchema>()
+    {
+        return Err(FlussLakeError::Internal(
+            "Arrow 58 and Arrow 59 C Data Interface layouts are incompatible".to_string(),
+        ));
+    }
+
+    let source: arrow_array_58::ArrayRef = Arc::new(StructArray58::from(batch));
+    let mut array = ArrowArray59::empty();
+    let mut schema = ArrowSchema59::empty();
+    // SAFETY: Both FFI structs are `repr(C)` implementations of the same
+    // stable Arrow C Data Interface. Size and alignment are checked above.
+    // Arrow 58 initializes the Arrow 59 storage in place, including producer
+    // release callbacks; `from_ffi` then takes ownership of those callbacks.
+    #[allow(deprecated)]
+    unsafe {
+        arrow_array_58::ffi::export_array_into_raw(
+            source,
+            addr_of_mut!(array).cast(),
+            addr_of_mut!(schema).cast(),
+        )
+        .map_err(|error| {
+            FlussLakeError::Internal(format!(
+                "failed to export a Paimon Arrow batch through the C Data Interface: {error}"
+            ))
+        })?;
+    }
+    // SAFETY: `array` and `schema` were initialized together by the Arrow 58
+    // exporter and ownership is transferred exactly once to Arrow 59.
+    let data = unsafe { from_ffi(array, &schema) }.map_err(|error| {
+        FlussLakeError::Internal(format!(
+            "failed to import a Paimon Arrow batch through the C Data Interface: {error}"
+        ))
+    })?;
+    Ok(RecordBatch::from(StructArray::from(data)))
+}
+
+fn decode_portable_split(encoded_split: &str, table_location: &str) -> Result<DataSplit> {
+    let portable: DataSplit = serde_json::from_str(encoded_split).map_err(|error| {
+        FlussLakeError::Internal(format!("failed to decode Paimon split: {error}"))
+    })?;
+    validate_split_file_names(&portable, |field, path, reason| {
+        FlussLakeError::Internal(format!(
+            "Paimon split {field} '{path}' is not a valid storage-relative path: {reason}"
+        ))
+    })?;
+    rewrite_split_paths(&portable, |path, field| {
+        absolute_storage_path(table_location, path).map_err(|reason| {
+            FlussLakeError::Internal(format!(
+                "Paimon split {field} '{path}' is not a valid storage-relative path: {reason}"
+            ))
+        })
+    })
+}
+
 fn validate_split_file_names<F>(split: &DataSplit, mut invalid: F) -> Result<()>
 where
     F: FnMut(&str, &str, String) -> FlussLakeError,
@@ -727,6 +910,18 @@ fn storage_relative_path(table_location: &str, path: &str) -> std::result::Resul
     Ok(relative.to_string())
 }
 
+fn absolute_storage_path(
+    table_location: &str,
+    relative: &str,
+) -> std::result::Result<String, String> {
+    validate_storage_relative_path(relative)?;
+    let table_location = table_location.trim_end_matches('/');
+    if table_location.is_empty() {
+        return Err("the resolved Paimon table location is empty".to_string());
+    }
+    Ok(format!("{table_location}/{relative}"))
+}
+
 fn validate_storage_relative_path(path: &str) -> std::result::Result<(), String> {
     if path.is_empty() {
         return Err("path is empty".to_string());
@@ -782,8 +977,38 @@ fn paimon_error(action: &str, error: paimon::Error) -> FlussLakeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluss::metadata::{DataField, DataTypes, RowType, Schema};
+    use arrow_array_58::{ArrayRef as ArrayRef58, Int32Array as Int32Array58};
+    use fluss::metadata::{DataField, DataTypes, Schema};
     use fluss::predicate::{Literal, Predicate, col};
+    use paimon::spec::DataFileMeta;
+    use std::sync::Arc;
+
+    fn row_type() -> RowType {
+        RowType::new(vec![
+            DataField::new("id", DataTypes::int(), None),
+            DataField::new("name", DataTypes::string(), None),
+            DataField::new("amount", DataTypes::bigint(), None),
+        ])
+    }
+
+    #[test]
+    fn imports_paimon_arrow_batches_without_changing_values() {
+        let source = arrow_array_58::RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array58::from(vec![Some(1), None, Some(3)])) as ArrayRef58,
+        )])
+        .unwrap();
+
+        let imported = upgrade_paimon_arrow_batch(source).unwrap();
+        let ids = imported
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+
+        assert_eq!(imported.schema().field(0).name(), "id");
+        assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
+    }
 
     fn table_info(
         properties: HashMap<String, String>,
@@ -892,6 +1117,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_projection_indexes_into_paimon_field_names() {
+        let names = projected_field_names(&row_type(), Some(&[2, 0])).unwrap();
+
+        assert_eq!(
+            names,
+            vec!["amount".to_string(), "id".to_string()],
+            "projection order must be preserved for the engine's scan output"
+        );
+    }
+
+    /// A request without a projection must still freeze an explicit column
+    /// list, or the tiering-appended Paimon system columns would leak into
+    /// the output schema.
+    #[test]
+    fn unprojected_requests_freeze_all_fluss_columns_explicitly() {
+        let names = projected_field_names(&row_type(), None).unwrap();
+
+        assert_eq!(
+            names,
+            vec!["id".to_string(), "name".to_string(), "amount".to_string()]
+        );
+    }
+
+    #[test]
     fn caller_catalog_properties_override_server_metadata() {
         let mut properties = HashMap::new();
         properties.insert(
@@ -933,6 +1182,14 @@ mod tests {
         let debug = format!("{options:?}");
         assert!(!debug.contains("CALLER-SECRET"));
         assert!(!debug.contains("s3.secret-key"));
+    }
+
+    #[test]
+    fn rejects_projection_beyond_the_frozen_schema() {
+        assert!(matches!(
+            projected_field_names(&row_type(), Some(&[3])),
+            Err(FlussLakeError::PlanningFailed(_))
+        ));
     }
 
     fn merge_engine_options(value: Option<&str>) -> HashMap<String, String> {
@@ -1108,6 +1365,93 @@ mod tests {
     }
 
     #[test]
+    fn portable_split_paths_are_relative_and_restored_at_execution() {
+        let table_location = "s3://warehouse/fluss/orders";
+        let split = DataSplit::builder()
+            .with_snapshot(42)
+            .with_partition(paimon::spec::BinaryRow::new(0))
+            .with_bucket(3)
+            .with_bucket_path(format!("{table_location}/region=US/bucket-3"))
+            .with_total_buckets(4)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap();
+
+        let encoded = encode_portable_split(&split, table_location).unwrap();
+        assert!(!encoded.contains(table_location));
+        assert!(encoded.contains("region=US/bucket-3"));
+
+        let restored = decode_portable_split(&encoded, table_location).unwrap();
+        assert_eq!(
+            restored.bucket_path(),
+            "s3://warehouse/fluss/orders/region=US/bucket-3"
+        );
+    }
+
+    #[test]
+    fn portable_split_rewrites_every_embedded_storage_path() {
+        let table_location = "s3://warehouse/fluss/orders";
+        let data_file: DataFileMeta = serde_json::from_value(serde_json::json!({
+            "_FILE_NAME": "data-0.parquet",
+            "_FILE_SIZE": 10,
+            "_ROW_COUNT": 1,
+            "_MIN_KEY": [],
+            "_MAX_KEY": [],
+            "_KEY_STATS": {
+                "_MIN_VALUES": [],
+                "_MAX_VALUES": [],
+                "_NULL_COUNTS": []
+            },
+            "_VALUE_STATS": {
+                "_MIN_VALUES": [],
+                "_MAX_VALUES": [],
+                "_NULL_COUNTS": []
+            },
+            "_MIN_SEQUENCE_NUMBER": 0,
+            "_MAX_SEQUENCE_NUMBER": 0,
+            "_SCHEMA_ID": 1,
+            "_LEVEL": 1,
+            "_EXTRA_FILES": [],
+            "_CREATION_TIME": null,
+            "_DELETE_ROW_COUNT": 0,
+            "_EMBEDDED_FILE_INDEX": null,
+            "_EXTERNAL_PATH": format!("{table_location}/external/data-0.parquet")
+        }))
+        .unwrap();
+        let split = DataSplit::builder()
+            .with_snapshot(42)
+            .with_partition(paimon::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_location}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                format!("{table_location}/index/deletion-vector"),
+                7,
+                11,
+                Some(1),
+            ))])
+            .build()
+            .unwrap();
+
+        let encoded = encode_portable_split(&split, table_location).unwrap();
+        assert!(!encoded.contains(table_location));
+
+        let restored = decode_portable_split(&encoded, table_location).unwrap();
+        assert_eq!(
+            restored.data_files()[0].external_path.as_deref(),
+            Some("s3://warehouse/fluss/orders/external/data-0.parquet")
+        );
+        assert_eq!(
+            restored.data_deletion_files().unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .path(),
+            "s3://warehouse/fluss/orders/index/deletion-vector"
+        );
+    }
+
+    #[test]
     fn portable_split_rejects_paths_outside_the_table_root() {
         let split = DataSplit::builder()
             .with_snapshot(42)
@@ -1123,5 +1467,95 @@ mod tests {
             encode_portable_split(&split, "s3://warehouse/fluss/orders"),
             Err(FlussLakeError::PlanningFailed(_))
         ));
+    }
+
+    #[test]
+    fn reader_rejects_absolute_paths_in_distributed_split_payloads() {
+        let split = DataSplit::builder()
+            .with_snapshot(42)
+            .with_partition(paimon::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("s3://attacker-controlled/orders/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap();
+        let encoded = serde_json::to_string(&split).unwrap();
+
+        assert!(matches!(
+            decode_portable_split(&encoded, "s3://warehouse/fluss/orders"),
+            Err(FlussLakeError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn reader_rejects_unsafe_data_and_extra_file_names() {
+        let table_location = "s3://warehouse/fluss/orders";
+        let data_file: DataFileMeta = serde_json::from_value(serde_json::json!({
+            "_FILE_NAME": "data-0.parquet",
+            "_FILE_SIZE": 10,
+            "_ROW_COUNT": 1,
+            "_MIN_KEY": [],
+            "_MAX_KEY": [],
+            "_KEY_STATS": {
+                "_MIN_VALUES": [],
+                "_MAX_VALUES": [],
+                "_NULL_COUNTS": []
+            },
+            "_VALUE_STATS": {
+                "_MIN_VALUES": [],
+                "_MAX_VALUES": [],
+                "_NULL_COUNTS": []
+            },
+            "_MIN_SEQUENCE_NUMBER": 0,
+            "_MAX_SEQUENCE_NUMBER": 0,
+            "_SCHEMA_ID": 1,
+            "_LEVEL": 1,
+            "_EXTRA_FILES": ["data-0.index"],
+            "_CREATION_TIME": null,
+            "_DELETE_ROW_COUNT": 0,
+            "_EMBEDDED_FILE_INDEX": null
+        }))
+        .unwrap();
+        let split_with_file = |data_file: DataFileMeta| {
+            DataSplit::builder()
+                .with_snapshot(42)
+                .with_partition(paimon::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![data_file])
+                .build()
+                .unwrap()
+        };
+
+        for unsafe_name in [
+            "../outside.parquet",
+            "/tmp/outside.parquet",
+            "s3://attacker/outside.parquet",
+            "nested/../../outside.parquet",
+        ] {
+            let mut tampered = data_file.clone();
+            tampered.file_name = unsafe_name.to_string();
+            let encoded = serde_json::to_string(&split_with_file(tampered)).unwrap();
+            assert!(
+                matches!(
+                    decode_portable_split(&encoded, table_location),
+                    Err(FlussLakeError::Internal(_))
+                ),
+                "reader must reject unsafe data file name {unsafe_name}"
+            );
+
+            let mut tampered = data_file.clone();
+            tampered.extra_files = vec![unsafe_name.to_string()];
+            let encoded = serde_json::to_string(&split_with_file(tampered)).unwrap();
+            assert!(
+                matches!(
+                    decode_portable_split(&encoded, table_location),
+                    Err(FlussLakeError::Internal(_))
+                ),
+                "reader must reject unsafe extra file name {unsafe_name}"
+            );
+        }
     }
 }
