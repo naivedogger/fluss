@@ -31,8 +31,12 @@
 //! Setting a predicate on a scan is only supported on log scans over tables
 //! with the ARROW log format.
 
+mod bound;
+mod eval;
 mod pb;
 
+#[doc(hidden)]
+pub use bound::{BoundLiteral, BoundPredicate};
 pub(crate) use pb::to_pb_predicate;
 
 use crate::row::{Decimal, TimestampLtz, TimestampNtz};
