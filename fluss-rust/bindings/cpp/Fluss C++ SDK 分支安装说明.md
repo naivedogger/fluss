@@ -7,7 +7,7 @@
 ## 源码版本
 
 - 仓库：`https://github.com/naivedogger/fluss.git`
-- 云览客户分支：`bugfix/yunlan-cpp-sdk`
+- 云览客户分支：`dev-cloudview`
 - 本文对应的 SDK 代码提交：`c19493ff208b5e22dd222b2e7e0672b5e42a6c46`
 - 相关上游 PR：[4252](https://github.com/apache/fluss/pull/4252)
 
@@ -21,7 +21,7 @@
 
 ```bash
 git clone --single-branch \
-  --branch bugfix/yunlan-cpp-sdk \
+  --branch dev-cloudview \
   https://github.com/naivedogger/fluss.git fluss-sdk-write-fix
 
 cd fluss-sdk-write-fix
