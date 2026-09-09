@@ -924,11 +924,11 @@ impl RecordAccumulator {
             return;
         }
 
-        // Find the correct position sorted by batch_sequence
+        // Keep retries ordered ahead of batches that have never been sent.
         let batch_seq = ready_write_batch.write_batch.batch_sequence();
         let mut insert_pos = dq.len();
         for (i, existing) in dq.iter().enumerate() {
-            if existing.has_batch_sequence() && existing.batch_sequence() > batch_seq {
+            if !existing.has_batch_sequence() || existing.batch_sequence() > batch_seq {
                 insert_pos = i;
                 break;
             }
@@ -1350,6 +1350,58 @@ mod tests {
 
     fn enabled_idempotence() -> Arc<IdempotenceManager> {
         Arc::new(IdempotenceManager::new(true, 5))
+    }
+
+    #[tokio::test]
+    async fn test_retries_drain_before_fresh_batches() -> Result<()> {
+        let idempotence = Arc::new(IdempotenceManager::new(true, 2));
+        idempotence.set_writer_id(42);
+        let accumulator = RecordAccumulator::new(Config::default(), Arc::clone(&idempotence));
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone())));
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 2));
+        let cluster = Arc::new(build_cluster(&table_path, 1, 2));
+        let first = append_and_drain(&accumulator, &cluster, &table_path, 0)?;
+        let second = append_and_drain(&accumulator, &cluster, &table_path, 0)?;
+        let second_id = second.write_batch.batch_id();
+        let bucket = first.table_bucket.clone();
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(table_info, Arc::clone(&physical_path), 1, &row);
+        let mut fresh_ids = Vec::new();
+        for _ in 0..2 {
+            accumulator.append(&record, 0, &cluster, false)?;
+            let entry = accumulator.write_batches.get(&physical_path).unwrap();
+            let mut queue = entry.batches.get(&0).unwrap().lock();
+            let batch = queue.back_mut().unwrap();
+            fresh_ids.push(batch.batch_id());
+            // Keep two distinct fresh batches queued while both slots are occupied.
+            batch.close()?;
+        }
+        accumulator.re_enqueue(second);
+        let nodes = HashSet::from([cluster.get_tablet_server(1).unwrap().clone()]);
+        assert!(
+            accumulator
+                .drain(cluster.clone(), &nodes, 1024 * 1024)?
+                .is_empty()
+        );
+        idempotence.handle_completed_batch(&bucket, first.write_batch.batch_id(), 42);
+
+        // The retry must precede both fresh batches, even with a free in-flight slot.
+        for (expected_seq, expected_id) in [second_id, fresh_ids[0], fresh_ids[1]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut batches = accumulator.drain(cluster.clone(), &nodes, 1024 * 1024)?;
+            let batch = batches.remove(&1).unwrap().pop().unwrap();
+            assert_eq!(batch.write_batch.batch_id(), expected_id);
+            assert_eq!(batch.write_batch.batch_sequence(), expected_seq as i32 + 1);
+            idempotence.handle_completed_batch(&bucket, expected_id, 42);
+        }
+        assert_eq!(idempotence.in_flight_count(&bucket), 0);
+        assert!(accumulator.drain(cluster, &nodes, 1024 * 1024)?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
