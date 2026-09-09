@@ -549,14 +549,13 @@ public class FlinkTableSource
             return null;
         }
 
-        Integer numBuckets =
-                org.apache.flink.configuration.Configuration.fromMap(tableOptions)
-                        .get(FlinkConnectorOptions.BUCKET_NUMBER);
-        // Connector tables declared outside the Fluss Catalog may not expose the resolved bucket
-        // count. Keep regular lookup joins usable and skip the optional custom shuffle.
-        if (numBuckets == null || numBuckets <= 0) {
-            return null;
-        }
+        // Fluss Catalog exposes the resolved bucket count through FlinkConversions.toFlinkTable.
+        int numBuckets =
+                checkNotNull(
+                        org.apache.flink.configuration.Configuration.fromMap(tableOptions)
+                                .get(FlinkConnectorOptions.BUCKET_NUMBER),
+                        "The resolved table option '%s' must be present for bucket shuffle.",
+                        FlinkConnectorOptions.BUCKET_NUMBER.key());
         org.apache.flink.table.types.logical.RowType lookupKeyType =
                 FlinkUtils.projectRowType(tableOutputType, lookupNormalizer.getLookupKeyIndexes());
         List<String> fieldNames = tableOutputType.getFieldNames();

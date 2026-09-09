@@ -74,7 +74,7 @@ class FlussLookupInputPartitionerTest {
      *
      * <p>This test pins only the exact bucket id ({@code numPartitions == numBuckets}); the {@code
      * bucket % numPartitions} channel selection is already covered by {@link
-     * #testNonPartitionedRoutingMatchesBucketAndIsDeterministic()}.
+     * #testDivisibleBucketRoutingMatchesOriginalAssignment()}.
      */
     @Test
     void testGoldenBucketVectors() {

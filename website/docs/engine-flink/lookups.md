@@ -290,13 +290,12 @@ of Fluss tablets.
   deterministic and bucket fan-out bounded while balancing the expected load across subtasks.
 - Partitioned and non-partitioned tables use the same strategy. Partition keys are included in the
   normalized lookup key, so the same lookup key is routed consistently. A `(partition, bucket)`
-  tablet may be accessed by multiple subtasks when weighted logical slots are used.
+  tablet may be accessed by multiple subtasks when there are fewer buckets than subtasks or when
+  weighted logical slots are used.
 
 Bucket custom shuffle applies to hash-distributed tables with bucket keys. Tables without bucket
 keys use Flink's default lookup distribution. Fluss Catalog tables expose the resolved `bucket.num`
-automatically. For Fluss connector tables declared outside the Fluss Catalog, configure a matching
-positive `bucket.num` to enable custom shuffle; otherwise, Flink uses its default lookup
-distribution.
+automatically, including when `bucket.num` is omitted from the table DDL.
 
 ## Historical Partition Lookup
 
