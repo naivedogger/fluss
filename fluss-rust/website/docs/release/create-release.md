@@ -2,438 +2,141 @@
 sidebar_position: 4
 ---
 
-# Creating a Fluss Rust Client Release
+<!--
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License. You may obtain a copy of the License at
 
-This document describes in detail how to create a release of the **Fluss clients** (fluss-rust, fluss-python, fluss-cpp) from the [fluss-rust](https://github.com/apache/fluss) repository. It is based on the [Creating a Fluss Release](https://fluss.apache.org/community/how-to-release/creating-a-fluss-release/) guide of the Apache Fluss project and the [release guide of Apache OpenDAL](https://nightlies.apache.org/opendal/opendal-docs-stable/community/release/); releases are source archives plus CI-published crates.io and PyPI.
+   http://www.apache.org/licenses/LICENSE-2.0
 
-Publishing software has legal consequences. This guide complements the foundation-wide [Product Release Policy](https://www.apache.org/legal/release-policy.html) and [Release Distribution Policy](https://infra.apache.org/release-distribution.html).
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied. See the License for the
+ specific language governing permissions and limitations
+ under the License.
+-->
 
-## Overview
+# Preparing Clients for a Fluss Release
 
-![Release process overview](/img/release-guide.png)
+The Rust client and its Python, C++ and Elixir bindings share the main Fluss
+release version and Git tag. There is **no separate client source release**.
+The authoritative process for release branches, signing, staging, voting and
+publication is [Creating a Fluss Release](https://fluss.apache.org/community/how-to-release/creating-a-fluss-release/).
+This page covers client preparation within that process, not a second release
+procedure. Do not use the historical standalone-repository release instructions.
 
-The release process consists of:
+## Tools and boundaries
 
-1. [Decide to release](#decide-to-release)
-2. [Prepare for the release](#prepare-for-the-release)
-3. [Build a release candidate](#build-a-release-candidate)
-4. [Vote on the release candidate](#vote-on-the-release-candidate)
-5. [If necessary, fix any issues and go back to step 3](#fix-any-issues)
-6. [Finalize the release](#finalize-the-release)
-7. [Promote the release](#promote-the-release)
+| Tool | Responsibility |
+| --- | --- |
+| `scripts/bump-version.sh CURRENT NEXT` | Update the Rust workspace version, its `fluss` self-dependency and the Elixir application's `@version` |
+| `scripts/release_version.py check --tag TAG` | Read-only version preflight for the proposed shared tag |
+| `scripts/dependencies.py generate` / `verify` | Generate / verify the client dependency inventories |
+| `scripts/release.sh` / `just release` | Retired; fail with a pointer to the main Fluss release process |
 
-## Decide to release
+The Python tools require **Python 3.11+**. Set `PYTHON` when using the shell
+wrapper or just recipes if `python3` selects an older interpreter.
+No tool on this page creates or pushes a tag, uploads a package, or approves a
+release. The preflight is local tooling; it does not replace the checks in the
+publishing workflows or automatically add a new CI gate.
 
-Deciding to release and selecting a Release Manager is the first step. This is a consensus-based decision of the community.
+## Prepare all versions before tagging
 
-Anybody can propose a release (e.g. on the dev [mailing list](https://fluss.apache.org/community/welcome/)), giving a short rationale and nominating a committer as Release Manager (including themselves). Any objections should be resolved by consensus before starting.
+Use a clean release checkout. Run the commands below from the **main repository
+root**, unless indicated otherwise. Finish this section **before** the main
+release guide's step that creates the RC tag or builds source artifacts.
 
-**Checklist to proceed**
+1. Follow the main guide to prepare Java and Gateway versions with
+   `tools/releasing/update_branch_version.sh`. That script does not update the
+   Rust workspace. It also creates a commit, so review the checkout first.
+2. Update the client versions. The bindings inherit the Cargo workspace version;
+   the Elixir application's separate version is updated by the same command:
 
-- [ ] Community agrees to release
-- [ ] A Release Manager is selected
+   ```bash
+   RELEASE_VERSION="1.0.0"
+   CURRENT_CLIENT_VERSION="1.0.0"  # Set to the actual current client version.
+   fluss-rust/scripts/bump-version.sh "$CURRENT_CLIENT_VERSION" "$RELEASE_VERSION"
+   ```
 
-## Prepare for the release
+   The script validates all three current version fields before writing. It
+   edits only the owned manifest fields, not unrelated dependency versions.
+   It does **not** hand-edit lockfiles or generated license inventories.
+3. Refresh lockfiles using Cargo in **both** workspaces. Gateway has a separate
+   lockfile and a path dependency on the Rust client:
 
-### 0. One-time Release Manager setup
+   ```bash
+   cargo update --workspace --offline --manifest-path fluss-rust/Cargo.toml
+   cargo update --workspace --offline --manifest-path fluss-gateway/Cargo.toml
+   ```
 
-Before your first release, perform one-time configuration. See **[Release Manager Preparation](https://fluss.apache.org/community/how-to-release/release-manager-preparation/)** (GPG key, etc.). For fluss-rust you do **not** need Nexus/Maven; you only need GPG for signing the source archive and (optionally) git signing.
+   Offline resolution requires dependencies to be cached. If they are missing,
+   populate the cache deliberately before retrying. Review both lockfile diffs;
+   do not silently include unrelated dependency upgrades in a version-only change.
+4. Regenerate and review the dependency inventories with the pinned cargo-deny
+   version required by the client scripts:
 
-For GitHub Actions publishing, configure the repository secret `CARGO_REGISTRY_TOKEN` with a crates.io API token from an account allowed to publish `fluss-rs`. The `Release Rust` workflow uses this secret directly when a release tag is pushed.
+   ```bash
+   (cd fluss-rust && python3 scripts/dependencies.py generate)
+   (cd fluss-rust && python3 scripts/dependencies.py verify)
+   ```
 
-**Checklist (one-time)**
+   Also refresh and verify Gateway's inventory and binary license files according
+   to its release instructions. Its dependency closure includes the Rust client.
+5. Run the read-only version preflight:
 
-- [ ] GPG key set up and published to [KEYS](https://downloads.apache.org/fluss/KEYS) or Apache account
-- [ ] Git configured to use your GPG key for signing tags
-- [ ] GitHub Actions secret `CARGO_REGISTRY_TOKEN` configured for crates.io publishing
+   ```bash
+   python3 fluss-rust/scripts/release_version.py check --tag "v${RELEASE_VERSION}-rc1"
+   ```
 
-### 1. Install Rust (and optional: just)
+   This checks the direct Maven project version, Gateway version, Rust workspace
+   and self-dependency versions, inherited member versions, Elixir version,
+   Python's dynamic version setting, and local package versions in both Cargo
+   lockfiles. A development `SNAPSHOT` version is not a release version.
+6. Review and commit **all** manifest, lockfile and inventory changes, run the
+   component verification required by the main guide, then create the shared RC
+   tag at that exact commit. Do not bump clients after tagging the source release.
 
-The release script (`just release` or `./scripts/release.sh`) uses `git archive` and `gpg`; building or verifying the project locally requires **Rust**. Install the [Rust toolchain](https://rustup.rs/) (the version should match [rust-toolchain.toml](https://github.com/apache/fluss/blob/main/fluss-rust/rust-toolchain.toml) in the repo). The dependency list script (`scripts/dependencies.py`) requires **Python 3.11+**.
+The accepted tag names are `vX.Y.Z`, `vX.Y.Z-rcN` and `vX.Y.Z-rc.N`, with N starting
+at 1. Source manifests keep `X.Y.Z` for both RC and final tags. This command checks
+the working tree against a **proposed tag name**; it does not resolve a Git tag or
+prove that an existing tag points to these files. It does not replace Cargo
+`--locked` resolution, builds, license audits, signatures or release voting.
 
-```bash
-rustc --version
-cargo --version
-```
+For the next development cycle, the bump command accepts Cargo SemVer such as
+`1.1.0-SNAPSHOT`, not Maven shorthand `1.1-SNAPSHOT`. Refresh generated files and
+review them there as well. Java/Gateway version changes remain under the main
+release tooling.
 
-To use `just release`, install [just](https://github.com/casey/just) (e.g. `cargo install just` or your system package manager). If you prefer not to use just, run `./scripts/release.sh $RELEASE_VERSION` instead.
+## RC and final publication
 
-### 2. Optional: Create a new Milestone in GitHub
+The main Fluss release process controls source artifacts and approval:
 
-If the project uses GitHub milestones for release tracking, create a new milestone for the **next** version (e.g. `v0.2` if you are releasing `0.1.x`). This helps contributors target issues to the correct release.
+- The source distribution is `fluss-${RELEASE_VERSION}-src.tgz`. Client sources
+  are under `fluss-${RELEASE_VERSION}/fluss-rust/` after extraction.
+- An RC tag runs Rust's crates.io dry-run and publishes Python wheels/sdist to
+  TestPyPI through the repository workflows.
+- After release approval, the final tag triggers crates.io and PyPI publication.
+- C++ currently ships as source, not as a separately published precompiled SDK.
+  This tooling does not introduce a C++ binary publisher or an Elixir/Hex publisher.
 
-### 3. Optional: Triage release-blocking issues
+Do not create a separate `fluss-rust-${RELEASE_VERSION}.tgz`, a client-only release
+branch, or a competing release tag. A future independent client release policy
+would require community agreement and corresponding tooling changes.
 
-Check open issues that might block the release. Resolve, defer to the next milestone, or mark as blocker and do not proceed until they are fixed.
-
-### 4. Clone fluss-rust into a fresh workspace
-
-Use a clean clone to avoid local changes affecting the release.
-
-```bash
-git clone https://github.com/apache/fluss.git
-cd fluss-rust
-```
-
-### 5. Set up environment variables
-
-Set these once and use them in all following commands. (Bash syntax.)
-
-```bash
-RELEASE_VERSION="0.1.0"
-SHORT_RELEASE_VERSION="0.1"
-RELEASE_TAG="v${RELEASE_VERSION}"
-SVN_RELEASE_DIR="fluss-rust-${RELEASE_VERSION}"
-# Only set if there is a previous release (for compare link in DISCUSS / release notes)
-LAST_VERSION="0.0.9"
-NEXT_VERSION="0.2.0"
-```
-
-For the **first release** there is no previous version; leave `LAST_VERSION` unset or omit it when using the compare link in the DISCUSS thread and release notes.
-
-### 6. Generate dependencies list
-
-[ASF release policy](https://www.apache.org/legal/release-policy.html) requires that every release comply with [ASF licensing policy](https://www.apache.org/legal/resolved.html) and that an **audit be performed before a full release**. Generating and committing a dependency list (and using cargo-deny) documents third-party components and supports this requirement.
-
-Do this on `main` **before** creating the release branch. Then both the release branch (when created from `main`) and `main` will have the same dependency list.
-
-1. Download and set up [cargo-deny](https://embarkstudios.github.io/cargo-deny/cli/index.html) (see cargo-deny docs).
-2. Run the script to update the dependency list (requires **Python 3.11+** for the release tooling), then commit on `main`:
-
-```bash
-git checkout main
-git pull
-python3 scripts/dependencies.py generate
-git add **/DEPENDENCIES*.tsv
-# Bash: run  shopt -s globstar  first so ** matches subdirs
-git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
-git push origin main
-```
-
-To only check licenses (no file update): `python3 scripts/dependencies.py check`.
-
-### 7. Optional: Start a [DISCUSS] thread
-
-On [Fluss Discussions](https://github.com/apache/fluss/discussions) or the dev list:
-
-- **Subject:** `[DISCUSS] Release Apache Fluss clients (fluss-rust, fluss-python, fluss-cpp) $RELEASE_VERSION`
-- **Body:** Short rationale; if there is a previous release, add compare link: `https://github.com/apache/fluss/compare/v${LAST_VERSION}...main`. Ask for comments.
-
-### 8. Create a release branch
-
-From `main`, create a release branch. All release artifacts will be built from this branch. The tag (RC or release) is created later when building the release candidate.
-
-```bash
-git checkout main
-git pull
-git checkout -b release-${SHORT_RELEASE_VERSION}
-git push origin release-${SHORT_RELEASE_VERSION}
-```
-
-Do **not** create or push the release/RC tag yet; that happens in [Build a release candidate](#build-a-release-candidate) after the source artifacts are staged.
-
-### 9. Bump version on main for the next development cycle
-
-So that `main` moves to the next version immediately after the release branch is cut, run the bump script and commit:
+## Verify these tools without publishing
 
 ```bash
-git checkout main
-git pull
-
-./scripts/bump-version.sh $RELEASE_VERSION $NEXT_VERSION
-
-git add Cargo.toml
-git commit -m "Bump version to ${NEXT_VERSION}"
-git push origin main
+python3 -m unittest discover -s fluss-rust/scripts -p 'test_release_version.py' -v
 ```
 
-The script updates the root `Cargo.toml` ([workspace.package] and [workspace.dependencies] fluss-rs). crates/fluss and bindings inherit `version` from the workspace.
-
-### 10. Optional: Create PRs for release blog and download page
-
-You can open a pull request in the **Apache Fluss** repository for the release blog (announcement). If the project website has a download page, also create a PR to add the new version there. **Do not merge these PRs until the release is finalized.**
-
----
-
-**Checklist to proceed to the next step**
-
-- [ ] Rust (and optionally just) installed and on PATH
-- [ ] Python 3.11+ for dependency list script
-- [ ] No release-blocking issues (or triaged)
-- [ ] Environment variables set
-- [ ] Release branch created and pushed
-- [ ] Main branch bumped to `NEXT_VERSION` and pushed
-- [ ] Dependencies list generated and committed on main
-- [ ] (Optional) DISCUSS thread and/or tracking issue created
-- [ ] (Optional) PRs for blog and download page created but not merged
-
-## Build a release candidate
-
-Each release candidate is built from the release branch, signed, and staged to the dev area of dist.apache.org. If an RC fails the vote, fix issues and repeat this section with an incremented `RC_NUM` (see [Fix any issues](#fix-any-issues)).
-
-### 1. Set RC environment variables
-
-Set these when building a **release candidate**. Start with `RC_NUM=1`; if the vote fails and you build a new candidate, increment to `2`, then `3`, etc.
-
-```bash
-export RC_NUM="1"
-export RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
-export SVN_RC_DIR="fluss-rust-${RELEASE_VERSION}-rc${RC_NUM}"
-```
-
-For a **direct release** (no RC), skip these and use `RELEASE_TAG` and `SVN_RELEASE_DIR` from the Prepare step instead.
-
-### 2. Check out the release branch and create the tag
-
-Check out the release branch at the commit you want to release, create the signed tag, then push it. Use `RC_TAG` for a release candidate or `RELEASE_TAG` for a direct release. Pushing the tag triggers GitHub Actions (for an RC tag, fluss-python is published to TestPyPI).
-
-```bash
-git checkout release-${SHORT_RELEASE_VERSION}
-git pull
-git tag -s $RC_TAG -m "${RC_TAG}"
-git push origin $RC_TAG
-```
-
-Check CI: [Actions](https://github.com/apache/fluss/actions) (Release Rust, Release Python).
-
-### 3. Create source release artifacts
-
-From the repository root (on the release branch, at the commit you tagged):
-
-```bash
-just release $RELEASE_VERSION
-# Or: ./scripts/release.sh $RELEASE_VERSION
-```
-
-This creates under `dist/`:
-
-- `fluss-rust-${RELEASE_VERSION}.tgz`
-- `fluss-rust-${RELEASE_VERSION}.tgz.sha512`
-- `fluss-rust-${RELEASE_VERSION}.tgz.asc`
-
-Verify with: `gpg --verify dist/fluss-rust-${RELEASE_VERSION}.tgz.asc dist/fluss-rust-${RELEASE_VERSION}.tgz`
-
-### 4. Stage artifacts to SVN (dist.apache.org dev)
-
-From the **fluss-rust** repo root, check out the Fluss dev area and add the release artifacts.
-
-```bash
-svn checkout https://dist.apache.org/repos/dist/dev/fluss fluss-dist-dev --depth=immediates
-cd fluss-dist-dev
-mkdir $SVN_RC_DIR
-cp ../dist/fluss-rust-${RELEASE_VERSION}.* $SVN_RC_DIR/
-svn add $SVN_RC_DIR
-svn status
-svn commit -m "Add fluss-rust ${RELEASE_VERSION} RC${RC_NUM}"
-```
-
-Verify: [https://dist.apache.org/repos/dist/dev/fluss/](https://dist.apache.org/repos/dist/dev/fluss/)
-
----
-
-**Checklist to proceed to the next step**
-
-- [ ] Source distribution built and signed under `dist/`
-- [ ] Artifacts staged to [dist.apache.org dev](https://dist.apache.org/repos/dist/dev/fluss/) under `$SVN_RC_DIR`
-- [ ] RC (or release) tag pushed to GitHub
-- [ ] CI for Release Rust / Release Python succeeded
-
-## Vote on the release candidate
-
-Share the release candidate for community review.
-
-### Fluss community vote
-
-Start the vote on the dev@ mailing list.
-
-**Subject:** `[VOTE] Release Apache Fluss clients (fluss-rust, fluss-python, fluss-cpp) ${RELEASE_VERSION} (RC${RC_NUM})`
-
-**Body template:**
-
-```
-Hi everyone,
-
-Please review and vote on release candidate #${RC_NUM} for Apache Fluss clients (fluss-rust, fluss-python, fluss-cpp) ${RELEASE_VERSION}.
-
-[ ] +1 Approve the release
-[ ] +0 No opinion
-[ ] -1 Do not approve (please provide specific comments)
-
-The release candidate (source distribution) is available at:
-* https://dist.apache.org/repos/dist/dev/fluss/$SVN_RC_DIR/
-
-KEYS for signature verification:
-* https://downloads.apache.org/fluss/KEYS
-
-Git tag:
-* https://github.com/apache/fluss/releases/tag/$RC_TAG
-
-PyPI (release) / TestPyPI (RC):
-* https://pypi.org/project/pyfluss/
-* https://test.pypi.org/project/pyfluss/
-
-Please download, verify, and test. Verification steps are in [How to Verify a Release Candidate](verifying-a-release-candidate.md).
-
-The vote will be open for at least 72 hours. It is adopted by majority approval with at least 3 PMC affirmative votes (or as per project policy).
-
-Thanks,
-Release Manager
-```
-
-If issues are found, cancel the vote and go to [Fix any issues](#fix-any-issues). If the vote passes, close it and tally the result in a follow-up:
-
-**Subject:** `[RESULT][VOTE] Release Apache Fluss clients ${RELEASE_VERSION} (RC${RC_NUM})`
-
-**Body:** Summarize binding and non-binding votes and link to the vote thread.
-
----
-
-**Checklist to proceed to finalization**
-
-- [ ] Community vote passed (at least 3 binding +1, more +1 than -1)
-
-## Fix any issues
-
-If the vote revealed issues:
-
-1. Fix them on `main` (or the release branch) via normal PRs; cherry-pick fixes into the release branch as needed.
-2. Remove the old RC from dist.apache.org dev (optional but recommended):
-
-```bash
-svn checkout https://dist.apache.org/repos/dist/dev/fluss fluss-dist-dev --depth=immediates
-cd fluss-dist-dev
-svn remove $SVN_RC_DIR
-svn commit -m "Remove fluss-rust ${RELEASE_VERSION} RC${RC_NUM} (superseded)"
-```
-
-3. Increment `RC_NUM` (e.g. set `RC_NUM="2"`), recreate `RC_TAG` and `SVN_RC_DIR`, then go back to [Build a release candidate](#build-a-release-candidate) and repeat until a candidate is approved.
-
-**Checklist**
-
-- [ ] Issues resolved and changes merged/cherry-picked to the release branch
-- [ ] New RC built and voted on (or same RC re-voted if only minor fixes)
-
-## Finalize the release
-
-Once a release candidate has been approved, finalize the release.
-
-### 1. Push the release git tag (if the vote was on an RC)
-
-If the community voted on an RC tag, create and push the formal release tag so CI publishes to crates.io and PyPI:
-
-```bash
-git checkout $RC_TAG
-git tag -s $RELEASE_TAG -m "Release fluss-rust, fluss-python, fluss-cpp ${RELEASE_VERSION}"
-git push origin $RELEASE_TAG
-```
-
-### 2. Deploy source artifacts to the release repository
-
-Move the staged artifacts from dev to release:
-
-```bash
-svn mv -m "Release fluss-rust ${RELEASE_VERSION}" \
-  https://dist.apache.org/repos/dist/dev/fluss/$SVN_RC_DIR \
-  https://dist.apache.org/repos/dist/release/fluss/$SVN_RELEASE_DIR
-```
-
-(Only PMC members may have write access to the release repository; if you get permission errors, ask on the mailing list.)
-
-### 3. Remove old RC(s) from dev (optional)
-
-Clean up the dev area so only the current RC or the moved release remains:
-
-```bash
-cd fluss-dist-dev
-svn remove $SVN_RC_DIR
-svn commit -m "Remove RC after release fluss-rust ${RELEASE_VERSION}"
-```
-
-### 4. Verify language artifacts
-
-- **fluss-rust:** [crates.io/crates/fluss-rs](https://crates.io/crates/fluss-rs) shows version `$RELEASE_VERSION`
-- **fluss-python:** [PyPI – pyfluss](https://pypi.org/project/pyfluss/) shows version `$RELEASE_VERSION`
-- **fluss-cpp:** Distributed via the source archive; no separate registry. A prebuilt
-  or registry artifact for it would need its own LICENSE and NOTICE.
-
-### 5. Create GitHub Release
-
-1. Go to [Releases → New release](https://github.com/apache/fluss/releases/new).
-2. Choose tag `$RELEASE_TAG`.
-3. Set the target to the release branch `release-${RELEASE_VERSION}` (i.e., the branch/commit used to create `$RELEASE_TAG`).
-4. Click **Generate release notes**, then add: notable changes, breaking changes (if any) from component upgrade docs, **official download link** (source archive and verification), and install instructions for fluss-rust, fluss-python, fluss-cpp.
-    - **Download link:** `https://downloads.apache.org/fluss/fluss-rust-${RELEASE_VERSION}/` (or the project download page). In the release description, include checksums and GPG verification steps.
-5. Click **Publish release**.
-
-### 6. Update CHANGELOG.md on main
-
-Add an entry for `$RELEASE_VERSION` with the list of changes (use [Generate Release Note](generate-release-note.md) from the release tag). Commit and push to `main`.
-
----
-
-**Checklist to proceed to promotion**
-
-- [ ] Release tag pushed; CI published to crates.io and PyPI
-- [ ] Source artifacts in [dist release](https://dist.apache.org/repos/dist/release/fluss/)
-- [ ] GitHub Release created
-- [ ] CHANGELOG.md updated on main
-
-## Promote the release
-
-### Merge website PRs
-
-Merge the pull requests for the release blog and download page that were created in [Prepare for the release](#10-optional-create-prs-for-release-blog-and-download-page).
-
-### Announce the release
-
-Wait at least 24 hours after finalizing, per [ASF release policy](https://www.apache.org/legal/release-policy.html#release-announcements).
-
-- Announce on the dev mailing list that the release is complete.
-- Announce on [Fluss Discussions – Announcements](https://github.com/apache/fluss/discussions) (if that category exists).
-- Send the release announcement to **announce@apache.org**.
-
-Use the `@apache.org` email address and **plain text** for the body; otherwise the list may reject the message.
-
-**Subject:** `[ANNOUNCE] Release Apache Fluss clients (fluss-rust, fluss-python, fluss-cpp) ${RELEASE_VERSION}`
-
-**Body template:**
-
-```
-The Apache Fluss community is pleased to announce the release of Apache Fluss clients (fluss-rust, fluss-python, fluss-cpp) ${RELEASE_VERSION}.
-
-This release includes ...
-(Notable changes; link to CHANGELOG or release notes.)
-
-Download and verification:
-* https://downloads.apache.org/fluss/$SVN_RELEASE_DIR/
-* KEYS: https://downloads.apache.org/fluss/KEYS
-
-Rust:    cargo add fluss-rs
-Python:  pip install pyfluss
-C++:     build from source (see project documentation)
-
-Release notes: https://github.com/apache/fluss/releases/tag/$RELEASE_TAG
-
-Thanks to all contributors!
-
-Release Manager
-```
-
----
-
-**Checklist to declare the process completed**
-
-- [ ] Release announced on dev list and (if applicable) user list
-- [ ] Release announced on announce@apache.org
-- [ ] Release blog published (if applicable)
-- [ ] Download page updated (if applicable)
-
-## Improve the process
-
-After finishing the release, consider what could be improved (simplifications, clearer steps, automation). Propose changes on the dev list or via a pull request to this guide.
-
-## See also
-
-- [Release Manager Preparation](https://fluss.apache.org/community/how-to-release/release-manager-preparation/) — GPG and one-time setup
-- [How to Verify a Release Candidate](verifying-a-release-candidate.md) — Verify signatures, checksums, build, and tests for a release candidate
-- [ASF Release Policy](https://www.apache.org/legal/release-policy.html)
+The tests use temporary fixtures and do not modify the checkout's versions, call
+package registries, create Git tags, or invoke GPG. From `fluss-rust/`, the same
+suite is available as `just test-release-tools`.
+
+For artifact checks and client testing, see
+[Verifying a Release Candidate](verifying-a-release-candidate.md).

@@ -1,17 +1,22 @@
 # How to Verify a Release Candidate
 
-This document describes how to verify a release candidate (RC) of the **Fluss clients** (fluss-rust, fluss-python, fluss-cpp) from the [fluss-rust](https://github.com/apache/fluss) repository. It is intended for anyone participating in the release vote (binding or non-binding) and is based on [Verifying a Fluss Release](https://fluss.apache.org/community/how-to-release/verifying-a-fluss-release/) of the Apache Fluss project, adapted for the fluss-rust source distribution and tooling (Rust, Python, C++).
+This document covers client verification within a **shared Fluss release candidate**
+from the [Apache Fluss repository](https://github.com/apache/fluss). Follow
+[Verifying a Fluss Release](https://fluss.apache.org/community/how-to-release/verifying-a-fluss-release/)
+for the full release. There is no separate client source distribution or client vote.
 
 ## Validating distributions
 
 The release vote email includes links to:
 
-- **Distribution archive:** source tarball (`fluss-rust-${RELEASE_VERSION}.tgz`) on [dist.apache.org dev](https://dist.apache.org/repos/dist/dev/fluss/)
-- **Signature file:** `fluss-rust-${RELEASE_VERSION}.tgz.asc`
-- **Checksum file:** `fluss-rust-${RELEASE_VERSION}.tgz.sha512`
+- **Distribution archive:** source tarball (`fluss-${RELEASE_VERSION}-src.tgz`) on [dist.apache.org dev](https://dist.apache.org/repos/dist/dev/fluss/)
+- **Signature file:** `fluss-${RELEASE_VERSION}-src.tgz.asc`
+- **Checksum file:** `fluss-${RELEASE_VERSION}-src.tgz.sha512`
 - **KEYS file:** [https://downloads.apache.org/fluss/KEYS](https://downloads.apache.org/fluss/KEYS)
 
-Download the archive (`.tgz`), `.asc`, and `.sha512` from the RC directory (e.g. `fluss-rust-0.1.0-rc1/`) and the KEYS file. Then follow the steps below to verify signatures and checksums.
+Download the archive (`.tgz`), `.asc`, and `.sha512` from the RC directory
+(e.g. `fluss-1.0.0-rc1/`) and the KEYS file. Set `RELEASE_VERSION` to the version
+in the vote email, then follow the steps below to verify signatures and checksums.
 
 ## Verifying signatures
 
@@ -43,13 +48,13 @@ Next, verify the tarball(s) using the provided `.sha512` file(s). Each `.sha512`
 **On macOS (shasum):**
 
 ```bash
-shasum -a 512 -c fluss-rust-${RELEASE_VERSION}.tgz.sha512
+shasum -a 512 -c fluss-${RELEASE_VERSION}-src.tgz.sha512
 ```
 
 **On Linux (sha512sum):**
 
 ```bash
-sha512sum -c fluss-rust-${RELEASE_VERSION}.tgz.sha512
+sha512sum -c fluss-${RELEASE_VERSION}-src.tgz.sha512
 ```
 
 If you have multiple archives, run `-c` on each `.sha512` file (or use `shasum -a 512 -c *.sha512` / `sha512sum -c *.sha512`).
@@ -57,7 +62,7 @@ If you have multiple archives, run `-c` on each `.sha512` file (or use `shasum -
 If the verification is successful, you will see a message like this:
 
 ```text
-fluss-rust-0.1.0.tgz: OK
+fluss-1.0.0-src.tgz: OK
 ```
 
 ## Verifying build
@@ -65,17 +70,24 @@ fluss-rust-0.1.0.tgz: OK
 Extract the source release archive and verify that it builds (and optionally that tests pass). You need **Rust** (see [rust-toolchain.toml](https://github.com/apache/fluss/blob/main/fluss-rust/rust-toolchain.toml) for the expected version) and, for full builds, **Python 3.9+** for bindings.
 
 ```bash
-tar -xzf fluss-rust-${RELEASE_VERSION}.tgz
-cd fluss-rust-${RELEASE_VERSION}
+tar -xzf fluss-${RELEASE_VERSION}-src.tgz
+cd fluss-${RELEASE_VERSION}
+python3 fluss-rust/scripts/release_version.py check --tag "v${RELEASE_VERSION}-rc1"
+cd fluss-rust
 ```
 
-Build the workspace:
+Use the RC tag from the vote email, not necessarily `rc1`. The version preflight
+requires Python 3.11+ and works without a Git checkout. It checks versions, not
+source authenticity, dependency resolution or functional correctness.
+
+Build and test the Rust client with the supplied lockfile:
 
 ```bash
-cargo build --workspace --release
+cargo build -p fluss-rs --release --locked
+cargo test -p fluss-rs --locked
 ```
 
-For Python bindings, see the project [README](https://github.com/apache/fluss/tree/main/fluss-rust#readme) and [Development Guide](https://github.com/apache/fluss/blob/main/fluss-rust/DEVELOPMENT.md). For C++ bindings, see `bindings/cpp/`.
+For Python bindings, see the project [README](https://github.com/apache/fluss/tree/main/fluss-rust#readme) and [Development Guide](https://github.com/apache/fluss/blob/main/fluss-rust/DEVELOPMENT.md). For C++ bindings, see `bindings/cpp/`. Building the Rust crate alone does not verify the bindings; exercise each included client against the RC cluster.
 
 ## Verifying LICENSE and NOTICE
 
@@ -86,7 +98,7 @@ Unzip the source release archive and verify that:
 3. All dependencies have been checked for their license and the license is ASL 2.0 compatible ([ASF third-party license policy](http://www.apache.org/legal/resolved.html#category-x)).
 4. Compatible non-ASL 2.0 licenses are documented (e.g. in NOTICE or in dependency audit files such as `DEPENDENCIES*.tsv`).
 
-The project uses [cargo-deny](https://embarkstudios.github.io/cargo-deny/) for license checks; see [Creating a Fluss Rust Client Release](create-release.md) for how the dependency list is generated before a release.
+The project uses [cargo-deny](https://embarkstudios.github.io/cargo-deny/) for license checks; see [Preparing Clients for a Fluss Release](create-release.md) for how the dependency list is generated before a release.
 
 The wheel, the sdist and the crate carry their own copies, since none of them is rooted at the repository root:
 
@@ -124,4 +136,3 @@ It is recommended to include a short list of what you verified (e.g. signatures,
 - [ ] [Verifying build](#verifying-build)
 - [ ] [Verifying LICENSE and NOTICE](#verifying-license-and-notice)
 - [ ] [Testing features](#testing-features)
-

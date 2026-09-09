@@ -14,68 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Create ASF source release artifacts under dist/ (aligned with Fluss release package format):
-#   fluss-rust-{version}.tgz
-#   fluss-rust-{version}.tgz.asc
-#   fluss-rust-{version}.tgz.sha512
-# Run from repo root. Check out the release tag first (e.g. git checkout v0.1.0-rc1).
-# Usage: ./scripts/release.sh [version]
-#   If version is omitted, it is read from Cargo.toml (workspace.package.version).
+# Retired entry point from the standalone fluss-rust repository.
+# Keep a failing wrapper so old automation cannot silently create a separate release.
 
-set -e
+set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cat >&2 <<'EOF'
+Fluss clients now release with the main Fluss project, not as a separate source archive.
+No archive was created or signed.
 
-if [ -n "$1" ]; then
-  VERSION="$1"
-else
-  VERSION=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-  if [ -z "$VERSION" ]; then
-    echo "Could not read version from Cargo.toml. Pass version as argument: $0 <version>"
-    exit 1
-  fi
-fi
+Follow website/community/how-to-release/creating-a-fluss-release.mdx in the
+repository root. Client preparation is documented in
+fluss-rust/website/docs/release/create-release.md.
 
-PREFIX="fluss-rust-${VERSION}"
-DIST_DIR="${REPO_ROOT}/dist"
-TARBALL="${PREFIX}.tgz"
+Before creating the shared RC tag, run from the repository root:
+  python3 fluss-rust/scripts/release_version.py check --tag v1.0.0-rc1
 
-echo "Creating ASF source release for fluss-rust ${VERSION}"
-mkdir -p "$DIST_DIR"
-
-echo "Creating source archive: ${TARBALL}"
-git archive --format=tar.gz --prefix="${PREFIX}/" -o "${DIST_DIR}/${TARBALL}" HEAD
-
-# The archive root is fluss-rust/, not the repo root, so it does not inherit the
-# repo's LICENSE/NOTICE. An ASF source release must carry both.
-echo "Verifying LICENSE and NOTICE at archive root"
-ARCHIVE_FILES=$(tar -tzf "${DIST_DIR}/${TARBALL}")
-for f in LICENSE NOTICE; do
-  if ! echo "$ARCHIVE_FILES" | grep -qx "${PREFIX}/${f}"; then
-    echo "Error: ${f} is missing from the root of ${TARBALL}"
-    exit 1
-  fi
-  if [ -z "$(tar -xzOf "${DIST_DIR}/${TARBALL}" "${PREFIX}/${f}")" ]; then
-    echo "Error: ${f} is empty in ${TARBALL}"
-    exit 1
-  fi
-done
-
-echo "Generating SHA-512 checksum: ${TARBALL}.sha512"
-if command -v shasum >/dev/null 2>&1; then
-  (cd "$DIST_DIR" && shasum -a 512 "$TARBALL" > "${TARBALL}.sha512")
-else
-  (cd "$DIST_DIR" && sha512sum "$TARBALL" > "${TARBALL}.sha512")
-fi
-
-echo "Signing with GPG: ${TARBALL}.asc"
-(cd "$DIST_DIR" && gpg --armor --detach-sig "$TARBALL")
-
-echo "Verifying signature"
-(cd "$DIST_DIR" && gpg --verify "${TARBALL}.asc" "$TARBALL")
-
-echo "Done. Artifacts in dist/:"
-ls -la "${DIST_DIR}/"
-echo ""
-echo "Next: upload contents of dist/ to SVN (see website/docs/release/create-release.md)."
+After preparing and committing ALL release versions, the release manager creates
+the complete source archive using tools/releasing/create_source_release.sh,
+invoked from the tools directory with RELEASE_VERSION set.
+EOF
+exit 1
