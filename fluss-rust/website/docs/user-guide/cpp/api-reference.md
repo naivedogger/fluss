@@ -188,6 +188,10 @@ are retained. Filters apply to Arrow log scans and are rejected by `CreateBucket
 |-------------------------------------------------------------|----------------------------------------|
 | `Append(const GenericRow& row) -> Result`                   | Append a row (fire-and-forget)         |
 | `Append(const GenericRow& row, WriteResult& out) -> Result` | Append a row with write acknowledgment |
+| `Append(const GenericRow& row, WriteCallback callback) -> Result` | Append a row with completion notification |
+| `AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch) -> Result` | Append a batch (fire-and-forget) |
+| `AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch, WriteResult& out) -> Result` | Append a batch with write acknowledgment |
+| `AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch, WriteCallback callback) -> Result` | Append a batch with one completion notification |
 | `Flush() -> Result`                                         | Flush all pending writes               |
 
 ## `UpsertWriter`
@@ -196,8 +200,10 @@ are retained. Filters apply to Arrow log scans and are rejected by `CreateBucket
 |-------------------------------------------------------------|-----------------------------------------------|
 | `Upsert(const GenericRow& row) -> Result`                   | Upsert a row (fire-and-forget)                |
 | `Upsert(const GenericRow& row, WriteResult& out) -> Result` | Upsert a row with write acknowledgment        |
+| `Upsert(const GenericRow& row, WriteCallback callback) -> Result` | Upsert a row with completion notification |
 | `Delete(const GenericRow& row) -> Result`                   | Delete a row by primary key (fire-and-forget) |
 | `Delete(const GenericRow& row, WriteResult& out) -> Result` | Delete a row with write acknowledgment        |
+| `Delete(const GenericRow& row, WriteCallback callback) -> Result` | Delete a row with completion notification |
 | `Flush() -> Result`                                         | Flush all pending operations                  |
 
 ## `WriteResult`
@@ -205,6 +211,60 @@ are retained. Filters apply to Arrow log scans and are rejected by `CreateBucket
 | Method             | Description                                 |
 |--------------------|---------------------------------------------|
 | `Wait() -> Result` | Wait for server acknowledgment of the write |
+
+## `WriteCallback`
+
+`WriteCallback` is `std::function<void(Result)>`. Pass a function pointer or a
+lambda to receive the final write outcome without a `WriteResult` handle or a
+call to `Wait()`:
+
+```cpp
+void OnWriteComplete(fluss::Result completed) {
+    if (!completed.Ok()) {
+        std::cerr << "Write failed: " << completed.error_message << '\n';
+    }
+}
+
+auto submitted = writer.Append(row, &OnWriteComplete);
+if (!submitted.Ok()) {
+    // Submission failed; OnWriteComplete will not be called.
+    std::cerr << "Submission failed: " << submitted.error_message << '\n';
+}
+```
+
+The immediate return value reports submission status, not acknowledgment. An
+empty callback is rejected before submission. Each successfully submitted
+operation invokes its callback exactly once with its final success or failure;
+`AppendArrowBatch` invokes one callback for the batch, not one per row or bucket.
+Submission does not wait for acknowledgment, but may still wait for buffer
+space under backpressure.
+
+The SDK takes ownership of the callback and its captures. Callbacks run on
+background callback threads, may execute concurrently and out of submission
+order, and may start before the submitting call returns. Keep callbacks short;
+synchronize access to shared state and keep captured references valid until the
+callback finishes. Callback overloads do not make writers safe for concurrent
+access: serialize access if both the caller and a callback use the same writer.
+Prefer capturing `std::shared_ptr` by value when sharing
+application state. Keep the connection alive until outstanding operations
+complete. Exceptions thrown by callbacks are caught and reported to stderr;
+they do not change the write outcome.
+
+The binding asynchronously awaits each write's result, then dispatches its
+callback to one of four process-wide callback workers. User callbacks run
+outside the runtime's async I/O workers.
+
+The completion queue is unbounded, so limit outstanding
+callbacks when callback processing is slower than writing; writer buffer limits
+do not bound memory retained by completed callbacks.
+Do not wait for another callback from within a callback, since all callback
+workers could become occupied. Synchronous SDK calls remain supported with
+exclusive access to the writer. If dedicated workers cannot be initialized, the
+SDK falls back to its runtime blocking pool to preserve callback delivery.
+
+`Flush()` still waits for pending writes, **not** for user callbacks to finish.
+Applications that need to drain callbacks must track their completion separately.
+The existing fire-and-forget and `WriteResult::Wait()` APIs are unchanged.
 
 ## `Lookuper`
 

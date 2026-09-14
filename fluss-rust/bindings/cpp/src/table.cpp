@@ -1605,6 +1605,10 @@ Result WriteResult::Wait() {
     return utils::from_ffi_result(ffi_result);
 }
 
+Result WriteResult::Notify(std::unique_ptr<ffi::WriteCallback> callback) {
+    return utils::from_ffi_result(inner_->notify(std::move(callback)));
+}
+
 // ============================================================================
 // AppendWriter
 // ============================================================================
@@ -1658,6 +1662,21 @@ Result AppendWriter::Append(const GenericRow& row, WriteResult& out) {
     return result;
 }
 
+Result AppendWriter::Append(const GenericRow& row, WriteCallback callback) {
+    if (!callback) {
+        return utils::make_client_error("Write callback must not be empty");
+    }
+    // Allocate before submission so an allocation failure cannot lose an
+    // already accepted write's completion notification.
+    auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    WriteResult pending;
+    auto result = Append(row, pending);
+    if (result.Ok()) {
+        return pending.Notify(std::move(completion));
+    }
+    return result;
+}
+
 Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch) {
     WriteResult wr;
     return AppendArrowBatch(batch, wr);
@@ -1692,6 +1711,20 @@ Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>&
     if (result.Ok()) {
         out.Destroy();
         out.inner_ = utils::ptr_from_ffi<ffi::WriteResult>(ffi_result);
+    }
+    return result;
+}
+
+Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                      WriteCallback callback) {
+    if (!callback) {
+        return utils::make_client_error("Write callback must not be empty");
+    }
+    auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    WriteResult pending;
+    auto result = AppendArrowBatch(batch, pending);
+    if (result.Ok()) {
+        return pending.Notify(std::move(completion));
     }
     return result;
 }
@@ -1758,6 +1791,19 @@ Result UpsertWriter::Upsert(const GenericRow& row, WriteResult& out) {
     return result;
 }
 
+Result UpsertWriter::Upsert(const GenericRow& row, WriteCallback callback) {
+    if (!callback) {
+        return utils::make_client_error("Write callback must not be empty");
+    }
+    auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    WriteResult pending;
+    auto result = Upsert(row, pending);
+    if (result.Ok()) {
+        return pending.Notify(std::move(completion));
+    }
+    return result;
+}
+
 Result UpsertWriter::Delete(const GenericRow& row) {
     WriteResult wr;
     return Delete(row, wr);
@@ -1775,6 +1821,19 @@ Result UpsertWriter::Delete(const GenericRow& row, WriteResult& out) {
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
         out = WriteResult(utils::ptr_from_ffi<ffi::WriteResult>(ffi_result));
+    }
+    return result;
+}
+
+Result UpsertWriter::Delete(const GenericRow& row, WriteCallback callback) {
+    if (!callback) {
+        return utils::make_client_error("Write callback must not be empty");
+    }
+    auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    WriteResult pending;
+    auto result = Delete(row, pending);
+    if (result.Ok()) {
+        return pending.Notify(std::move(completion));
     }
     return result;
 }
