@@ -42,7 +42,7 @@ const DEFAULT_WRITER_KV_BACKPRESSURE_MAX_THROTTLE_MS: u64 = 3000;
 
 const MAX_IN_FLIGHT_REQUESTS_PER_BUCKET_FOR_IDEMPOTENCE: usize = 5;
 const DEFAULT_ACKS: &str = "all";
-const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_SECURITY_PROTOCOL: &str = "PLAINTEXT";
 const DEFAULT_SASL_MECHANISM: &str = "PLAIN";
 
@@ -170,7 +170,7 @@ pub struct Config {
     pub writer_kv_backpressure_max_throttle_ms: u64,
 
     /// Connect timeout in milliseconds for TCP transport connect.
-    /// Default: 120000 (120 seconds).
+    /// Default: 15000 (15 seconds), matching Java `client.connect-timeout`.
     #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT_MS)]
     pub connect_timeout_ms: u64,
 
@@ -463,6 +463,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_connect_timeout() {
+        assert_eq!(Config::default().connect_timeout_ms, 15_000);
+        assert_eq!(
+            Config::try_parse_from(["fluss"])
+                .unwrap()
+                .connect_timeout_ms,
+            15_000
+        );
+    }
+
+    #[test]
+    fn test_explicit_connect_timeout() {
+        let config = Config::try_parse_from(["fluss", "--connect-timeout-ms", "120000"]).unwrap();
+        assert_eq!(config.connect_timeout_ms, 120_000);
+    }
 
     #[test]
     fn test_default_is_not_sasl() {
