@@ -537,6 +537,11 @@ impl SchemaBuilder {
         primary_key: Option<&PrimaryKey>,
     ) -> Result<Vec<Column>> {
         let names: Vec<_> = columns.iter().map(|c| &c.name).collect();
+        if names.iter().any(|name| name.trim().is_empty()) {
+            return Err(Error::invalid_table(
+                "Field names must contain at least one non-whitespace character.",
+            ));
+        }
         if let Some(duplicates) = Self::find_duplicates(&names) {
             return Err(Error::invalid_table(format!(
                 "Duplicate column names found: {duplicates:?}"
@@ -1716,6 +1721,20 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn blank_column_names_are_rejected() {
+        let err = Schema::builder()
+            .column(" \t", DataTypes::int())
+            .build()
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Field names must contain at least one non-whitespace character."),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

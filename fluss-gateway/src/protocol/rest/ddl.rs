@@ -1032,6 +1032,10 @@ mod tests {
                     {"name": "id", "data_type": {"type": "STRING"}}
                 ]),
             ),
+            (
+                "columns",
+                json!([{"name": " ", "data_type": {"type": "BIGINT"}}]),
+            ),
         ] {
             let mut invalid = partitioned_table();
             invalid["validate_only"] = json!(true);
