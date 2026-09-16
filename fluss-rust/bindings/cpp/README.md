@@ -78,9 +78,15 @@ not apply to `CreateBucketBatchScanner()`.
 
 The callback section configures `WriteCallbackOptions` to bound outstanding callback
 operations. The SDK executes callbacks; applications do not need a waiting thread or
-poll loop. `max_pending_operations` defaults to 65536 and `enqueue_timeout` to 30 seconds;
-the example uses a limit of 2 and a 5-second admission timeout. That timeout covers only
-waiting for callback capacity.
+poll loop. The example uses the defaults: `max_pending_operations = 262144` per Writer
+and `enqueue_timeout = 30s`. That timeout covers only waiting for callback capacity.
+
+The callback limit counts operations, not bytes; it does not preallocate 262144 slots.
+The separate `Configuration::writer_buffer_memory_size` remains 64 MiB by default,
+shared across all tables and writers on a Connection. Neither setting caps process RSS.
+For a high-throughput starting configuration, see the
+[buffer sizing guidance](../../website/docs/user-guide/cpp/api-reference.md#sizing-callback-capacity-and-write-buffers),
+including a 512 MiB per-Connection example and how to budget for multiple writers.
 
 A failed callback does not prove that the record was not written. Application
 resubmission can duplicate it, even with SDK idempotence enabled. The example only

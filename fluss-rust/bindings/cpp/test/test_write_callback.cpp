@@ -546,7 +546,7 @@ TEST(WriteCallbackBridgeTest, ContainsCallbackExceptions) {
 
 TEST(WriteCallbackBridgeTest, ValidatesCallbackOptions) {
     fluss::WriteCallbackOptions options;
-    EXPECT_EQ(options.max_pending_operations, 65536u);
+    EXPECT_EQ(options.max_pending_operations, 262144u);
     EXPECT_EQ(options.enqueue_timeout, std::chrono::seconds(30));
     EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
     options.max_pending_operations = 0;
@@ -567,6 +567,23 @@ TEST(WriteCallbackBridgeTest, ValidatesCallbackOptions) {
               "enqueue_timeout must be nonnegative");
     options.enqueue_timeout = std::chrono::milliseconds(0);
     EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
+}
+
+TEST(WriteCallbackBridgeTest, DefaultCapacityRejectsOverflowWithoutDroppingReservations) {
+    fluss::WriteCallbackOptions options;
+    options.enqueue_timeout = std::chrono::milliseconds(0);
+    fluss::ffi::WriteCallbackCapacity capacity(options);
+    for (size_t i = 0; i < options.max_pending_operations; ++i) {
+        ASSERT_OK(capacity.Acquire());
+    }
+    EXPECT_FALSE(capacity.Acquire().Ok());
+    capacity.Release();
+    ASSERT_OK(capacity.Acquire());
+    EXPECT_FALSE(capacity.Acquire().Ok());
+    for (size_t i = 0; i < options.max_pending_operations; ++i) {
+        capacity.Release();
+    }
+    EXPECT_OK(capacity.AwaitAll(std::chrono::milliseconds(0)));
 }
 
 TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {

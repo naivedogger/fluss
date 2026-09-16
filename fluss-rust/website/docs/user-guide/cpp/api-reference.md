@@ -25,6 +25,8 @@ Complete API reference for the Fluss C++ client.
 | `writer_dynamic_batch_size_enabled`   | `bool`        | `true`               | Enable per-table dynamic batch sizing: target grows 10% above 80% fill, shrinks 5% below 50% |
 | `writer_dynamic_batch_size_min`       | `int32_t`     | `262144` (256 KB)    | Lower bound for the dynamic batch size estimator (ignored when disabled)                 |
 | `writer_batch_timeout_ms`             | `int64_t`     | `100`                | Maximum time in ms to wait for a writer batch to fill up before sending                  |
+| `writer_buffer_memory_size`          | `size_t`      | `67108864` (64 MiB) | Shared write-batch memory budget per Connection, across all tables and writers; not a process RSS limit |
+| `writer_buffer_wait_timeout_ms`       | `uint64_t`    | `UINT64_MAX`        | Maximum wait for Rust write-buffer capacity in ms; separate from callback admission |
 | `writer_kv_backpressure_max_throttle_ms` | `uint64_t`  | `3000`               | Maximum per-bucket KV backpressure throttle in milliseconds                             |
 | `writer_bucket_no_key_assigner`       | `std::string` | `"sticky"`           | Bucket assignment strategy for tables without bucket keys: `"sticky"` or `"round_robin"` |
 | `scanner_remote_log_prefetch_num`     | `size_t`      | `4`                  | Number of remote log segments to prefetch                                                |
@@ -278,8 +280,9 @@ operational limits below before retrying a batch.
 
 ```cpp
 fluss::WriteCallbackOptions options;
-options.max_pending_operations = 65536;
-options.enqueue_timeout = std::chrono::seconds(5);
+// These are the defaults; CreateWriter(writer) also uses them.
+options.max_pending_operations = 262144;
+options.enqueue_timeout = std::chrono::seconds(30);
 fluss::AppendWriter writer;
 auto created = table.NewAppend().CreateWriter(writer, options);
 // Check created before using writer. NewUpsert().CreateWriter accepts the same options.
@@ -287,7 +290,7 @@ auto created = table.NewAppend().CreateWriter(writer, options);
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `max_pending_operations` | `65536` | Positive, per-writer limit on callback operations reserved for submission or not yet finished |
+| `max_pending_operations` | `262144` | Positive, per-writer limit on callback operations reserved for submission or not yet finished |
 | `enqueue_timeout` | `30s` | Nonnegative maximum wait for callback capacity; `0ms` rejects immediately when full |
 
 The existing `CreateWriter(writer)` overload uses these defaults. Each callback
@@ -310,6 +313,79 @@ This timeout covers **only callback capacity admission**, not the entire
 `Append` call, buffer waits, network requests, core retries, or callback duration.
 It does not cancel any accepted write. Do not hold a mutex needed by callbacks
 while submitting: a full writer can wait for those callbacks to finish.
+
+### Sizing callback capacity and write buffers
+
+There are two independent budgets:
+
+| Setting | Scope | What it limits |
+|---------|-------|----------------|
+| `max_pending_operations` | Each Writer | Callback operations from admission through callback execution and capture cleanup |
+| `writer_buffer_memory_size` | Each Connection | Rust write-batch memory accounting shared by all its tables and writers, including writes using `Wait()` or fire-and-forget |
+
+The callback default of 262144 operations with a 30-second admission wait was
+used in an eight-hour load test with 1 KiB rows, short callbacks, and five writers
+per Connection. It is a starting point, not a throughput or latency guarantee.
+The limit is not preallocated storage. It allows four times as many outstanding
+operations as the previous 65536 default, so applications with tighter memory
+budgets should explicitly select a smaller value.
+
+Budget callback capacity across **all writers**, including writers for different
+tables. Five writers at the default allow 1310720 operations in total; fifty allow
+13107200. If each outstanding operation retains 1 KiB of application data, those
+limits permit roughly 1.25 GiB and 12.5 GiB of captures alone, before SDK overhead.
+An `AppendArrowBatch` counts as one operation even when its batch contains many
+rows, so large batches need a separate application byte budget.
+
+For callback capacity, estimate each writer's operation rate multiplied by the
+time from admission until its callback finishes, then allow headroom for bursts
+and tail latency **within the process memory budget**. Measure capture sizes too.
+Use smaller limits for many tables, large captures, or tight memory budgets.
+If callbacks are slow, shorten or offload their work before increasing capacity;
+a larger queue does not fix a sustained completion-rate deficit.
+
+The Connection buffer accounts for write batches, not callback captures,
+application input, or application retry queues. Its accounting is not a precise
+bound on actual Arrow builder allocations or process RSS.
+Sharing a Connection shares this budget: do not multiply it by the number of
+writers, but expect busy or stalled tables to compete for it. Separate Connections
+have separate budgets, which must be added when sizing the process or host.
+
+The following explicit settings were used with the callback defaults in that
+high-throughput test. They are **not** new Connection defaults:
+
+```cpp
+fluss::Configuration config;
+config.bootstrap_servers = "127.0.0.1:9123";  // Replace with your cluster endpoint.
+config.writer_buffer_memory_size = 512ULL * 1024 * 1024;  // Per Connection.
+config.writer_buffer_wait_timeout_ms = 5000;
+config.writer_batch_size = 2 * 1024 * 1024;
+config.writer_dynamic_batch_size_min = 1024 * 1024;
+config.writer_batch_timeout_ms = 100;
+config.writer_request_max_size = 32 * 1024 * 1024;
+// Apply config when creating the Connection; use default callback options per Writer.
+```
+
+Keep the 64 MiB Connection default for a small workload unless measurements show
+buffer pressure. For sustained high-throughput writes with several writers,
+512 MiB per Connection is a tested starting point if the host has sufficient
+headroom. Eight such Connections have a 4 GiB write-buffer budget in total, not a
+4 GiB RSS limit. More active buckets and tables can retain more concurrent
+batches; tune using buffer pressure, achieved throughput, completion latency,
+and RSS together. Increase the budget only when the downstream service can
+drain it; larger buffers can otherwise just extend queues and latency. The
+eight-hour test also showed RSS growth, so it does not establish long-term memory
+stability or a universally safe configuration.
+
+`enqueue_timeout` and `writer_buffer_wait_timeout_ms` govern different waits
+that can occur in the same call. Set them to suit upstream latency and overload
+handling, rather than assuming either is a whole-call deadline. Lowering an
+admission timeout rejects sooner; it does not cancel accepted writes. Increasing
+callback capacity does not increase Rust buffer space, and increasing Rust buffer
+space does not prevent slow callbacks from filling their operation limit.
+The default `writer_buffer_wait_timeout_ms = UINT64_MAX` permits a much longer
+buffer wait than the 30-second callback admission timeout; configure a finite
+buffer wait when the application needs to stop waiting and handle overload.
 
 ### Execution and lifecycle
 
