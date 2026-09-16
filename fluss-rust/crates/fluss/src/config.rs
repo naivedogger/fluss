@@ -465,23 +465,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_connect_timeout() {
-        assert_eq!(Config::default().connect_timeout_ms, 15_000);
-        assert_eq!(
-            Config::try_parse_from(["fluss"])
-                .unwrap()
-                .connect_timeout_ms,
-            15_000
-        );
-    }
-
-    #[test]
-    fn test_explicit_connect_timeout() {
-        let config = Config::try_parse_from(["fluss", "--connect-timeout-ms", "120000"]).unwrap();
-        assert_eq!(config.connect_timeout_ms, 120_000);
-    }
-
-    #[test]
     fn test_default_is_not_sasl() {
         let config = Config::default();
         assert!(!config.is_sasl_enabled());

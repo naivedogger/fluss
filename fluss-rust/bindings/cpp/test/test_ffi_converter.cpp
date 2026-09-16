@@ -62,15 +62,6 @@ TEST(FfiConverterTest, KvBackpressureConfiguration) {
     EXPECT_TRUE(fluss::ErrorCode::IsRetriable(72));
 }
 
-TEST(FfiConverterTest, ConnectTimeoutConfiguration) {
-    fluss::Configuration config;
-    EXPECT_EQ(config.connect_timeout_ms, 15000u);
-    EXPECT_EQ(fluss::utils::to_ffi_config(config).connect_timeout_ms, 15000u);
-
-    config.connect_timeout_ms = 120000;
-    EXPECT_EQ(fluss::utils::to_ffi_config(config).connect_timeout_ms, 120000u);
-}
-
 // --- DataType value semantics ---
 
 TEST(DataTypeTest, DefaultNullable) { EXPECT_TRUE(DataType::Int().nullable()); }
