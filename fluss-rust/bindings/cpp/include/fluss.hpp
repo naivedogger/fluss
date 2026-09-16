@@ -575,7 +575,9 @@ using WriteCallback = std::function<void(Result)>;
 struct WriteCallbackOptions {
     /// Maximum operations reserved for submission or awaiting callback completion.
     /// Must be positive. One AppendArrowBatch call counts as one operation, not its rows.
-    size_t max_pending_operations = 65536;
+    /// Per-writer count, not preallocated storage or a byte limit. Reduce for many
+    /// writers or large captures; independent of Configuration::writer_buffer_memory_size.
+    size_t max_pending_operations = 262144;
 
     /// Maximum wait for callback capacity; zero rejects immediately when full.
     /// Must be nonnegative. Does not bound buffer waits, ACKs, retries, or callback duration.
@@ -1604,7 +1606,8 @@ struct Configuration {
     bool writer_enable_idempotence{true};
     // Maximum number of in-flight requests per bucket for idempotent writes
     size_t writer_max_inflight_requests_per_bucket{5};
-    // Total memory available for buffering write batches (default 64MB)
+    // Shared write-batch memory budget per Connection, across its tables and writers
+    // (default 64 MiB). Not a process RSS limit or a callback-capture memory budget.
     size_t writer_buffer_memory_size{64 * 1024 * 1024};
     // Maximum time in milliseconds to block waiting for buffer memory
     uint64_t writer_buffer_wait_timeout_ms{std::numeric_limits<uint64_t>::max()};
