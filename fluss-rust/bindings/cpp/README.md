@@ -76,7 +76,23 @@ not apply to `CreateBucketBatchScanner()`.
   [C++ API reference](../../website/docs/user-guide/cpp/api-reference.md) and
   [log-table examples](../../website/docs/user-guide/cpp/example/log-tables.md).
 
-The callback section configures `WriteCallbackOptions` so the SDK bounds outstanding callback operations and `Flush()` waits for both server acknowledgment and pending callbacks. `max_pending_operations` defaults to 65536 and `enqueue_timeout` to 30 seconds; the example uses a limit of 2 and a 5-second admission timeout. That timeout only covers waiting for callback capacity. Flush timeout defaults to 60 seconds. Production applications still need a recovery policy for operations that never complete.
+The callback section configures `WriteCallbackOptions` to bound outstanding callback
+operations. The SDK executes callbacks; applications do not need a waiting thread or
+poll loop. `max_pending_operations` defaults to 65536 and `enqueue_timeout` to 30 seconds;
+the example uses a limit of 2 and a 5-second admission timeout. That timeout covers only
+waiting for callback capacity.
+
+A failed callback does not prove that the record was not written. Application
+resubmission can duplicate it, even with SDK idempotence enabled. The example only
+counts and logs outcomes; it does not implement durable recovery. Keep callbacks
+short, protect shared state, and handle retries outside the callback with an
+application recovery policy.
+
+After submissions stop, `Flush()` first flushes writes and, on success, waits up to
+60 seconds for pending callbacks. This is not a whole-call timeout. If it returns an
+error, keep callback state alive; if it succeeds, still check individual write results.
+See the [callback guarantees and recovery guidance](../../website/docs/user-guide/cpp/api-reference.md#write-guarantees-and-recovery)
+for result semantics, callback implementation, and shutdown requirements.
 
 For a bounded log scan, pass the per-bucket offset ranges directly to `TableScan`. The returned
 reader yields one Arrow batch at a time until every `[starting_offset, stopping_offset)` range

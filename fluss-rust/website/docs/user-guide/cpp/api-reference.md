@@ -223,6 +223,7 @@ call to `Wait()`:
 ```cpp
 void OnWriteComplete(fluss::Result completed) {
     if (!completed.Ok()) {
+        // The record may already have been written. Logging alone is not recovery.
         std::cerr << "Write failed: " << completed.error_message << '\n';
     }
 }
@@ -241,6 +242,37 @@ final success or failure, subject to the lifetime and shutdown requirements belo
 `AppendArrowBatch` invokes one callback for the batch, not one per row or bucket.
 Submission does not wait for acknowledgment, but may still wait for callback
 capacity and then for Rust writer buffer space under backpressure.
+
+### Write guarantees and recovery
+
+- A successful submission means the operation was accepted, not that it was
+  written successfully. Check both the immediate return value and the callback
+  result. A submission error does not register a callback.
+- A successful callback reports completion under the configured acknowledgment
+  policy. It does not strengthen that policy; for example, `writer_acks = "0"`
+  does not wait for server acknowledgment.
+- The SDK handles retryable write errors internally according to its retry
+  configuration. The callback reports the resulting completion, not each retry
+  attempt. A failure can be reported when retries are exhausted or an error
+  cannot be retried; not every failure goes through the configured retry count.
+- **A failed callback does not guarantee that the record was not written.**
+  Even for a single row, the server may have written it before a response was
+  lost. Other errors can represent a definite rejection. `Result` has no separate
+  field that distinguishes these outcomes, and `IsRetriable()` is not proof that
+  nothing was written or that resubmission is duplicate-safe.
+- Calling `Append` again is a new operation. SDK idempotence for internal retries
+  does not deduplicate application resubmissions of the same logical record.
+  Decide whether to resubmit using application identifiers, deduplication or
+  reconciliation, and a bounded retry policy. Do not blindly resubmit every error.
+- One callback invocation per accepted operation is not an exactly-once delivery
+  guarantee. Pending notifications are not persisted and can be lost on process
+  exit or a crash. Applications requiring recovery across restarts must retain
+  their source records or durable operation state independently of the callback.
+
+`AppendArrowBatch` is not atomic across internal batches or buckets. Its single
+callback cannot identify which individual rows succeeded. A failed submission
+can also follow partial acceptance without registering a callback; see the
+operational limits below before retrying a batch.
 
 ### Callback capacity
 
@@ -281,6 +313,10 @@ while submitting: a full writer can wait for those callbacks to finish.
 
 ### Execution and lifecycle
 
+Implement the callback's application logic; the SDK supplies the execution
+threads. There is no need to create a waiting thread, call `Wait()`, or poll for
+callback delivery.
+
 The SDK takes ownership of the callback and its captures. Callbacks run on
 background callback threads, may execute concurrently and out of submission
 order, and may start before the submitting call returns. Keep callbacks short;
@@ -290,7 +326,23 @@ access: serialize access if both the caller and a callback use the same writer.
 Prefer capturing `std::shared_ptr` by value when sharing
 application state. Keep the connection alive until outstanding operations
 complete. Exceptions thrown by callbacks are caught and reported to stderr;
-they do not change the write outcome.
+they do not change the write outcome or cause the callback to be invoked again.
+
+A callback should update thread-safe completion state and return promptly.
+Capture an operation identifier by value so failures can be associated with
+their input; `Result` does not contain the original row. If recovery is needed,
+retain the payload or a reference to a durable source until its outcome has been
+handled. The example above only logs failures; it is not a recovery implementation.
+
+For expensive processing or retries, hand off to an application event loop or
+worker through a bounded, nonblocking mechanism. Define what happens when that
+queue is full: preserve the failed operation and stop or backpressure new
+submissions rather than silently dropping it or blocking SDK callback workers.
+Do not loop on `Append`, sleep for retry backoff, or call `Flush()` inside a
+callback. Schedule retries outside the callback with exclusive writer access.
+They do not need to wait for `Flush()`, and remain subject to the duplicate risks
+described above. A separate application thread is optional if an existing
+submission loop can handle the handoff.
 
 Callbacks register directly with their internal write batch, rather than
 creating an asynchronous ACK-waiting task for each row. When a batch completes,
@@ -316,9 +368,19 @@ remove Rust buffer waits or make arbitrary blocking SDK calls deadlock-free.
 Exclusive writer access is still required. If dedicated workers cannot be
 initialized, the SDK falls back to its runtime blocking pool to preserve delivery.
 
-`Flush()` waits for server acknowledgment and then for all pending callbacks to
-finish. It returns immediately when called from within a callback to avoid
-deadlock.
+For shutdown, stop and join submitting threads, then call `Flush()` outside a
+callback. It first runs the Rust write flush and, if that succeeds, waits up to
+60 seconds for this writer's pending callbacks and captures to finish. The
+60-second callback wait is not an end-to-end timeout for the entire call.
+Check individual callback results as well: successful flushing is not a summary
+that every submitted operation succeeded.
+
+If the write flush fails or the callback wait times out, callbacks may still be
+pending; do not release their referenced state. A timeout does not cancel them.
+`Flush()` does not wait for work handed to application workers or retry queues;
+those need their own shutdown handling. When called inside a callback, only the
+callback-wait phase is skipped; the Rust write flush can still block. Do not use
+this path as a shutdown barrier.
 
 ### Compatibility and operational limits
 
@@ -346,20 +408,15 @@ deadlock.
   not ordering or latency guarantees. A slow callback delays other callbacks in
   its job, and slow callbacks from one connection can delay another connection.
   The blocking-pool fallback is not limited to four callback threads.
-- Callback delivery is in memory only. There is no end-to-end callback deadline,
-  public callback-drain API, or durable recovery of pending notifications.
+- Callback delivery is in memory only. There is no end-to-end callback deadline
+  or durable recovery of pending notifications.
   Connection or writer destruction is not a callback-drain barrier; process exit,
   crashes, or fatal resource exhaustion can prevent pending callbacks from running.
   The process-wide executor is not automatically drained at exit.
-- Before releasing callback state or the connection, stop and join submitting
-  threads, flush pending writes, and wait separately for tracked callbacks.
-  Application tracking must allow callbacks before submission returns and
-  exclude rejected submissions, which have no callback. Flush() waits for
-  accepted callbacks; it does not wait for work that a callback delegates to
-  application threads or retry queues.
-  An application-side wait timeout does not cancel the write or its callback.
-  Keep referenced state alive if abandoning a wait; use durable application
-  tracking and a duplicate-safe retry policy when recovery is required.
+- Application tracking must allow callbacks before submission returns and
+  exclude rejected submissions, which have no callback. Follow the shutdown
+  sequence above before releasing callback state or the connection; an
+  application-side wait timeout does not cancel the write or its callback.
 - C++ exceptions thrown by user callbacks are contained. If copying error text
   fails, the callback still receives the error code, but the message may be empty.
   Allocation failures while constructing the callback before submission can still
