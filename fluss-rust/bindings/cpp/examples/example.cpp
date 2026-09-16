@@ -156,6 +156,8 @@ int main() {
 
     // Callback acknowledgment
     {
+        // The SDK runs callbacks; no application waiting thread is required.
+        // This example counts outcomes only. It does not implement durable recovery.
         std::atomic<size_t> succeeded{0};
         std::atomic<size_t> failed{0};
         for (const auto& r : rows) {
@@ -173,6 +175,10 @@ int main() {
                 if (result.Ok()) {
                     ++succeeded;
                 } else {
+                    // An error does not prove the row was not written. A new Append
+                    // can duplicate it, even with SDK idempotence enabled.
+                    // For recovery, retain id and input in application-owned state
+                    // and schedule duplicate-safe retries outside this callback.
                     if (failed.fetch_add(1) == 0) {
                         std::cerr << "Write failed for id=" << id << ": " << result.error_message
                                   << '\n';
@@ -180,11 +186,15 @@ int main() {
                 }
             });
             if (!submitted.Ok()) {
+                // No callback will run for this submission; handle this path too.
                 std::cerr << "Submission failed for id=" << id << ": " << submitted.error_message
                           << '\n';
                 break;
             }
         }
+        // Submission has stopped. Wait for callbacks before leaving the counters'
+        // scope; individual callback failures are checked below.
+        // check() exits on error; a continuing application must keep callback state alive.
         check("flush", writer.Flush());
         std::cout << "Callback writes: succeeded=" << succeeded << " failed=" << failed << '\n';
         if (failed != 0) {

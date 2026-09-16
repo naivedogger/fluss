@@ -530,30 +530,45 @@ struct Result {
 
     bool Ok() const { return error_code == 0; }
 
-    /// Returns true if retrying the request may succeed. Client-side errors always return false.
+    /// Returns true if retrying the request may succeed. Does not guarantee that a failed
+    /// write had no effect or that application resubmission is duplicate-safe.
+    /// Client-side errors always return false.
     bool IsRetriable() const { return ErrorCode::IsRetriable(error_code); }
 };
 
 /// Receives the final outcome of an accepted write. Function pointers and lambdas
 /// are supported. An empty callback is rejected before submitting the write.
 ///
-/// The SDK owns the callback until completion and invokes it exactly once on
-/// background callback threads, never inline in the submitting call. Callbacks
-/// may run concurrently and out of order, including before the call returns.
+/// During normal operation, the SDK owns the callback until completion and invokes
+/// it exactly once on SDK-managed background threads; no caller polling or waiting
+/// thread is needed. Process exit or a crash can prevent delivery. Callbacks never
+/// run inline in the submitting call, but may run concurrently and out of order,
+/// including before the call returns.
 /// Keep callbacks short and synchronize access to shared state, including writers.
 /// Callback overloads do not make writers safe for concurrent access. Captured
 /// references must remain valid until the callback finishes; capturing shared
 /// ownership is recommended. Keep the connection alive until completion.
+///
+/// Success follows the configured acknowledgment policy. Errors are reported after
+/// internal retry handling, but do not guarantee that no data was written.
+/// Application resubmission is a new operation and can produce duplicates even
+/// with SDK idempotence enabled. Retain input identifiers and recovery state as
+/// needed; one callback invocation is not an exactly-once delivery guarantee.
 ///
 /// Callback threads are shared across connections. Do not wait for another
 /// callback from a callback: it can exhaust the worker pool. Synchronous SDK
 /// calls require exclusive writer access. Callback submissions to a full writer
 /// fail immediately when called from a callback, instead of blocking the workers.
 /// WriteCallbackOptions bounds outstanding callback operations per writer.
+/// Hand off retries or expensive work without blocking; bound application queues
+/// and handle overflow without silently discarding failed operations.
 ///
 /// Exceptions thrown by callbacks are caught and reported to stderr; they do not
-/// change the write outcome. Flush() waits for server acknowledgment and then for
-/// pending callbacks to finish; it returns immediately when called from a callback.
+/// change the write outcome or retry the callback. Stop submissions before Flush().
+/// After a successful Rust write flush, Flush() waits up to 60 seconds for pending
+/// callbacks to finish. On error, referenced state may still be in use.
+/// Inside a callback only the callback wait is skipped; the write flush may block.
+/// Flush() does not wait for work handed to application workers or retry queues.
 using WriteCallback = std::function<void(Result)>;
 
 /// Admission limits for callback overloads only; Wait and fire-and-forget are unchanged.
