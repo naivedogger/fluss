@@ -670,14 +670,20 @@ impl RecordAccumulator {
     /// batch instead of resending it on every poll cycle. The batch keeps its place
     /// at the head of the bucket deque, so batch sequence ordering -- and therefore
     /// idempotence -- is unaffected.
+    ///
+    /// The window is keyed per bucket, but several batches can be in flight for one
+    /// bucket and a node-level failure re-enqueues all of them, each with its own
+    /// per-batch backoff. We keep the latest expiry so a fresh batch's short backoff
+    /// can never shorten an escalated one already set for the bucket.
     pub(crate) fn set_retry_backoff(&self, table_bucket: &TableBucket, delay_ms: i64) {
         if delay_ms <= 0 {
             return;
         }
-        self.retry_backoff_expiry_ms.insert(
-            table_bucket.clone(),
-            current_time_ms().saturating_add(delay_ms),
-        );
+        let expiry = current_time_ms().saturating_add(delay_ms);
+        self.retry_backoff_expiry_ms
+            .entry(table_bucket.clone())
+            .and_modify(|current| *current = (*current).max(expiry))
+            .or_insert(expiry);
     }
 
     /// Milliseconds left in `table_bucket`'s retry backoff window, 0 when the
