@@ -9,19 +9,23 @@
 #
 # Split-role A/B (recommended). Backpressure protects the job that has it, so a
 # single backpressured job may not reproduce the storm. Keep the stressor on
-# table A fire-and-forget (it stays the constant insult in both arms) and put
-# the config under test on the observed table B. Env is read per invocation, so
+# table A fire-and-forget and put the config under test on the observed table B.
+# The stressor is transient: fire it once mid-run for ~5 min so it self-exits
+# (its own RUN_SECONDS), then watch B recover. Env is read per invocation, so
 # launch the two roles with different env:
-#   # arm 1 (baseline observed): unbounded measure-only + zero backoff
+#   # arm 1 (baseline observed): long run, unbounded measure-only + zero backoff
 #   AWAIT_COMPLETIONS=true MAX_IN_FLIGHT_APPENDS=0 RETRY_BACKOFF_MS=0 \
-#     TARGET_RATE=<healthy> ./run-isr-storm.sh b-start
-#   AWAIT_COMPLETIONS=false RETRY_BACKOFF_MS=0 ./run-isr-storm.sh a-start
-#   ./run-isr-storm.sh trigger   # induce the ISR event, repeat as needed
-#   # arm 2 (fixed observed): bounded backpressure + backoff on
+#     TARGET_RATE=<healthy> RUN_SECONDS=900 ./run-isr-storm.sh b-start
+#   # let B settle at baseline, then fire the stressor for 5 min (self-exits):
+#   AWAIT_COMPLETIONS=false RETRY_BACKOFF_MS=0 RUN_SECONDS=300 ./run-isr-storm.sh a-start
+#   ./run-isr-storm.sh recreate   # optional DDL kick during the burst
+#   # arm 2 (fixed observed): bounded backpressure + backoff on, same stressor
 #   AWAIT_COMPLETIONS=true MAX_IN_FLIGHT_APPENDS=10000 RETRY_BACKOFF_MS=100 \
-#     TARGET_RATE=<healthy> ./run-isr-storm.sh b-start
-#   AWAIT_COMPLETIONS=false RETRY_BACKOFF_MS=0 ./run-isr-storm.sh a-start
-# Compare table B's over_...ms ratio and p99/max between the two arms.
+#     TARGET_RATE=<healthy> RUN_SECONDS=900 ./run-isr-storm.sh b-start
+#   AWAIT_COMPLETIONS=false RETRY_BACKOFF_MS=0 RUN_SECONDS=300 ./run-isr-storm.sh a-start
+# Compare B's per-second p99/max/>Ns during the stressor window and how fast
+# they fall back after A exits; the end-of-run cumulative ratio is diluted by
+# the long healthy period, so keep B short or read the monitor timeline.
 #
 # Subcommands:
 #   b-start     launch B writers (continuous)
