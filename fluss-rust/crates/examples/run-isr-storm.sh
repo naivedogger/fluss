@@ -83,6 +83,14 @@ MAX_BACKOFF_MS="${MAX_BACKOFF_MS:-1000}"
 AWAIT_COMPLETIONS="${AWAIT_COMPLETIONS:-false}"
 MAX_IN_FLIGHT_APPENDS="${MAX_IN_FLIGHT_APPENDS:-10000}"
 LATENCY_THRESHOLD_MS="${LATENCY_THRESHOLD_MS:-30000}"
+# Byte-based buffer backpressure (the built-in mechanism). BUFFER_MEMORY bounds
+# outstanding un-acked bytes per Connection; when full, append blocks up to
+# BUFFER_WAIT_TIMEOUT_MS then returns BufferExhausted (shed, shows up as thr/s).
+# To exercise buffer backpressure without the count semaphore, set
+# MAX_IN_FLIGHT_APPENDS=0 and tune these: shrink BUFFER_MEMORY to trigger it
+# sooner, raise BUFFER_WAIT_TIMEOUT_MS to block-and-pace instead of shed.
+BUFFER_MEMORY="${BUFFER_MEMORY:-268435456}"          # 256 MiB
+BUFFER_WAIT_TIMEOUT_MS="${BUFFER_WAIT_TIMEOUT_MS:-1000}"
 
 common_args() {
   local await_flag=""
@@ -105,6 +113,8 @@ common_args() {
     --retry-max-backoff-ms $MAX_BACKOFF_MS \
     --max-in-flight-appends $MAX_IN_FLIGHT_APPENDS \
     --latency-threshold-ms $LATENCY_THRESHOLD_MS \
+    --buffer-memory $BUFFER_MEMORY \
+    --buffer-wait-timeout-ms $BUFFER_WAIT_TIMEOUT_MS \
     $await_flag \
     --metrics-port 0"
 }
