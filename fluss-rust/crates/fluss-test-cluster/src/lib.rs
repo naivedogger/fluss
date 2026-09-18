@@ -130,6 +130,11 @@ impl FlussTestingClusterBuilder {
         Self::new_with_cluster_conf(testing_name.into(), &HashMap::default())
     }
 
+    pub fn with_tablet_servers(mut self, number_of_tablet_servers: u16) -> Self {
+        self.number_of_tablet_servers = number_of_tablet_servers;
+        self
+    }
+
     pub fn with_remote_data_dir(mut self, dir: std::path::PathBuf) -> Self {
         std::fs::create_dir_all(&dir).expect("Failed to create remote data directory");
         self.remote_data_dir = Some(dir);

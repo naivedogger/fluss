@@ -50,6 +50,7 @@ impl FlussConnection {
             .map_err(|msg| Error::IllegalArgument { message: msg })?;
 
         let timeout = Duration::from_millis(arg.connect_timeout_ms);
+        let max_idle = Duration::from_millis(arg.connection_max_idle_ms);
         // connect_timeout_ms: no lower-bound validation to match Java behavior.
         // Java allows 0 — tracked in https://github.com/apache/fluss/issues/3068
         let connections = if arg.is_sasl_enabled() {
@@ -59,10 +60,15 @@ impl FlussConnection {
                         arg.security_sasl_username.clone(),
                         arg.security_sasl_password.clone(),
                     )
-                    .with_timeout(timeout),
+                    .with_timeout(timeout)
+                    .with_max_idle(max_idle),
             )
         } else {
-            Arc::new(RpcClient::new().with_timeout(timeout))
+            Arc::new(
+                RpcClient::new()
+                    .with_timeout(timeout)
+                    .with_max_idle(max_idle),
+            )
         };
         let metadata = Metadata::new(arg.bootstrap_servers.as_str(), connections.clone()).await?;
 

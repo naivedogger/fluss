@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::rpc::error::RpcError;
+use socket2::{SockRef, TcpKeepalive};
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -67,7 +68,26 @@ impl AsyncWrite for Transport {
 impl Transport {
     pub async fn connect(server: &str, timeout: Option<Duration>) -> Result<Self, RpcError> {
         let tcp_stream = Self::connect_timeout(server, timeout).await?;
+        Self::configure_socket(&tcp_stream);
         Ok(Transport::Plain { inner: tcp_stream })
+    }
+
+    /// Best-effort socket tuning applied right after connect. TCP keepalive lets
+    /// the OS detect a dead peer on an otherwise idle connection, complementing
+    /// the application-level idle timeout. Failures are logged, not fatal, so a
+    /// platform that rejects an option never blocks connecting. Mirrors Java's
+    /// `SO_KEEPALIVE` / `TCP_NODELAY` client socket options.
+    fn configure_socket(stream: &TcpStream) {
+        let sock_ref = SockRef::from(stream);
+        let keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            log::warn!("Failed to enable TCP keepalive: {e}");
+        }
+        if let Err(e) = sock_ref.set_tcp_nodelay(true) {
+            log::warn!("Failed to enable TCP_NODELAY: {e}");
+        }
     }
 
     async fn connect_timeout(host: &str, timeout: Option<Duration>) -> Result<TcpStream, RpcError> {

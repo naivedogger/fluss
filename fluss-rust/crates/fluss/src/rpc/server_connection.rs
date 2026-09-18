@@ -192,6 +192,7 @@ pub struct RpcClient {
     connections: RwLock<HashMap<String, ServerConnection>>,
     client_id: Arc<str>,
     timeout: Option<Duration>,
+    max_idle: Option<Duration>,
     max_message_size: usize,
     sasl_config: Option<SaslConfig>,
 }
@@ -202,6 +203,7 @@ impl RpcClient {
             connections: Default::default(),
             client_id: Arc::from(""),
             timeout: None,
+            max_idle: None,
             max_message_size: usize::MAX,
             sasl_config: None,
         }
@@ -209,6 +211,14 @@ impl RpcClient {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Close a connection whose read side sees no traffic for `max_idle`.
+    /// Without this a half-open connection (e.g. after a tablet server is
+    /// scaled down) would leave in-flight requests awaiting a response forever.
+    pub fn with_max_idle(mut self, max_idle: Duration) -> Self {
+        self.max_idle = Some(max_idle);
         self
     }
 
@@ -258,6 +268,7 @@ impl RpcClient {
             BufStream::new(transport),
             self.max_message_size,
             self.client_id.clone(),
+            self.max_idle,
         );
         let connection = ServerConnection::new(messenger);
 
@@ -472,7 +483,12 @@ impl<RW> ServerConnectionInner<RW>
 where
     RW: AsyncRead + AsyncWrite + Send + 'static,
 {
-    pub fn new(stream: RW, max_message_size: usize, client_id: Arc<str>) -> Self {
+    pub fn new(
+        stream: RW,
+        max_message_size: usize,
+        client_id: Arc<str>,
+        max_idle: Option<Duration>,
+    ) -> Self {
         let (stream_read, stream_write) = tokio::io::split(stream);
         let state = Arc::new(Mutex::new(ConnectionState::RequestMap(HashMap::default())));
         let state_captured = Arc::clone(&state);
@@ -480,7 +496,28 @@ where
         let join_handle = tokio::spawn(async move {
             let mut stream_read = stream_read;
             loop {
-                match stream_read.read_message(max_message_size).await {
+                // Bound the read on the idle window so a half-open connection
+                // (e.g. a scaled-down server that never sends FIN/RST) cannot
+                // block in-flight requests forever. The timer resets on every
+                // read, so an actively used connection never trips it. Mirrors
+                // Java's IdleStateHandler closing idle connections.
+                let read_result = match max_idle {
+                    Some(idle) => {
+                        match tokio::time::timeout(idle, stream_read.read_message(max_message_size))
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                state_captured.lock().poison(RpcError::ConnectionError(
+                                    "connection closed after exceeding max idle time".to_string(),
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    None => stream_read.read_message(max_message_size).await,
+                };
+                match read_result {
                     Ok(msg) => {
                         // message was read, so all subsequent errors should not poison the whole stream
                         let mut cursor = Cursor::new(msg);
@@ -905,6 +942,27 @@ mod tests {
         }
     }
 
+    /// Reads a framed request then holds the connection open without ever
+    /// responding, emulating a half-open socket left behind by a scaled-down
+    /// server that never sends FIN/RST.
+    async fn mock_silent_server(mut stream: tokio::io::DuplexStream) {
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = i32::from_be_bytes(len_buf) as usize;
+
+        let mut payload = vec![0u8; len];
+        if stream.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+
+        // Keep the stream open (never respond) for longer than the test's
+        // idle window so the client's idle timer is what trips, not an EOF.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(stream);
+    }
+
     // -- Recorder setup --------------------------------------------------
 
     /// Shared test recorder (installed once per test binary).
@@ -1012,7 +1070,8 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         tokio::spawn(mock_echo_server(server));
 
-        let conn = ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"));
+        let conn =
+            ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"), None);
         *conn.api_versions.lock() = Some(server_api_versions(&[PbApiVersion {
             api_key: 1014,
             min_version: 0,
@@ -1057,7 +1116,8 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         tokio::spawn(mock_echo_server(server));
 
-        let conn = ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"));
+        let conn =
+            ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"), None);
         *conn.api_versions.lock() = Some(server_api_versions(&[PbApiVersion {
             api_key: 1012,
             min_version: 0,
@@ -1098,7 +1158,8 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(64);
         drop(server); // force write failure on request path
-        let conn = ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"));
+        let conn =
+            ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"), None);
         *conn.api_versions.lock() = Some(server_api_versions(&[PbApiVersion {
             api_key: 1014,
             min_version: 0,
@@ -1151,7 +1212,8 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         tokio::spawn(mock_error_server(server));
 
-        let conn = ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"));
+        let conn =
+            ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"), None);
         *conn.api_versions.lock() = Some(server_api_versions(&[PbApiVersion {
             api_key: 1014,
             min_version: 0,
@@ -1331,6 +1393,43 @@ mod tests {
             Error::UnexpectedError { message, .. }
                 if message.contains("max_version") && message.contains(&max_version.to_string())
         ));
+    }
+
+    #[tokio::test]
+    async fn request_fails_when_connection_exceeds_max_idle() {
+        // Serialize against the metrics tests: this request touches the shared
+        // global request counters that those tests snapshot before/after.
+        let _test_guard = test_lock().lock().await;
+
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(mock_silent_server(server));
+
+        let conn = ServerConnectionInner::new(
+            BufStream::new(client),
+            usize::MAX,
+            Arc::from("t"),
+            Some(Duration::from_millis(100)),
+        );
+        *conn.api_versions.lock() = Some(server_api_versions(&[PbApiVersion {
+            api_key: 1014,
+            min_version: 0,
+            max_version: 0,
+        }]));
+
+        // The server never responds; the idle timer must poison the connection
+        // and fail the in-flight request instead of hanging forever.
+        let result = conn.request(TestProduceRequest).await;
+        assert!(
+            result.is_err(),
+            "request must fail once the connection exceeds its max idle time"
+        );
+        assert!(
+            conn.is_poisoned(),
+            "connection must be poisoned after the idle timeout trips"
+        );
+
+        // Subsequent requests fail fast on the poisoned connection.
+        assert!(conn.request(TestProduceRequest).await.is_err());
     }
 
     #[test]

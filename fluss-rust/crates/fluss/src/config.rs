@@ -42,7 +42,20 @@ const DEFAULT_WRITER_KV_BACKPRESSURE_MAX_THROTTLE_MS: u64 = 3000;
 
 const MAX_IN_FLIGHT_REQUESTS_PER_BUCKET_FOR_IDEMPOTENCE: usize = 5;
 const DEFAULT_ACKS: &str = "all";
+// Wait this long before resending a batch the server rejected with a retriable
+// error, doubling up to `DEFAULT_WRITER_RETRY_MAX_BACKOFF_MS`. Shaped like
+// Kafka's `retry.backoff.ms` / `retry.backoff.max.ms`, whose defaults are 100ms
+// and 1s. Without a backoff a transient rejection is resent on every sender poll
+// cycle, which turns one unhealthy leader into a request storm.
+const DEFAULT_WRITER_RETRY_BACKOFF_MS: u64 = 100;
+const DEFAULT_WRITER_RETRY_MAX_BACKOFF_MS: u64 = 1000;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 120_000;
+// Close connections that see no traffic for this long, matching Java's
+// `netty.connection.max-idle-time` (default 10 minutes). This lets the client
+// detect dead peers (e.g. a scaled-down tablet server that left a half-open
+// TCP connection) and fail in-flight requests instead of awaiting a response
+// that never arrives.
+const DEFAULT_CONNECTION_MAX_IDLE_MS: u64 = 600_000;
 const DEFAULT_SECURITY_PROTOCOL: &str = "PLAINTEXT";
 const DEFAULT_SASL_MECHANISM: &str = "PLAIN";
 
@@ -76,6 +89,20 @@ pub struct Config {
 
     #[arg(long, default_value_t = DEFAULT_RETRIES)]
     pub writer_retries: i32,
+
+    /// Initial delay before a batch rejected with a retriable error is resent.
+    /// The delay doubles per attempt, up to `writer_retry_max_backoff_ms`, and
+    /// carries +/-20% jitter so buckets failing together do not resend in
+    /// lockstep. Mirrors Kafka's `retry.backoff.ms`. 0 resends immediately.
+    /// Default: 100.
+    #[arg(long, default_value_t = DEFAULT_WRITER_RETRY_BACKOFF_MS)]
+    pub writer_retry_backoff_ms: u64,
+
+    /// Ceiling for the exponentially growing retry delay. Mirrors Kafka's
+    /// `retry.backoff.max.ms`. Keeping it low bounds how long a bucket stays
+    /// idle after its leader becomes healthy again. Default: 1000.
+    #[arg(long, default_value_t = DEFAULT_WRITER_RETRY_MAX_BACKOFF_MS)]
+    pub writer_retry_max_backoff_ms: u64,
 
     #[arg(long, default_value_t = DEFAULT_WRITER_BATCH_SIZE)]
     pub writer_batch_size: i32,
@@ -174,6 +201,13 @@ pub struct Config {
     #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT_MS)]
     pub connect_timeout_ms: u64,
 
+    /// Close a connection after it sees no traffic for this many milliseconds.
+    /// A read that blocks longer than this poisons the connection so in-flight
+    /// requests fail fast and callers reconnect. Mirrors Java's
+    /// `netty.connection.max-idle-time`. Default: 600000 (10 minutes).
+    #[arg(long, default_value_t = DEFAULT_CONNECTION_MAX_IDLE_MS)]
+    pub connection_max_idle_ms: u64,
+
     #[arg(long, default_value_t = String::from(DEFAULT_SECURITY_PROTOCOL))]
     pub security_protocol: String,
 
@@ -219,6 +253,11 @@ impl std::fmt::Debug for Config {
             .field("writer_request_max_size", &self.writer_request_max_size)
             .field("writer_acks", &self.writer_acks)
             .field("writer_retries", &self.writer_retries)
+            .field("writer_retry_backoff_ms", &self.writer_retry_backoff_ms)
+            .field(
+                "writer_retry_max_backoff_ms",
+                &self.writer_retry_max_backoff_ms,
+            )
             .field("writer_batch_size", &self.writer_batch_size)
             .field(
                 "writer_dynamic_batch_size_enabled",
@@ -276,6 +315,7 @@ impl std::fmt::Debug for Config {
                 &self.writer_kv_backpressure_max_throttle_ms,
             )
             .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("connection_max_idle_ms", &self.connection_max_idle_ms)
             .field("security_protocol", &self.security_protocol)
             .field("security_sasl_mechanism", &self.security_sasl_mechanism)
             .field("security_sasl_username", &self.security_sasl_username)
@@ -299,6 +339,8 @@ impl Default for Config {
             writer_request_max_size: DEFAULT_REQUEST_MAX_SIZE,
             writer_acks: String::from(DEFAULT_ACKS),
             writer_retries: i32::MAX,
+            writer_retry_backoff_ms: DEFAULT_WRITER_RETRY_BACKOFF_MS,
+            writer_retry_max_backoff_ms: DEFAULT_WRITER_RETRY_MAX_BACKOFF_MS,
             writer_batch_size: DEFAULT_WRITER_BATCH_SIZE,
             writer_dynamic_batch_size_enabled: DEFAULT_WRITER_DYNAMIC_BATCH_SIZE_ENABLED,
             writer_dynamic_batch_size_min: DEFAULT_WRITER_DYNAMIC_BATCH_SIZE_MIN,
@@ -319,6 +361,7 @@ impl Default for Config {
             writer_buffer_wait_timeout_ms: DEFAULT_WRITER_BUFFER_WAIT_TIMEOUT_MS,
             writer_kv_backpressure_max_throttle_ms: DEFAULT_WRITER_KV_BACKPRESSURE_MAX_THROTTLE_MS,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            connection_max_idle_ms: DEFAULT_CONNECTION_MAX_IDLE_MS,
             security_protocol: String::from(DEFAULT_SECURITY_PROTOCOL),
             security_sasl_mechanism: String::from(DEFAULT_SASL_MECHANISM),
             security_sasl_username: String::new(),

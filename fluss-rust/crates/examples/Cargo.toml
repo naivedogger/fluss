@@ -68,3 +68,7 @@ path = "src/example_filter_pushdown.rs"
 [[example]]
 name = "example-auto-increment-table"
 path = "src/example_auto_increment_table.rs"
+
+[[example]]
+name = "example-ecs-write-test"
+path = "src/example_ecs_write_test.rs"
