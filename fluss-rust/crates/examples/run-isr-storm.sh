@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Orchestrates the ISR retry-storm A/B test:
+#   - Table B: many processes writing continuously (the "innocent bystander").
+#   - Table A: fewer processes; we delete + recreate A mid-run and resume the
+#     same traffic, then watch the blast radius on B.
+#
+# All knobs are env vars with sane defaults; override on the command line, e.g.
+#   RETRY_BACKOFF_MS=0 ./run-isr-storm.sh b-start
+#
+# Subcommands:
+#   b-start     launch B writers (continuous)
+#   a-start     launch A writers
+#   a-stop      stop only the A writers
+#   recreate    drop + recreate table A and wait until it is writable
+#   trigger     a-stop -> recreate -> a-start  (the full delete/recreate cycle)
+#   stop-all    stop every writer this script started
+#   status      show running pids
+set -euo pipefail
+
+# --- Resolve paths -----------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# fluss-rust workspace root is two levels up from crates/examples.
+WS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Prefer a release binary; fall back to debug. Override with BIN=/path.
+if [[ -z "${BIN:-}" ]]; then
+  if [[ -x "$WS_ROOT/target/release/examples/example-isr-retry-storm" ]]; then
+    BIN="$WS_ROOT/target/release/examples/example-isr-retry-storm"
+  else
+    BIN="$WS_ROOT/target/debug/examples/example-isr-retry-storm"
+  fi
+fi
+
+CONFIG="${CONFIG:-$SCRIPT_DIR/isr-storm.conf}"
+RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/isr-run}"
+mkdir -p "$RUN_DIR"
+
+# --- Test parameters (override via env) --------------------------------------
+DATABASE="${DATABASE:-fluss}"
+TABLE_A="${TABLE_A:-bench_a}"
+TABLE_B="${TABLE_B:-bench_b}"
+A_PROCS="${A_PROCS:-4}"
+B_PROCS="${B_PROCS:-8}"
+CONCURRENCY="${CONCURRENCY:-5}"       # threads per process
+MAX_INFLIGHT="${MAX_INFLIGHT:-5}"
+IDEMPOTENCE="${IDEMPOTENCE:-true}"
+ACKS="${ACKS:-all}"
+BUCKETS="${BUCKETS:-32}"
+RF="${RF:-3}"
+PAYLOAD="${PAYLOAD:-256}"
+# Per-process target rows/sec (0 = unthrottled). Cap this to keep the baseline
+# healthy so a 4-node cluster is not saturated before the ISR event.
+TARGET_RATE="${TARGET_RATE:-0}"
+RUN_SECONDS="${RUN_SECONDS:-3600}"
+READY_TIMEOUT="${READY_TIMEOUT:-120}"
+# The A/B knob: 0 = pre-fix zero-backoff storm, 100 = fixed exponential backoff.
+RETRY_BACKOFF_MS="${RETRY_BACKOFF_MS:-100}"
+MAX_BACKOFF_MS="${MAX_BACKOFF_MS:-1000}"
+# Client-backpressure mode. true = each writer registers a completion callback
+# per append, bounds outstanding un-acked appends to MAX_IN_FLIGHT_APPENDS, and
+# records end-to-end (submit -> ack) latency incl. the share over
+# LATENCY_THRESHOLD_MS. false = fire-and-forget (no backpressure, no latency).
+AWAIT_COMPLETIONS="${AWAIT_COMPLETIONS:-false}"
+MAX_IN_FLIGHT_APPENDS="${MAX_IN_FLIGHT_APPENDS:-10000}"
+LATENCY_THRESHOLD_MS="${LATENCY_THRESHOLD_MS:-30000}"
+
+common_args() {
+  local await_flag=""
+  if [[ "$AWAIT_COMPLETIONS" == "true" ]]; then
+    await_flag="--await-completions"
+  fi
+  echo "--config $CONFIG \
+    --database $DATABASE \
+    --concurrency $CONCURRENCY \
+    --max-inflight $MAX_INFLIGHT \
+    --idempotence $IDEMPOTENCE \
+    --acks $ACKS \
+    --buckets $BUCKETS \
+    --replication-factor $RF \
+    --payload-bytes $PAYLOAD \
+    --target-rate $TARGET_RATE \
+    --run-seconds $RUN_SECONDS \
+    --ready-timeout-secs $READY_TIMEOUT \
+    --retry-backoff-ms $RETRY_BACKOFF_MS \
+    --retry-max-backoff-ms $MAX_BACKOFF_MS \
+    --max-in-flight-appends $MAX_IN_FLIGHT_APPENDS \
+    --latency-threshold-ms $LATENCY_THRESHOLD_MS \
+    $await_flag \
+    --metrics-port 0"
+}
+
+require_bin() {
+  if [[ ! -x "$BIN" ]]; then
+    echo "binary not found: $BIN" >&2
+    echo "build it first:  (cd $WS_ROOT && cargo build --release -p fluss-examples --example example-isr-retry-storm)" >&2
+    exit 1
+  fi
+}
+
+# start_writers <table> <count> <tag>
+start_writers() {
+  local table="$1" count="$2" tag="$3"
+  require_bin
+  echo "starting $count writers on $DATABASE.$table (backoff=${RETRY_BACKOFF_MS}ms await_completions=${AWAIT_COMPLETIONS}) ..."
+  for i in $(seq 1 "$count"); do
+    local log="$RUN_DIR/${tag}-${i}.log"
+    # shellcheck disable=SC2046
+    nohup "$BIN" $(common_args) --table "$table" >"$log" 2>&1 &
+    echo $! >>"$RUN_DIR/${tag}.pids"
+    echo "  [$tag-$i] pid=$! log=$log"
+  done
+}
+
+stop_writers() {
+  local tag="$1"
+  local f="$RUN_DIR/${tag}.pids"
+  [[ -f "$f" ]] || { echo "no $tag writers tracked"; return 0; }
+  echo "stopping $tag writers ..."
+  while read -r pid; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      echo "  killed pid=$pid"
+    fi
+  done <"$f"
+  rm -f "$f"
+}
+
+recreate_a() {
+  require_bin
+  echo "drop + recreate $DATABASE.$TABLE_A, waiting until writable ..."
+  # shellcheck disable=SC2046
+  "$BIN" $(common_args) --table "$TABLE_A" --recreate
+}
+
+case "${1:-}" in
+  b-start)  start_writers "$TABLE_B" "$B_PROCS" b ;;
+  a-start)  start_writers "$TABLE_A" "$A_PROCS" a ;;
+  a-stop)   stop_writers a ;;
+  recreate) recreate_a ;;
+  trigger)
+    stop_writers a
+    recreate_a
+    start_writers "$TABLE_A" "$A_PROCS" a
+    ;;
+  stop-all) stop_writers a; stop_writers b ;;
+  status)
+    for tag in a b; do
+      f="$RUN_DIR/${tag}.pids"
+      [[ -f "$f" ]] || continue
+      echo "== $tag =="
+      while read -r pid; do
+        kill -0 "$pid" 2>/dev/null && echo "  running pid=$pid" || echo "  dead    pid=$pid"
+      done <"$f"
+    done
+    ;;
+  *)
+    echo "usage: $0 {b-start|a-start|a-stop|recreate|trigger|stop-all|status}" >&2
+    exit 1
+    ;;
+esac
