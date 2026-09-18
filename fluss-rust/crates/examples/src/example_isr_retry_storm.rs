@@ -29,6 +29,22 @@
 //! `retry/s` (client-side storm signal) plus the server's `NotEnoughReplicas`
 //! ERROR rate and how long the ISR stays shrunk.
 //!
+//! Stressor vs observed workload. Backpressure protects the process that has it,
+//! so a single backpressured job may no longer reproduce the storm on its own.
+//! To keep the anomaly reproducible while measuring the fix, split the roles:
+//!   - Stressor: a fire-and-forget process (`--await-completions` off,
+//!     `--retry-backoff-ms 0`) that keeps inducing the ISR shrink. Same in both
+//!     arms; it is the constant environmental insult.
+//!   - Observed: a healthy-rate process that carries the config under test and
+//!     reports end-to-end latency. Baseline = `--await-completions` with
+//!     `--max-in-flight-appends 0` (unbounded, measure-only) and
+//!     `--retry-backoff-ms 0`; fixed = `--await-completions` with a bounded
+//!     `--max-in-flight-appends` and `--retry-backoff-ms 100`.
+//!
+//! Compare the observed process's `over_...ms` ratio and p99/max between arms.
+//! The latency clock starts before the backpressure permit, so a backpressure
+//! stall still counts as user-visible latency and cannot hide a timeout.
+//!
 //! Connection: pass a config file with the endpoint and credentials, or use
 //! flags/env vars. Precedence for each value is CLI flag > config file > env.
 //!   --config isr-storm.conf   (copy isr-storm.example.conf and fill it in)
@@ -76,6 +92,14 @@ struct LatencyStats {
     max_ms: AtomicU64,
     over_threshold: AtomicU64,
     buckets: [AtomicU64; LAT_BOUNDS_MS.len() + 1],
+    /// Time spent blocked on the backpressure permit before the append was even
+    /// submitted. Reported separately so we can attribute user-visible latency
+    /// between "cluster was slow to ack" and "we throttled ourselves".
+    wait_sum_ms: AtomicU64,
+    wait_max_ms: AtomicU64,
+    /// Appends submitted but not yet acked. Tracked directly (not via the
+    /// semaphore) so it is meaningful in unbounded/measure-only mode too.
+    in_flight: AtomicU64,
 }
 
 impl LatencyStats {
@@ -87,6 +111,9 @@ impl LatencyStats {
             max_ms: AtomicU64::new(0),
             over_threshold: AtomicU64::new(0),
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            wait_sum_ms: AtomicU64::new(0),
+            wait_max_ms: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
         }
     }
 
@@ -108,6 +135,18 @@ impl LatencyStats {
             .position(|&b| elapsed_ms < b)
             .unwrap_or(LAT_BOUNDS_MS.len());
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Marks an append as submitted (callback registered, not yet acked).
+    fn on_submit(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records how long an append blocked on the backpressure permit.
+    fn record_wait(&self, wait_ms: u64) {
+        self.wait_sum_ms.fetch_add(wait_ms, Ordering::Relaxed);
+        self.wait_max_ms.fetch_max(wait_ms, Ordering::Relaxed);
     }
 
     fn snapshot_buckets(&self) -> [u64; LAT_BOUNDS_MS.len() + 1] {
@@ -150,6 +189,8 @@ fn print_latency_summary(stats: &LatencyStats, threshold_ms: u64) {
     let over = stats.over_threshold.load(Ordering::Relaxed);
     let max_ms = stats.max_ms.load(Ordering::Relaxed);
     let sum_ms = stats.sum_ms.load(Ordering::Relaxed);
+    let wait_sum_ms = stats.wait_sum_ms.load(Ordering::Relaxed);
+    let wait_max_ms = stats.wait_max_ms.load(Ordering::Relaxed);
     let buckets = stats.snapshot_buckets();
     let total = ok + failed;
     let mean = if total > 0 {
@@ -157,12 +198,22 @@ fn print_latency_summary(stats: &LatencyStats, threshold_ms: u64) {
     } else {
         0.0
     };
+    let over_pct = if total > 0 {
+        over as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+    let wait_mean = if total > 0 {
+        wait_sum_ms as f64 / total as f64
+    } else {
+        0.0
+    };
     println!(
-        "Latency (submit->ack): completed={total} ok={ok} failed={failed} over_{}ms={over}",
+        "Latency (submit->ack, incl. backpressure wait): completed={total} ok={ok} failed={failed} over_{}ms={over} ({over_pct:.2}%)",
         threshold_ms
     );
     println!(
-        "  p50~{} p90~{} p99~{} max={max_ms}ms mean={mean:.1}ms",
+        "  p50~{} p90~{} p99~{} max={max_ms}ms mean={mean:.1}ms | backpressure wait mean={wait_mean:.1}ms max={wait_max_ms}ms",
         fmt_ms(approx_percentile_ms(&buckets, 0.50)),
         fmt_ms(approx_percentile_ms(&buckets, 0.90)),
         fmt_ms(approx_percentile_ms(&buckets, 0.99)),
@@ -253,7 +304,9 @@ struct Args {
     await_completions: bool,
     /// Backpressure bound: max outstanding un-acked appends across the whole
     /// process when --await-completions is set. Once reached, new appends wait
-    /// for an ack before enqueuing more.
+    /// for an ack before enqueuing more. Set to 0 for unbounded: callbacks still
+    /// measure end-to-end latency but no backpressure is applied, which is the
+    /// pre-fix baseline we can still observe (register-to-measure only).
     #[arg(long, default_value_t = 10_000)]
     max_in_flight_appends: usize,
     /// User-visible latency threshold in ms. Completions at or above this count
@@ -409,10 +462,14 @@ async fn main() -> Result<()> {
 
     let config = build_config(&args, bootstrap.clone(), &file_cfg);
     let mode = if args.await_completions {
-        format!(
-            "callback+backpressure(max_in_flight={})",
-            args.max_in_flight_appends
-        )
+        if args.max_in_flight_appends > 0 {
+            format!(
+                "callback+backpressure(max_in_flight={})",
+                args.max_in_flight_appends
+            )
+        } else {
+            "callback+measure-only(unbounded)".to_string()
+        }
     } else {
         "fire-and-forget".to_string()
     };
@@ -496,8 +553,11 @@ async fn main() -> Result<()> {
 
     // Callback / backpressure mode state. In fire-and-forget mode these are
     // created but unused, keeping the task and monitor wiring uniform.
+    // `max_in_flight_appends == 0` means unbounded: callbacks still measure
+    // latency but the permit gate is skipped (measure-only baseline).
     let await_completions = args.await_completions;
     let threshold_ms = args.latency_threshold_ms;
+    let bounded = args.max_in_flight_appends > 0;
     let max_in_flight = args.max_in_flight_appends.max(1);
     let latency = Arc::new(LatencyStats::new());
     let semaphore = Arc::new(Semaphore::new(max_in_flight));
@@ -549,25 +609,37 @@ async fn main() -> Result<()> {
                     row.set_field(0, counter);
                     row.set_field(1, payload);
                     if await_completions {
-                        // Client-backpressure mode. Acquire a slot first so the
-                        // producer cannot have more than --max-in-flight-appends
-                        // un-acked writes outstanding; the permit is released by
-                        // the completion callback, so a stalled cluster stalls us
-                        // too instead of letting the buffer balloon.
-                        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => break,
+                        // Observed-workload mode. Register a completion callback
+                        // to measure end-to-end latency, and (when bounded) hold
+                        // a backpressure permit for the write's whole lifetime so
+                        // the producer cannot outrun the cluster.
+                        //
+                        // The latency clock starts HERE, before acquiring the
+                        // permit, so a backpressure stall counts as user-visible
+                        // latency and cannot hide a timeout by converting it into
+                        // upstream blocking. When unbounded (max-in-flight 0) the
+                        // permit gate is skipped: callbacks still measure latency
+                        // but no backpressure is applied (the pre-fix baseline).
+                        let want = Instant::now();
+                        let permit = if bounded {
+                            match Arc::clone(&semaphore).acquire_owned().await {
+                                Ok(permit) => Some(permit),
+                                Err(_) => break,
+                            }
+                        } else {
+                            None
                         };
-                        let submit = Instant::now();
+                        latency.record_wait(want.elapsed().as_millis() as u64);
                         match writer.append(&row) {
                             Ok(fut) => {
                                 enqueued.fetch_add(1, Ordering::Relaxed);
+                                latency.on_submit();
                                 let stats = Arc::clone(&latency);
                                 // The callback runs on the sender's completion
                                 // path; it only touches atomics and drops the
                                 // permit, so it never blocks the I/O thread.
                                 let cb = move |res: Result<()>| {
-                                    let elapsed_ms = submit.elapsed().as_millis() as u64;
+                                    let elapsed_ms = want.elapsed().as_millis() as u64;
                                     stats.record(&res, elapsed_ms, threshold_ms);
                                     drop(permit);
                                 };
@@ -575,7 +647,9 @@ async fn main() -> Result<()> {
                                     fut.try_on_complete(cb, WriteCallbackBatch::run)
                                 {
                                     // A fresh future never reaches this; drop the
-                                    // callback to release its permit defensively.
+                                    // callback (releasing its permit and undoing
+                                    // the in-flight bump) defensively.
+                                    latency.in_flight.fetch_sub(1, Ordering::Relaxed);
                                     drop(cb);
                                 }
                             }
@@ -631,7 +705,6 @@ async fn main() -> Result<()> {
         let errors = Arc::clone(&errors);
         let done = Arc::clone(&done);
         let latency = Arc::clone(&latency);
-        let semaphore = Arc::clone(&semaphore);
         tokio::spawn(async move {
             let start = Instant::now();
             let mut last_rows = 0u64;
@@ -672,7 +745,8 @@ async fn main() -> Result<()> {
 
                 // In callback mode, add the user-facing view: completions/s,
                 // outstanding un-acked appends (backpressure depth), failures,
-                // how many blew past the threshold, and cumulative tail latency.
+                // how many blew past the threshold (with running ratio), and
+                // cumulative tail latency.
                 let mut cb_line = String::new();
                 if await_completions {
                     let ok = latency.ok.load(Ordering::Relaxed);
@@ -680,13 +754,17 @@ async fn main() -> Result<()> {
                     let done_total = ok + failed;
                     let done_s = done_total.saturating_sub(last_done);
                     last_done = done_total;
-                    let inflight =
-                        (max_in_flight as u64).saturating_sub(semaphore.available_permits() as u64);
+                    let inflight = latency.in_flight.load(Ordering::Relaxed);
                     let over = latency.over_threshold.load(Ordering::Relaxed);
+                    let over_pct = if done_total > 0 {
+                        over as f64 * 100.0 / done_total as f64
+                    } else {
+                        0.0
+                    };
                     let max_ms = latency.max_ms.load(Ordering::Relaxed);
                     let buckets = latency.snapshot_buckets();
                     cb_line = format!(
-                        "  done/s={done_s:>8}  inflt={inflight:>6}  fail={failed:>7}  >{}s={over:>7}  p50~{}  p99~{}  max={max_ms}ms",
+                        "  done/s={done_s:>8}  inflt={inflight:>6}  fail={failed:>7}  >{}s={over:>7}({over_pct:>5.2}%)  p50~{}  p99~{}  max={max_ms}ms",
                         threshold_ms / 1000,
                         fmt_ms(approx_percentile_ms(&buckets, 0.50)),
                         fmt_ms(approx_percentile_ms(&buckets, 0.99)),
