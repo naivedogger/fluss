@@ -66,7 +66,10 @@ class WriteCallbackCapacity {
             std::lock_guard<std::mutex> lock(mutex_);
             --pending_;
         }
-        available_.notify_one();
+        // notify_all: Acquire() waiters and the AwaitAll() waiter share this condvar,
+        // so waking only one risks waking AwaitAll() (still pending) while an Acquire()
+        // waiter sleeps until enqueue_timeout despite the freed slot.
+        available_.notify_all();
     }
 
     /// Wait for all reserved operations to finish their callbacks.
