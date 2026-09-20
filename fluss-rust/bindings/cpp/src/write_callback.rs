@@ -23,14 +23,24 @@ use std::thread::{self, JoinHandle};
 
 use crate::{RUNTIME, WriteResult, client_err, err_from_core_error, ffi, ok_result};
 
-const CALLBACK_WORKERS: usize = 4;
+const DEFAULT_CALLBACK_WORKERS: usize = 4;
 const COMPLETION_BATCH_SIZE: usize = 64;
 type Completion = Box<dyn FnOnce() + Send + 'static>;
+
+// Process-wide worker count. Override with FLUSS_CALLBACK_WORKERS; invalid or
+// zero values fall back to the default.
+fn callback_workers() -> usize {
+    std::env::var("FLUSS_CALLBACK_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(DEFAULT_CALLBACK_WORKERS)
+}
 
 // Like RUNTIME, the executor is process-wide and lives until process exit.
 // Initialize it on the submitting thread, not an async I/O worker.
 static CALLBACK_EXECUTOR: LazyLock<Option<CallbackExecutor>> =
-    LazyLock::new(|| match CallbackExecutor::new(CALLBACK_WORKERS) {
+    LazyLock::new(|| match CallbackExecutor::new(callback_workers()) {
         Ok(executor) => Some(executor),
         Err(error) => {
             // The write has already been accepted. Keep the old dispatch path
