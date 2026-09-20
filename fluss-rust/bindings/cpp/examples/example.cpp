@@ -91,7 +91,8 @@ int main() {
 
     // 5) Write rows with scalar and temporal values
     fluss::AppendWriter writer;
-    // Defaults: 262144 pending callback operations per Writer, 30s admission wait.
+    // Defaults: 262144 pending callback operations per Writer, 30s submission timeout
+    // (callback capacity plus buffer backpressure; zero makes callback submits non-blocking).
     // Pass WriteCallbackOptions to lower the limit for large captures or many writers.
     // This count is independent of the Connection's write-buffer byte budget.
     check("new_append_writer", table.NewAppend().CreateWriter(writer));
@@ -155,6 +156,8 @@ int main() {
     // Callback acknowledgment
     {
         // The SDK runs callbacks; no application waiting thread is required.
+        // Callbacks run on a small shared executor pool, so keep them short and
+        // non-blocking: do not Flush/Wait or retry synchronously inside a callback.
         // This example counts outcomes only. It does not implement durable recovery.
         std::atomic<size_t> succeeded{0};
         std::atomic<size_t> failed{0};
@@ -173,10 +176,12 @@ int main() {
                 if (result.Ok()) {
                     ++succeeded;
                 } else {
-                    // An error does not prove the row was not written. A new Append
-                    // can duplicate it, even with SDK idempotence enabled.
-                    // For recovery, retain id and input in application-owned state
-                    // and schedule duplicate-safe retries outside this callback.
+                    // By now the SDK has exhausted internal retries or hit a
+                    // non-retriable error, so do not retry synchronously here.
+                    // An error does not prove the row was not written, and a new
+                    // Append can duplicate it even with SDK idempotence enabled.
+                    // Record the outcome and either stop or hand id and input to
+                    // your own retry queue; deduplicate by id downstream.
                     if (failed.fetch_add(1) == 0) {
                         std::cerr << "Write failed for id=" << id << ": " << result.error_message
                                   << '\n';
@@ -193,6 +198,8 @@ int main() {
         // Submission has stopped. Wait for callbacks before leaving the counters'
         // scope; individual callback failures are checked below.
         // check() exits on error; a continuing application must keep callback state alive.
+        // A durable pipeline would advance its source position or offset only
+        // after Flush() succeeds, then replay from there on restart.
         check("flush", writer.Flush());
         std::cout << "Callback writes: succeeded=" << succeeded << " failed=" << failed << '\n';
         if (failed != 0) {
