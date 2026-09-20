@@ -20,6 +20,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <mutex>
@@ -81,6 +82,18 @@ class WriteCallbackCapacity {
             return {ErrorCode::CLIENT_ERROR, "Timed out waiting for pending callbacks"};
         }
         return {};
+    }
+
+    /// Milliseconds left in the enqueue_timeout budget since `start`, floored at 0.
+    /// Used to bound the buffer-backpressure wait so the whole submit stays within
+    /// enqueue_timeout (Kafka max.block.ms style). A zero budget makes the buffer
+    /// wait non-blocking (fail fast).
+    int64_t RemainingBudgetMs(std::chrono::steady_clock::time_point start) const {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        auto remaining = options_.enqueue_timeout - elapsed;
+        auto ms = remaining.count();
+        return ms > 0 ? ms : 0;
     }
 
    private:

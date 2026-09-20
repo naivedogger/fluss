@@ -32,6 +32,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 pub(crate) mod broadcast;
 mod bucket_assigner;
@@ -52,6 +53,9 @@ pub struct WriteRecord<'a> {
     schema_id: i32,
     write_format: WriteFormat,
     table_info: Arc<TableInfo>,
+    /// Optional deadline bounding the buffer-memory wait during append. `None`
+    /// falls back to the writer's configured buffer wait timeout.
+    submit_deadline: Option<Instant>,
 }
 
 impl<'a> WriteRecord<'a> {
@@ -143,6 +147,7 @@ impl<'a> WriteRecord<'a> {
             bucket_key: None,
             schema_id,
             write_format: WriteFormat::ArrowLog,
+            submit_deadline: None,
         }
     }
 
@@ -159,12 +164,21 @@ impl<'a> WriteRecord<'a> {
             bucket_key: None,
             schema_id,
             write_format: WriteFormat::ArrowLog,
+            submit_deadline: None,
         }
     }
 
     /// Sets the bucket key used to hash-assign this record to a bucket.
     pub fn with_bucket_key(mut self, bucket_key: Option<Bytes>) -> Self {
         self.bucket_key = bucket_key;
+        self
+    }
+
+    /// Sets a submit deadline that bounds how long the buffer-memory wait may block
+    /// before this record's append fails fast. `None` uses the writer's configured
+    /// buffer wait timeout.
+    pub fn with_submit_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.submit_deadline = deadline;
         self
     }
 
@@ -186,6 +200,7 @@ impl<'a> WriteRecord<'a> {
             bucket_key,
             schema_id,
             write_format,
+            submit_deadline: None,
         }
     }
 }

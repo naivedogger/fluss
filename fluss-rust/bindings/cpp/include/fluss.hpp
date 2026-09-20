@@ -579,8 +579,10 @@ struct WriteCallbackOptions {
     /// writers or large captures; independent of Configuration::writer_buffer_memory_size.
     size_t max_pending_operations = 262144;
 
-    /// Maximum wait for callback capacity; zero rejects immediately when full.
-    /// Must be nonnegative. Does not bound buffer waits, ACKs, retries, or callback duration.
+    /// Maximum wait for the whole callback submission: callback capacity plus
+    /// buffer backpressure (Kafka max.block.ms style). Zero makes submission
+    /// non-blocking, rejecting immediately when either is full. Must be nonnegative.
+    /// Does not bound ACKs, core retries, or callback duration.
     std::chrono::milliseconds enqueue_timeout{30000};
 };
 
@@ -1955,8 +1957,11 @@ class AppendWriter {
     Result Append(const GenericRow& row);
     Result Append(const GenericRow& row, WriteResult& out);
     /// Submit a row and notify callback of its final outcome without waiting for
-    /// acknowledgment. Returns submission status; on failure no callback runs.
-    /// Submission can block on callback capacity and buffer backpressure. See WriteCallbackOptions.
+    /// acknowledgment. Submission is bounded by WriteCallbackOptions::enqueue_timeout,
+    /// covering callback capacity and buffer backpressure: within it, Ok means the
+    /// write was accepted and the callback fires exactly once, an error means
+    /// submission failed and no callback runs. A zero enqueue_timeout makes
+    /// submission non-blocking. See WriteCallbackOptions.
     Result Append(const GenericRow& row, WriteCallback callback);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch, WriteResult& out);
@@ -1970,6 +1975,14 @@ class AppendWriter {
     friend class TableAppend;
     AppendWriter(ffi::AppendWriter* writer,
                  std::shared_ptr<ffi::WriteCallbackCapacity> callback_capacity) noexcept;
+
+    // Submit through FFI bounding the buffer-backpressure wait by submit_budget_ms
+    // (Kafka max.block.ms style): negative uses the writer's configured buffer wait
+    // timeout, >= 0 caps the wait at that many ms (0 = fail fast when the buffer is
+    // full). Only the callback path passes a budget; the public overloads pass -1.
+    Result AppendWithBudget(const GenericRow& row, WriteResult& out, int64_t submit_budget_ms);
+    Result AppendArrowBatchWithBudget(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                      WriteResult& out, int64_t submit_budget_ms);
 
     void Destroy() noexcept;
     ffi::AppendWriter* writer_{nullptr};
@@ -1990,9 +2003,12 @@ class UpsertWriter {
 
     Result Upsert(const GenericRow& row);
     Result Upsert(const GenericRow& row, WriteResult& out);
-    /// Submit an upsert and notify callback of its final outcome. Returns
-    /// submission status; on failure no callback runs. Submission may block on
-    /// callback capacity and buffer backpressure, but not acknowledgment. See WriteCallbackOptions.
+    /// Submit an upsert and notify callback of its final outcome without waiting
+    /// for acknowledgment. Submission is bounded by WriteCallbackOptions::enqueue_timeout,
+    /// covering callback capacity and buffer backpressure: within it, Ok means the
+    /// write was accepted and the callback fires exactly once, an error means
+    /// submission failed and no callback runs. A zero enqueue_timeout makes
+    /// submission non-blocking. See WriteCallbackOptions.
     Result Upsert(const GenericRow& row, WriteCallback callback);
     Result Delete(const GenericRow& row);
     Result Delete(const GenericRow& row, WriteResult& out);
@@ -2005,6 +2021,12 @@ class UpsertWriter {
     friend class TableUpsert;
     UpsertWriter(ffi::UpsertWriter* writer,
                  std::shared_ptr<ffi::WriteCallbackCapacity> callback_capacity) noexcept;
+
+    // See AppendWriter::AppendWithBudget for submit_budget_ms semantics. Only the
+    // callback path passes a budget; the public overloads pass -1.
+    Result UpsertWithBudget(const GenericRow& row, WriteResult& out, int64_t submit_budget_ms);
+    Result DeleteWithBudget(const GenericRow& row, WriteResult& out, int64_t submit_budget_ms);
+
     void Destroy() noexcept;
     ffi::UpsertWriter* writer_{nullptr};
     std::shared_ptr<ffi::WriteCallbackCapacity> callback_capacity_;

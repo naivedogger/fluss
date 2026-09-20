@@ -1670,6 +1670,11 @@ Result AppendWriter::Append(const GenericRow& row) {
 }
 
 Result AppendWriter::Append(const GenericRow& row, WriteResult& out) {
+    return AppendWithBudget(row, out, -1);
+}
+
+Result AppendWriter::AppendWithBudget(const GenericRow& row, WriteResult& out,
+                                      int64_t submit_budget_ms) {
     if (!Available()) {
         return utils::make_client_error("AppendWriter not available");
     }
@@ -1677,7 +1682,7 @@ Result AppendWriter::Append(const GenericRow& row, WriteResult& out) {
         return utils::make_client_error("GenericRow not available");
     }
 
-    auto ffi_result = writer_->append(*row.inner_);
+    auto ffi_result = writer_->append(*row.inner_, submit_budget_ms);
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
         out = WriteResult(utils::ptr_from_ffi<ffi::WriteResult>(ffi_result));
@@ -1692,12 +1697,14 @@ Result AppendWriter::Append(const GenericRow& row, WriteCallback callback) {
     // Allocate before submission so an allocation failure cannot lose an
     // already accepted write's completion notification.
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    // Bound the whole submit (capacity reservation + buffer wait) by enqueue_timeout.
+    const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
     if (!reserved.Ok()) {
         return reserved;
     }
     WriteResult pending;
-    auto result = Append(row, pending);
+    auto result = AppendWithBudget(row, pending, callback_capacity_->RemainingBudgetMs(submit_start));
     if (result.Ok()) {
         return pending.Notify(std::move(completion));
     }
@@ -1711,6 +1718,11 @@ Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>&
 
 Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch,
                                       WriteResult& out) {
+    return AppendArrowBatchWithBudget(batch, out, -1);
+}
+
+Result AppendWriter::AppendArrowBatchWithBudget(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                                WriteResult& out, int64_t submit_budget_ms) {
     if (!Available()) {
         return utils::make_client_error("AppendWriter not available");
     }
@@ -1733,7 +1745,8 @@ Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>&
     // Rust takes ownership of both pointers immediately via Box::from_raw(),
     // so after this call C++ must NOT free them.
     auto ffi_result = writer_->append_arrow_batch(reinterpret_cast<size_t>(array_heap),
-                                                  reinterpret_cast<size_t>(schema_heap));
+                                                  reinterpret_cast<size_t>(schema_heap),
+                                                  submit_budget_ms);
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
         out.Destroy();
@@ -1748,12 +1761,14 @@ Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>&
         return utils::make_client_error("Write callback must not be empty");
     }
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
     if (!reserved.Ok()) {
         return reserved;
     }
     WriteResult pending;
-    auto result = AppendArrowBatch(batch, pending);
+    auto result =
+        AppendArrowBatchWithBudget(batch, pending, callback_capacity_->RemainingBudgetMs(submit_start));
     if (result.Ok()) {
         return pending.Notify(std::move(completion));
     }
@@ -1813,6 +1828,11 @@ Result UpsertWriter::Upsert(const GenericRow& row) {
 }
 
 Result UpsertWriter::Upsert(const GenericRow& row, WriteResult& out) {
+    return UpsertWithBudget(row, out, -1);
+}
+
+Result UpsertWriter::UpsertWithBudget(const GenericRow& row, WriteResult& out,
+                                     int64_t submit_budget_ms) {
     if (!Available()) {
         return utils::make_client_error("UpsertWriter not available");
     }
@@ -1820,7 +1840,7 @@ Result UpsertWriter::Upsert(const GenericRow& row, WriteResult& out) {
         return utils::make_client_error("GenericRow not available");
     }
 
-    auto ffi_result = writer_->upsert(*row.inner_);
+    auto ffi_result = writer_->upsert(*row.inner_, submit_budget_ms);
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
         out = WriteResult(utils::ptr_from_ffi<ffi::WriteResult>(ffi_result));
@@ -1833,12 +1853,13 @@ Result UpsertWriter::Upsert(const GenericRow& row, WriteCallback callback) {
         return utils::make_client_error("Write callback must not be empty");
     }
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
     if (!reserved.Ok()) {
         return reserved;
     }
     WriteResult pending;
-    auto result = Upsert(row, pending);
+    auto result = UpsertWithBudget(row, pending, callback_capacity_->RemainingBudgetMs(submit_start));
     if (result.Ok()) {
         return pending.Notify(std::move(completion));
     }
@@ -1851,6 +1872,11 @@ Result UpsertWriter::Delete(const GenericRow& row) {
 }
 
 Result UpsertWriter::Delete(const GenericRow& row, WriteResult& out) {
+    return DeleteWithBudget(row, out, -1);
+}
+
+Result UpsertWriter::DeleteWithBudget(const GenericRow& row, WriteResult& out,
+                                     int64_t submit_budget_ms) {
     if (!Available()) {
         return utils::make_client_error("UpsertWriter not available");
     }
@@ -1858,7 +1884,7 @@ Result UpsertWriter::Delete(const GenericRow& row, WriteResult& out) {
         return utils::make_client_error("GenericRow not available");
     }
 
-    auto ffi_result = writer_->delete_row(*row.inner_);
+    auto ffi_result = writer_->delete_row(*row.inner_, submit_budget_ms);
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
         out = WriteResult(utils::ptr_from_ffi<ffi::WriteResult>(ffi_result));
@@ -1871,12 +1897,13 @@ Result UpsertWriter::Delete(const GenericRow& row, WriteCallback callback) {
         return utils::make_client_error("Write callback must not be empty");
     }
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
+    const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
     if (!reserved.Ok()) {
         return reserved;
     }
     WriteResult pending;
-    auto result = Delete(row, pending);
+    auto result = DeleteWithBudget(row, pending, callback_capacity_->RemainingBudgetMs(submit_start));
     if (result.Ok()) {
         return pending.Notify(std::move(completion));
     }
