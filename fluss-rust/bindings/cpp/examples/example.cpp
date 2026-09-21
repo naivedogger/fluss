@@ -45,6 +45,11 @@ int main() {
     // 1) Connect
     fluss::Configuration config;
     config.bootstrap_servers = "127.0.0.1:9123";
+    // Bounds how long a write blocks when the shared write buffer is full, and also caps
+    // the whole callback submission (callback capacity plus buffer backpressure). The
+    // default UINT64_MAX waits indefinitely; a finite value makes overloaded writes and
+    // callback submits return with an error instead of blocking. Zero fails fast.
+    config.writer_buffer_wait_timeout_ms = 30000;
 
     fluss::Connection conn;
     check("create", fluss::Connection::Create(config, conn));
@@ -97,7 +102,7 @@ int main() {
     fluss::WriteCallbackOptions callback_options;
     // Pending callback operations per writer. Lower it for large captures or many
     // writers; independent of the Connection's write-buffer byte budget. Waiting for a
-    // free slot is bounded by client.writer.buffer.wait-timeout.
+    // free slot is bounded by the connection's writer_buffer_wait_timeout_ms set above.
     callback_options.max_pending_operations = 262144;
     check("new_append_writer", table.NewAppend().CreateWriter(writer, callback_options));
 

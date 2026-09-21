@@ -365,6 +365,44 @@ TEST_F(WriteCallbackTest, ArrowBatchCapacitySurvivesMovesAndDoesNotAffectWaitOrF
     EXPECT_EQ(rejected->Results().size(), 1u);
 }
 
+// End-to-end through the public writer API: when the writer's capacity is exhausted, a
+// callback submission must return within the connection's client.writer.buffer.wait-timeout
+// rather than blocking on the occupied slot until the running callback releases it.
+TEST_F(WriteCallbackTest, CapacityFullSubmissionReturnsWithinWaitTimeout) {
+    CreateTable();
+    constexpr uint64_t wait_timeout_ms = 200;
+    UseWriterBufferWaitTimeout(wait_timeout_ms);
+    fluss::AppendWriter writer;
+    ASSERT_OK(table_.NewAppend().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
+
+    // Occupy the single slot with a callback that blocks until released, so the next
+    // submission has to wait for capacity instead of completing normally.
+    auto started = std::make_shared<Completion>();
+    auto gate = std::make_shared<std::promise<void>>();
+    auto resume = gate->get_future().share();
+    ASSERT_OK(writer.Append(Row(), [started, resume](fluss::Result result) {
+        started->Record(std::move(result));
+        resume.wait_for(std::chrono::seconds(20));
+    }));
+    ASSERT_TRUE(started->Await());
+
+    auto rejected = std::make_shared<Completion>();
+    auto start = std::chrono::steady_clock::now();
+    auto result = writer.Append(
+        Row(2), [rejected](fluss::Result completed) { rejected->Record(std::move(completed)); });
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_FALSE(result.Ok());
+    EXPECT_NE(result.error_message.find("Timed out"), std::string::npos);
+    // Returned because the shared budget elapsed: not immediately, and well before the
+    // 20-second callback block that would otherwise gate the slot.
+    EXPECT_GE(elapsed, std::chrono::milliseconds(wait_timeout_ms));
+    EXPECT_LT(elapsed, std::chrono::seconds(5));
+    EXPECT_TRUE(rejected->Results().empty());
+
+    gate->set_value();
+    ASSERT_OK(writer.Flush());
+}
+
 TEST_F(WriteCallbackTest, UpsertAndDeleteShareCapacityAndReturnItOnSubmissionErrors) {
     CreateTable(true);
     UseWriterBufferWaitTimeout(250);
