@@ -612,25 +612,24 @@ TEST(WriteCallbackBridgeTest, ValidatesCallbackOptions) {
     EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
 }
 
-TEST(WriteCallbackBridgeTest, DefaultCapacityRejectsOverflowWithoutDroppingReservations) {
-    fluss::WriteCallbackOptions options;
-    fluss::ffi::WriteCallbackCapacity capacity(options, 0);
-    for (size_t i = 0; i < options.max_pending_operations; ++i) {
+TEST(WriteCallbackBridgeTest, CapacityRejectsOverflowWithoutDroppingReservations) {
+    constexpr size_t max_pending_operations = 3;
+    fluss::ffi::WriteCallbackCapacity capacity(max_pending_operations, 0);
+    for (size_t i = 0; i < max_pending_operations; ++i) {
         ASSERT_OK(capacity.Acquire());
     }
     EXPECT_FALSE(capacity.Acquire().Ok());
     capacity.Release();
     ASSERT_OK(capacity.Acquire());
     EXPECT_FALSE(capacity.Acquire().Ok());
-    for (size_t i = 0; i < options.max_pending_operations; ++i) {
+    for (size_t i = 0; i < max_pending_operations; ++i) {
         capacity.Release();
     }
     EXPECT_OK(capacity.AwaitAll(std::chrono::milliseconds(0)));
 }
 
 TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 0);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     // This deleter runs after the user callback returns, but before its slot is returned.
     auto capture = std::shared_ptr<int>(new int(0), [capacity](int* value) {
         EXPECT_FALSE(capacity->Acquire().Ok());
@@ -649,8 +648,7 @@ TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {
 }
 
 TEST(WriteCallbackBridgeTest, UnsubmittedCallbackReturnsCapacityOnException) {
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 0);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     int calls = 0;
     try {
         fluss::ffi::WriteCallback callback([&](fluss::Result) { ++calls; });
@@ -664,8 +662,7 @@ TEST(WriteCallbackBridgeTest, UnsubmittedCallbackReturnsCapacityOnException) {
 }
 
 TEST(WriteCallbackBridgeTest, ReservationOutlivesWriterOwnership) {
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 0);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     std::weak_ptr<fluss::ffi::WriteCallbackCapacity> weak = capacity;
     fluss::ffi::WriteCallback callback([](fluss::Result) {});
     ASSERT_OK(callback.Reserve(capacity));
@@ -676,8 +673,7 @@ TEST(WriteCallbackBridgeTest, ReservationOutlivesWriterOwnership) {
 }
 
 TEST(WriteCallbackBridgeTest, CapacityTimeoutDoesNotDiscardAcceptedCallback) {
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 25);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 25);
     int calls = 0;
     fluss::ffi::WriteCallback accepted([&](fluss::Result) { ++calls; });
     ASSERT_OK(accepted.Reserve(capacity));
@@ -694,8 +690,7 @@ TEST(WriteCallbackBridgeTest, CapacityTimeoutDoesNotDiscardAcceptedCallback) {
 }
 
 TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 5000);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 5000);
     fluss::ffi::WriteCallback accepted([](fluss::Result) {});
     ASSERT_OK(accepted.Reserve(capacity));
     std::promise<void> started;
@@ -714,8 +709,7 @@ TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
 }
 
 TEST(WriteCallbackBridgeTest, CallbackRejectsFullOtherWriterAndRestoresThreadContext) {
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 25);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 25);
     ASSERT_OK(capacity->Acquire());  // Full writer unrelated to the executing callback.
     fluss::ffi::WriteCallback callback([capacity](fluss::Result) {
         auto result = capacity->Acquire();
@@ -732,8 +726,7 @@ TEST(WriteCallbackBridgeTest, CallbackRejectsFullOtherWriterAndRestoresThreadCon
 
 TEST(WriteCallbackBridgeTest, ConcurrentCapacityReservationsStayBounded) {
     constexpr size_t limit = 3;
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{limit}, 5000);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(limit, 5000);
     std::atomic<size_t> active{0};
     std::atomic<size_t> completed{0};
     std::vector<std::thread> threads;

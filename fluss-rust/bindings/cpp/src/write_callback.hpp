@@ -37,8 +37,8 @@ class WriteCallbackCapacity {
    public:
     /// `wait_timeout_ms` is the connection's client.writer.buffer.wait-timeout, used as
     /// the shared budget for the whole submit. UINT64_MAX means block until a slot frees.
-    WriteCallbackCapacity(const WriteCallbackOptions& options, uint64_t wait_timeout_ms)
-        : max_pending_(options.max_pending_operations), wait_timeout_ms_(wait_timeout_ms) {}
+    WriteCallbackCapacity(size_t max_pending_operations, uint64_t wait_timeout_ms)
+        : max_pending_(max_pending_operations), wait_timeout_ms_(wait_timeout_ms) {}
 
     static Result Validate(const WriteCallbackOptions& options) {
         if (options.max_pending_operations == 0) {

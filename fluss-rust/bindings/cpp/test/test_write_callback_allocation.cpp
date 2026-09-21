@@ -52,8 +52,7 @@ TEST(WriteCallbackBridgeTest, ErrorTextAllocationFailureStillCompletesAndRelease
         ++calls;
         observed = std::move(result);
     });
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1}, 0);
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     ASSERT_TRUE(callback.Reserve(capacity).Ok());
     const rust::Str text(message);
     fail_next_allocation = true;

@@ -1294,7 +1294,7 @@ Result TableAppend::CreateWriter(AppendWriter& out, const WriteCallbackOptions& 
     }
 
     auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
-        options, table_->writer_buffer_wait_timeout_ms());
+        options.max_pending_operations, table_->writer_buffer_wait_timeout_ms());
     auto ffi_result = table_->new_append_writer();
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
@@ -1363,7 +1363,7 @@ Result TableUpsert::CreateWriter(UpsertWriter& out, const WriteCallbackOptions& 
 
     try {
         auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
-            options, table_->writer_buffer_wait_timeout_ms());
+            options.max_pending_operations, table_->writer_buffer_wait_timeout_ms());
         auto resolved_indices = !column_names_.empty() ? ResolveNameProjection() : column_indices_;
 
         rust::Vec<size_t> rust_indices;
