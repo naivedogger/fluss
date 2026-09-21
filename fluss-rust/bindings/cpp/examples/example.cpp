@@ -91,11 +91,17 @@ int main() {
 
     // 5) Write rows with scalar and temporal values
     fluss::AppendWriter writer;
-    // Defaults: 262144 pending callback operations per Writer, 30s submission timeout
-    // (callback capacity plus buffer backpressure; zero makes callback submits non-blocking).
-    // Pass WriteCallbackOptions to lower the limit for large captures or many writers.
-    // This count is independent of the Connection's write-buffer byte budget.
-    check("new_append_writer", table.NewAppend().CreateWriter(writer));
+    // Callback admission limits, shown with their defaults. They bound the callback
+    // overloads only; Wait and fire-and-forget writes are unaffected. Passing no
+    // options uses these same values, so this block is equivalent to CreateWriter(writer).
+    fluss::WriteCallbackOptions callback_options;
+    // Pending callback operations per writer. Lower it for large captures or many
+    // writers; independent of the Connection's write-buffer byte budget.
+    callback_options.max_pending_operations = 262144;
+    // Whole-submit budget (callback capacity plus buffer backpressure). Zero makes
+    // callback submits non-blocking, rejecting immediately when either is full.
+    callback_options.enqueue_timeout = std::chrono::milliseconds(30000);
+    check("new_append_writer", table.NewAppend().CreateWriter(writer, callback_options));
 
     struct RowData {
         int id;
