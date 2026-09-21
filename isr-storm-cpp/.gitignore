@@ -1,0 +1,5 @@
+# Local run artifacts and real credentials (never packaged/committed).
+build/
+isr-run-cpp/
+isr-storm-cpp-*.tar.gz
+isr-storm.conf
