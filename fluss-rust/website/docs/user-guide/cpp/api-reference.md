@@ -303,7 +303,7 @@ auto created = table.NewAppend().CreateWriter(writer, options);
 |--------|---------|---------|
 | `max_pending_operations` | `262144` | Positive, per-writer limit on callback operations reserved for submission or not yet finished |
 
-The existing `CreateWriter(writer)` overload uses these defaults. Each callback
+The existing `CreateWriter(writer)` overload uses this default. Each callback
 submission reserves one slot **before** submitting to Rust and holds it through
 user callback execution and capture cleanup. Submission errors and exceptions
 return the slot automatically. `Upsert` and `Delete` share their writer's limit;

@@ -1607,7 +1607,9 @@ struct Configuration {
     // Shared write-batch memory budget per Connection, across its tables and writers
     // (default 64 MiB). Not a process RSS limit or a callback-capture memory budget.
     size_t writer_buffer_memory_size{64 * 1024 * 1024};
-    // Maximum time in milliseconds to block waiting for buffer memory
+    // Maximum time in milliseconds to block waiting for buffer memory. This also bounds
+    // the whole callback submission, including callback capacity and buffer backpressure.
+    // UINT64_MAX waits indefinitely; zero fails fast when capacity or memory is unavailable.
     uint64_t writer_buffer_wait_timeout_ms{std::numeric_limits<uint64_t>::max()};
     // Maximum KV backpressure throttle in milliseconds
     uint64_t writer_kv_backpressure_max_throttle_ms{3000};
