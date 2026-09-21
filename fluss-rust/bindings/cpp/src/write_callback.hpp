@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <mutex>
 
 #include "fluss.hpp"
@@ -34,27 +35,31 @@ namespace ffi {
 /// Per-writer admission control; independent of Rust buffer memory and ACK completion.
 class WriteCallbackCapacity {
    public:
-    explicit WriteCallbackCapacity(const WriteCallbackOptions& options) : options_(options) {}
+    /// `wait_timeout_ms` is the connection's client.writer.buffer.wait-timeout, used as
+    /// the shared budget for the whole submit. UINT64_MAX means block until a slot frees.
+    WriteCallbackCapacity(const WriteCallbackOptions& options, uint64_t wait_timeout_ms)
+        : max_pending_(options.max_pending_operations), wait_timeout_ms_(wait_timeout_ms) {}
 
     static Result Validate(const WriteCallbackOptions& options) {
         if (options.max_pending_operations == 0) {
             return {ErrorCode::CLIENT_ERROR, "max_pending_operations must be positive"};
-        }
-        if (options.enqueue_timeout.count() < 0) {
-            return {ErrorCode::CLIENT_ERROR, "enqueue_timeout must be nonnegative"};
         }
         return {};
     }
 
     Result Acquire() {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (pending_ == options_.max_pending_operations) {
-            // Applies across writers and also to callbacks on the fallback executor.
-            if (in_callback_ || options_.enqueue_timeout.count() == 0) {
+        if (pending_ == max_pending_) {
+            auto has_slot = [&] { return pending_ < max_pending_; };
+            // Fail fast from within a callback to avoid stalling the shared workers on
+            // their own capacity; a zero budget also rejects immediately.
+            if (in_callback_ || wait_timeout_ms_ == 0) {
                 return {ErrorCode::CLIENT_ERROR, "Write callback capacity is full"};
             }
-            if (!available_.wait_for(lock, options_.enqueue_timeout,
-                                     [&] { return pending_ < options_.max_pending_operations; })) {
+            if (IsUnbounded()) {
+                available_.wait(lock, has_slot);
+            } else if (!available_.wait_for(lock, std::chrono::milliseconds(wait_timeout_ms_),
+                                            has_slot)) {
                 return {ErrorCode::CLIENT_ERROR, "Timed out waiting for write callback capacity"};
             }
         }
@@ -69,7 +74,7 @@ class WriteCallbackCapacity {
         }
         // notify_all: Acquire() waiters and the AwaitAll() waiter share this condvar,
         // so waking only one risks waking AwaitAll() (still pending) while an Acquire()
-        // waiter sleeps until enqueue_timeout despite the freed slot.
+        // waiter keeps sleeping despite the freed slot.
         available_.notify_all();
     }
 
@@ -84,22 +89,26 @@ class WriteCallbackCapacity {
         return {};
     }
 
-    /// Milliseconds left in the enqueue_timeout budget since `start`, floored at 0.
-    /// Used to bound the buffer-backpressure wait so the whole submit stays within
-    /// enqueue_timeout (Kafka max.block.ms style). A zero budget makes the buffer
-    /// wait non-blocking (fail fast).
+    /// Milliseconds left in the client.writer.buffer.wait-timeout budget since `start`, so
+    /// the buffer-backpressure wait plus the capacity reservation stay within one timeout
+    /// (Kafka max.block.ms style). Floored at 0 (0 = fail fast). Returns -1 when the timeout
+    /// is unbounded, letting the buffer wait fall back to the writer's configured timeout.
     int64_t RemainingBudgetMs(std::chrono::steady_clock::time_point start) const {
+        if (IsUnbounded()) {
+            return -1;
+        }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
-        auto remaining = options_.enqueue_timeout - elapsed;
-        auto ms = remaining.count();
-        return ms > 0 ? ms : 0;
+        int64_t remaining = static_cast<int64_t>(wait_timeout_ms_) - elapsed.count();
+        return remaining > 0 ? remaining : 0;
     }
 
    private:
     friend class WriteCallback;
     inline static thread_local bool in_callback_ = false;
-    const WriteCallbackOptions options_;
+    bool IsUnbounded() const { return wait_timeout_ms_ == std::numeric_limits<uint64_t>::max(); }
+    const size_t max_pending_;
+    const uint64_t wait_timeout_ms_;
     std::mutex mutex_;
     std::condition_variable available_;
     size_t pending_ = 0;

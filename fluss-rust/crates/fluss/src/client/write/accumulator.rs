@@ -2378,7 +2378,7 @@ mod tests {
 
     #[test]
     fn test_memory_limiter_acquire_within_past_deadline_is_nonblocking() {
-        // A deadline already in the past = try semantics (callback enqueue_timeout == 0).
+        // A deadline already in the past = try semantics (zero submit budget).
         let limiter = Arc::new(MemoryLimiter::new(1024, Duration::from_secs(3600)));
         let _permit = limiter.acquire(1024).unwrap();
 

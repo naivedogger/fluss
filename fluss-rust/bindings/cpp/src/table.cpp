@@ -1293,7 +1293,8 @@ Result TableAppend::CreateWriter(AppendWriter& out, const WriteCallbackOptions& 
         return utils::make_client_error("Table not available");
     }
 
-    auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(options);
+    auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
+        options, table_->writer_buffer_wait_timeout_ms());
     auto ffi_result = table_->new_append_writer();
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
@@ -1361,7 +1362,8 @@ Result TableUpsert::CreateWriter(UpsertWriter& out, const WriteCallbackOptions& 
     }
 
     try {
-        auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(options);
+        auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
+            options, table_->writer_buffer_wait_timeout_ms());
         auto resolved_indices = !column_names_.empty() ? ResolveNameProjection() : column_indices_;
 
         rust::Vec<size_t> rust_indices;
@@ -1697,7 +1699,7 @@ Result AppendWriter::Append(const GenericRow& row, WriteCallback callback) {
     // Allocate before submission so an allocation failure cannot lose an
     // already accepted write's completion notification.
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
-    // Bound the whole submit (capacity reservation + buffer wait) by enqueue_timeout.
+    // Bound the whole submit (capacity reservation + buffer wait) by client.writer.buffer.wait-timeout.
     const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
     if (!reserved.Ok()) {

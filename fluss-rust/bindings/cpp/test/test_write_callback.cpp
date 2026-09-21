@@ -100,12 +100,24 @@ class WriteCallbackTest : public ::testing::Test {
             descriptor_builder.SetProperty("table.delete.behavior", "disable");
         }
         auto descriptor = descriptor_builder.Build();
-        fluss::TablePath path("fluss",
-                              std::string("cpp_callback_") +
-                                  ::testing::UnitTest::GetInstance()->current_test_info()->name());
-        fluss_test::CreateTable(env.GetAdmin(), path, descriptor);
-        auto result = env.GetConnection().GetTable(path, table_);
+        table_path_ = fluss::TablePath(
+            "fluss", std::string("cpp_callback_") +
+                         ::testing::UnitTest::GetInstance()->current_test_info()->name());
+        fluss_test::CreateTable(env.GetAdmin(), table_path_, descriptor);
+        auto result = env.GetConnection().GetTable(table_path_, table_);
         ASSERT_OK(result);
+    }
+
+    // Reopen table_ through a dedicated connection whose client.writer.buffer.wait-timeout
+    // bounds callback submission, so a full-capacity wait fails with a definite timeout
+    // instead of blocking on the shared connection's unbounded default.
+    void UseWriterBufferWaitTimeout(uint64_t wait_timeout_ms) {
+        auto& env = *fluss_test::FlussTestEnvironment::Instance();
+        fluss::Configuration config;
+        config.bootstrap_servers = env.GetBootstrapServers();
+        config.writer_buffer_wait_timeout_ms = wait_timeout_ms;
+        ASSERT_OK(fluss::Connection::Create(config, connection_));
+        ASSERT_OK(connection_.GetTable(table_path_, table_));
     }
 
     fluss::GenericRow Row(int32_t id = 1) {
@@ -115,6 +127,9 @@ class WriteCallbackTest : public ::testing::Test {
         return row;
     }
 
+    // Declared before table_ so the table (which references it) is destroyed first.
+    fluss::Connection connection_;
+    fluss::TablePath table_path_;
     fluss::Table table_;
 };
 
@@ -270,8 +285,7 @@ TEST_F(WriteCallbackTest, MultipleOutstandingWritesEachNotifyOnce) {
 TEST_F(WriteCallbackTest, RejectedSubmissionDoesNotInvokeCallback) {
     CreateTable();
     fluss::AppendWriter writer;
-    ASSERT_OK(table_.NewAppend().CreateWriter(
-        writer, fluss::WriteCallbackOptions{1, std::chrono::milliseconds(0)}));
+    ASSERT_OK(table_.NewAppend().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
     auto completion = std::make_shared<Completion>();
     auto lifetime = std::make_shared<Lifetime>();
     auto released = lifetime->released.get_future();
@@ -300,9 +314,9 @@ TEST_F(WriteCallbackTest, RejectedSubmissionDoesNotInvokeCallback) {
 
 TEST_F(WriteCallbackTest, ArrowBatchCapacitySurvivesMovesAndDoesNotAffectWaitOrFlush) {
     CreateTable();
+    UseWriterBufferWaitTimeout(250);
     fluss::AppendWriter writer;
-    ASSERT_OK(table_.NewAppend().CreateWriter(
-        writer, fluss::WriteCallbackOptions{1, std::chrono::milliseconds(250)}));
+    ASSERT_OK(table_.NewAppend().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
     arrow::Int32Builder ids;
     arrow::StringBuilder values;
     ASSERT_TRUE(ids.AppendValues({1, 2, 3}).ok());
@@ -353,9 +367,9 @@ TEST_F(WriteCallbackTest, ArrowBatchCapacitySurvivesMovesAndDoesNotAffectWaitOrF
 
 TEST_F(WriteCallbackTest, UpsertAndDeleteShareCapacityAndReturnItOnSubmissionErrors) {
     CreateTable(true);
+    UseWriterBufferWaitTimeout(250);
     fluss::UpsertWriter writer;
-    ASSERT_OK(table_.NewUpsert().CreateWriter(
-        writer, fluss::WriteCallbackOptions{1, std::chrono::milliseconds(250)}));
+    ASSERT_OK(table_.NewUpsert().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
     auto completion = std::make_shared<Completion>();
     auto callback = [completion](fluss::Result result) { completion->Record(std::move(result)); };
     fluss::GenericRow invalid(2);
@@ -388,8 +402,7 @@ TEST_F(WriteCallbackTest, UpsertAndDeleteShareCapacityAndReturnItOnSubmissionErr
 TEST_F(WriteCallbackTest, CallbackDoesNotWaitForCapacityOnAnotherWriter) {
     CreateTable();
     auto full_writer = std::make_shared<fluss::AppendWriter>();
-    ASSERT_OK(table_.NewAppend().CreateWriter(
-        *full_writer, fluss::WriteCallbackOptions{1, std::chrono::seconds(5)}));
+    ASSERT_OK(table_.NewAppend().CreateWriter(*full_writer, fluss::WriteCallbackOptions{1}));
     auto started = std::make_shared<Completion>();
     auto gate = std::make_shared<std::promise<void>>();
     auto resume = gate->get_future().share();
@@ -547,7 +560,6 @@ TEST(WriteCallbackBridgeTest, ContainsCallbackExceptions) {
 TEST(WriteCallbackBridgeTest, ValidatesCallbackOptions) {
     fluss::WriteCallbackOptions options;
     EXPECT_EQ(options.max_pending_operations, 262144u);
-    EXPECT_EQ(options.enqueue_timeout, std::chrono::seconds(30));
     EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
     options.max_pending_operations = 0;
     EXPECT_FALSE(fluss::ffi::WriteCallbackCapacity::Validate(options).Ok());
@@ -559,20 +571,12 @@ TEST(WriteCallbackBridgeTest, ValidatesCallbackOptions) {
     EXPECT_EQ(table.NewUpsert().CreateWriter(upsert, options).error_message,
               "max_pending_operations must be positive");
     options.max_pending_operations = 1;
-    options.enqueue_timeout = std::chrono::milliseconds(-1);
-    EXPECT_FALSE(fluss::ffi::WriteCallbackCapacity::Validate(options).Ok());
-    EXPECT_EQ(table.NewAppend().CreateWriter(append, options).error_message,
-              "enqueue_timeout must be nonnegative");
-    EXPECT_EQ(table.NewUpsert().CreateWriter(upsert, options).error_message,
-              "enqueue_timeout must be nonnegative");
-    options.enqueue_timeout = std::chrono::milliseconds(0);
     EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
 }
 
 TEST(WriteCallbackBridgeTest, DefaultCapacityRejectsOverflowWithoutDroppingReservations) {
     fluss::WriteCallbackOptions options;
-    options.enqueue_timeout = std::chrono::milliseconds(0);
-    fluss::ffi::WriteCallbackCapacity capacity(options);
+    fluss::ffi::WriteCallbackCapacity capacity(options, 0);
     for (size_t i = 0; i < options.max_pending_operations; ++i) {
         ASSERT_OK(capacity.Acquire());
     }
@@ -588,7 +592,7 @@ TEST(WriteCallbackBridgeTest, DefaultCapacityRejectsOverflowWithoutDroppingReser
 
 TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1, std::chrono::milliseconds(0)});
+        fluss::WriteCallbackOptions{1}, 0);
     // This deleter runs after the user callback returns, but before its slot is returned.
     auto capture = std::shared_ptr<int>(new int(0), [capacity](int* value) {
         EXPECT_FALSE(capacity->Acquire().Ok());
@@ -608,7 +612,7 @@ TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {
 
 TEST(WriteCallbackBridgeTest, UnsubmittedCallbackReturnsCapacityOnException) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1, std::chrono::milliseconds(0)});
+        fluss::WriteCallbackOptions{1}, 0);
     int calls = 0;
     try {
         fluss::ffi::WriteCallback callback([&](fluss::Result) { ++calls; });
@@ -623,7 +627,7 @@ TEST(WriteCallbackBridgeTest, UnsubmittedCallbackReturnsCapacityOnException) {
 
 TEST(WriteCallbackBridgeTest, ReservationOutlivesWriterOwnership) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1, std::chrono::milliseconds(0)});
+        fluss::WriteCallbackOptions{1}, 0);
     std::weak_ptr<fluss::ffi::WriteCallbackCapacity> weak = capacity;
     fluss::ffi::WriteCallback callback([](fluss::Result) {});
     ASSERT_OK(callback.Reserve(capacity));
@@ -635,7 +639,7 @@ TEST(WriteCallbackBridgeTest, ReservationOutlivesWriterOwnership) {
 
 TEST(WriteCallbackBridgeTest, CapacityTimeoutDoesNotDiscardAcceptedCallback) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1, std::chrono::milliseconds(25)});
+        fluss::WriteCallbackOptions{1}, 25);
     int calls = 0;
     fluss::ffi::WriteCallback accepted([&](fluss::Result) { ++calls; });
     ASSERT_OK(accepted.Reserve(capacity));
@@ -653,7 +657,7 @@ TEST(WriteCallbackBridgeTest, CapacityTimeoutDoesNotDiscardAcceptedCallback) {
 
 TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1, std::chrono::seconds(5)});
+        fluss::WriteCallbackOptions{1}, 5000);
     fluss::ffi::WriteCallback accepted([](fluss::Result) {});
     ASSERT_OK(accepted.Reserve(capacity));
     std::promise<void> started;
@@ -673,7 +677,7 @@ TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
 
 TEST(WriteCallbackBridgeTest, CallbackRejectsFullOtherWriterAndRestoresThreadContext) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{1, std::chrono::milliseconds(25)});
+        fluss::WriteCallbackOptions{1}, 25);
     ASSERT_OK(capacity->Acquire());  // Full writer unrelated to the executing callback.
     fluss::ffi::WriteCallback callback([capacity](fluss::Result) {
         auto result = capacity->Acquire();
@@ -691,7 +695,7 @@ TEST(WriteCallbackBridgeTest, CallbackRejectsFullOtherWriterAndRestoresThreadCon
 TEST(WriteCallbackBridgeTest, ConcurrentCapacityReservationsStayBounded) {
     constexpr size_t limit = 3;
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(
-        fluss::WriteCallbackOptions{limit, std::chrono::seconds(5)});
+        fluss::WriteCallbackOptions{limit}, 5000);
     std::atomic<size_t> active{0};
     std::atomic<size_t> completed{0};
     std::vector<std::thread> threads;

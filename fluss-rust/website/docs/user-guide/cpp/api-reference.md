@@ -26,7 +26,7 @@ Complete API reference for the Fluss C++ client.
 | `writer_dynamic_batch_size_min`       | `int32_t`     | `262144` (256 KB)    | Lower bound for the dynamic batch size estimator (ignored when disabled)                 |
 | `writer_batch_timeout_ms`             | `int64_t`     | `100`                | Maximum time in ms to wait for a writer batch to fill up before sending                  |
 | `writer_buffer_memory_size`          | `size_t`      | `67108864` (64 MiB) | Shared write-batch memory budget per Connection, across all tables and writers; not a process RSS limit |
-| `writer_buffer_wait_timeout_ms`       | `uint64_t`    | `UINT64_MAX`        | Maximum wait for Rust write-buffer capacity in ms for Wait and fire-and-forget writes; callback writes instead bound this wait by `enqueue_timeout` |
+| `writer_buffer_wait_timeout_ms`       | `uint64_t`    | `UINT64_MAX`        | Maximum wait in ms for Rust write-buffer capacity; also bounds the whole callback submission (callback capacity plus buffer backpressure). `UINT64_MAX` waits indefinitely |
 | `writer_kv_backpressure_max_throttle_ms` | `uint64_t`  | `3000`               | Maximum per-bucket KV backpressure throttle in milliseconds                             |
 | `writer_bucket_no_key_assigner`       | `std::string` | `"sticky"`           | Bucket assignment strategy for tables without bucket keys: `"sticky"` or `"round_robin"` |
 | `scanner_remote_log_prefetch_num`     | `size_t`      | `4`                  | Number of remote log segments to prefetch                                                |
@@ -292,9 +292,8 @@ operational limits below before retrying a batch.
 
 ```cpp
 fluss::WriteCallbackOptions options;
-// These are the defaults; CreateWriter(writer) also uses them.
+// This is the default; CreateWriter(writer) also uses it.
 options.max_pending_operations = 262144;
-options.enqueue_timeout = std::chrono::seconds(30);
 fluss::AppendWriter writer;
 auto created = table.NewAppend().CreateWriter(writer, options);
 // Check created before using writer. NewUpsert().CreateWriter accepts the same options.
@@ -303,7 +302,6 @@ auto created = table.NewAppend().CreateWriter(writer, options);
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `max_pending_operations` | `262144` | Positive, per-writer limit on callback operations reserved for submission or not yet finished |
-| `enqueue_timeout` | `30s` | Nonnegative maximum wait for the whole callback submission (callback capacity plus buffer backpressure); `0ms` makes submission non-blocking |
 
 The existing `CreateWriter(writer)` overload uses these defaults. Each callback
 submission reserves one slot **before** submitting to Rust and holds it through
@@ -314,7 +312,7 @@ a writer transfers its capacity state; already accepted callbacks retain it
 independently of the writer's lifetime.
 
 When callback capacity or the write buffer is full, the submitting thread waits up
-to `enqueue_timeout` for both together.
+to `client.writer.buffer.wait-timeout` for both together.
 A capacity rejection returns `CLIENT_ERROR` without submitting any data or
 registering a callback; it never discards an accepted notification. Client errors
 return false from `IsRetriable()`, including capacity errors. Applications may
@@ -324,9 +322,9 @@ including partial ArrowBatch acceptance described below.
 
 This timeout bounds the whole callback submission, callback capacity admission plus
 buffer backpressure (Kafka max.block.ms style), so a callback submit returns a
-definite result within it and `0ms` makes submission non-blocking. It does not cover
-network requests, core retries, or callback duration, and does not cancel any
-accepted write. Do not hold a mutex needed by callbacks while submitting: a full
+definite result within it and a zero timeout makes submission non-blocking. It does
+not cover network requests, core retries, or callback duration, and does not cancel
+any accepted write. Do not hold a mutex needed by callbacks while submitting: a full
 writer can wait for those callbacks to finish.
 
 ### Sizing callback capacity and write buffers
@@ -392,17 +390,17 @@ drain it; larger buffers can otherwise just extend queues and latency. The
 eight-hour test also showed RSS growth, so it does not establish long-term memory
 stability or a universally safe configuration.
 
-For callback writes, `enqueue_timeout` bounds the whole submission, including the
-buffer-backpressure wait, so a callback submit returns within it regardless of
-`writer_buffer_wait_timeout_ms`. For `Wait()` and fire-and-forget writes,
-`writer_buffer_wait_timeout_ms` governs the buffer wait instead. Set them to suit
-upstream latency and overload handling, rather than assuming either bounds ACKs,
-retries, or callback duration. Lowering `enqueue_timeout` rejects sooner; it does
+For callback writes, `writer_buffer_wait_timeout_ms` (client.writer.buffer.wait-timeout)
+bounds the whole submission, including both the callback-capacity wait and the
+buffer-backpressure wait, so a callback submit returns within it. For `Wait()` and
+fire-and-forget writes, the same setting governs the buffer wait. Set it to suit
+upstream latency and overload handling, rather than assuming it bounds ACKs,
+retries, or callback duration. Lowering it rejects sooner; it does
 not cancel accepted writes. Increasing callback capacity does not increase Rust
 buffer space, and increasing Rust buffer space does not prevent slow callbacks from
 filling their operation limit. The default `writer_buffer_wait_timeout_ms = UINT64_MAX`
-permits an unbounded buffer wait for non-callback writes; configure a finite buffer
-wait when those paths need to stop waiting and handle overload.
+permits an unbounded wait; configure a finite value when callback submission or the
+non-callback buffer wait needs to stop waiting and handle overload.
 
 ### Execution and lifecycle
 
@@ -455,7 +453,7 @@ are still pending, so its capacity slot does not bound all underlying batch memo
 Do not wait for another callback from within a callback, since all callback
 workers could become occupied. A callback submission from within any SDK write
 callback fails immediately if its target writer's capacity is full, regardless
-of `enqueue_timeout`, to avoid blocking the shared workers on their own capacity.
+of `client.writer.buffer.wait-timeout`, to avoid blocking the shared workers on their own capacity.
 This applies across writers and on the fallback executor as well. It does not
 remove Rust buffer waits or make arbitrary blocking SDK calls deadlock-free.
 Exclusive writer access is still required. If dedicated workers cannot be
@@ -480,7 +478,7 @@ this path as a shutdown barrier.
 - Existing fire-and-forget and `WriteResult::Wait()` overloads retain their
   result semantics and do not consume callback capacity. Rust callers can still
   `.await` a `WriteResultFuture`. Callback overloads now bound the whole submission
-  by `enqueue_timeout` (callback capacity plus buffer backpressure) by default;
+  by `client.writer.buffer.wait-timeout` (callback capacity plus buffer backpressure);
   existing callback callers may block up to that timeout or receive a capacity or
   buffer error.
   Completion follows the configured acknowledgment policy; a callback does not

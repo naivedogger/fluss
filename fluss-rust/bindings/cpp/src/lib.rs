@@ -531,6 +531,7 @@ mod ffi {
         unsafe fn get_arrow_schema(self: &Table, out_ptr: usize) -> FfiResult;
         fn get_table_path(self: &Table) -> FfiTablePath;
         fn has_primary_key(self: &Table) -> bool;
+        fn writer_buffer_wait_timeout_ms(self: &Table) -> u64;
         fn create_upsert_writer(self: &Table, column_indices: Vec<usize>) -> FfiPtrResult;
         fn new_lookuper(self: &Table) -> FfiPtrResult;
         fn new_prefix_lookuper(self: &Table, lookup_column_names: Vec<String>) -> FfiPtrResult;
@@ -2082,6 +2083,12 @@ impl Table {
 
     fn has_primary_key(&self) -> bool {
         self.has_pk
+    }
+
+    /// The connection's configured write-buffer wait timeout (client.writer.buffer.wait-timeout),
+    /// used by the C++ callback path to bound the whole submit. UINT64_MAX means unbounded.
+    fn writer_buffer_wait_timeout_ms(&self) -> u64 {
+        self.connection.config().writer_buffer_wait_timeout_ms
     }
 
     fn create_upsert_writer(&self, column_indices: Vec<usize>) -> ffi::FfiPtrResult {

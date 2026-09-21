@@ -577,13 +577,9 @@ struct WriteCallbackOptions {
     /// Must be positive. One AppendArrowBatch call counts as one operation, not its rows.
     /// Per-writer count, not preallocated storage or a byte limit. Reduce for many
     /// writers or large captures; independent of Configuration::writer_buffer_memory_size.
+    /// Waiting for a free slot is bounded by client.writer.buffer.wait-timeout, the same
+    /// budget as the buffer-backpressure wait.
     size_t max_pending_operations = 262144;
-
-    /// Maximum wait for the whole callback submission: callback capacity plus
-    /// buffer backpressure (Kafka max.block.ms style). Zero makes submission
-    /// non-blocking, rejecting immediately when either is full. Must be nonnegative.
-    /// Does not bound ACKs, core retries, or callback duration.
-    std::chrono::milliseconds enqueue_timeout{30000};
 };
 
 struct TablePath {
@@ -1957,11 +1953,11 @@ class AppendWriter {
     Result Append(const GenericRow& row);
     Result Append(const GenericRow& row, WriteResult& out);
     /// Submit a row and notify callback of its final outcome without waiting for
-    /// acknowledgment. Submission is bounded by WriteCallbackOptions::enqueue_timeout,
+    /// acknowledgment. Submission is bounded by client.writer.buffer.wait-timeout,
     /// covering callback capacity and buffer backpressure: within it, Ok means the
     /// write was accepted and the callback fires exactly once, an error means
-    /// submission failed and no callback runs. A zero enqueue_timeout makes
-    /// submission non-blocking. See WriteCallbackOptions.
+    /// submission failed and no callback runs. A zero timeout makes submission
+    /// non-blocking. See WriteCallbackOptions.
     Result Append(const GenericRow& row, WriteCallback callback);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch, WriteResult& out);
@@ -2004,11 +2000,11 @@ class UpsertWriter {
     Result Upsert(const GenericRow& row);
     Result Upsert(const GenericRow& row, WriteResult& out);
     /// Submit an upsert and notify callback of its final outcome without waiting
-    /// for acknowledgment. Submission is bounded by WriteCallbackOptions::enqueue_timeout,
+    /// for acknowledgment. Submission is bounded by client.writer.buffer.wait-timeout,
     /// covering callback capacity and buffer backpressure: within it, Ok means the
     /// write was accepted and the callback fires exactly once, an error means
-    /// submission failed and no callback runs. A zero enqueue_timeout makes
-    /// submission non-blocking. See WriteCallbackOptions.
+    /// submission failed and no callback runs. A zero timeout makes submission
+    /// non-blocking. See WriteCallbackOptions.
     Result Upsert(const GenericRow& row, WriteCallback callback);
     Result Delete(const GenericRow& row);
     Result Delete(const GenericRow& row, WriteResult& out);

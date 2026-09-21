@@ -78,11 +78,11 @@ not apply to `CreateBucketBatchScanner()`.
 
 The callback section configures `WriteCallbackOptions` to bound outstanding callback
 operations. The SDK executes callbacks; applications do not need a waiting thread or
-poll loop. The example uses the defaults: `max_pending_operations = 262144` per Writer
-and `enqueue_timeout = 30s`. That timeout bounds the whole callback submission, callback
-capacity plus buffer backpressure, so a callback submit returns a definite result within
-it and zero makes the submit non-blocking. It does not bound ACKs, retries, or callback
-duration.
+poll loop. The example uses the default `max_pending_operations = 262144` per Writer.
+A callback submit is bounded by `client.writer.buffer.wait-timeout`, covering callback
+capacity plus buffer backpressure, so it returns a definite result within that budget
+and a zero timeout makes the submit non-blocking. It does not bound ACKs, retries, or
+callback duration.
 
 The callback limit counts operations, not bytes; it does not preallocate 262144 slots.
 The separate `Configuration::writer_buffer_memory_size` remains 64 MiB by default,
