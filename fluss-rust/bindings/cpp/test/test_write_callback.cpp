@@ -108,18 +108,6 @@ class WriteCallbackTest : public ::testing::Test {
         ASSERT_OK(result);
     }
 
-    // Reopen table_ through a dedicated connection whose client.writer.buffer.wait-timeout
-    // bounds callback submission, so a full-capacity wait fails with a definite timeout
-    // instead of blocking on the shared connection's unbounded default.
-    void UseWriterBufferWaitTimeout(uint64_t wait_timeout_ms) {
-        auto& env = *fluss_test::FlussTestEnvironment::Instance();
-        fluss::Configuration config;
-        config.bootstrap_servers = env.GetBootstrapServers();
-        config.writer_buffer_wait_timeout_ms = wait_timeout_ms;
-        ASSERT_OK(fluss::Connection::Create(config, connection_));
-        ASSERT_OK(connection_.GetTable(table_path_, table_));
-    }
-
     fluss::GenericRow Row(int32_t id = 1) {
         fluss::GenericRow row(2);
         row.SetInt32(0, id);
@@ -127,8 +115,6 @@ class WriteCallbackTest : public ::testing::Test {
         return row;
     }
 
-    // Declared before table_ so the table (which references it) is destroyed first.
-    fluss::Connection connection_;
     fluss::TablePath table_path_;
     fluss::Table table_;
 };
@@ -285,7 +271,7 @@ TEST_F(WriteCallbackTest, MultipleOutstandingWritesEachNotifyOnce) {
 TEST_F(WriteCallbackTest, RejectedSubmissionDoesNotInvokeCallback) {
     CreateTable();
     fluss::AppendWriter writer;
-    ASSERT_OK(table_.NewAppend().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
+    ASSERT_OK(table_.NewAppend().CreateWriter(writer));
     auto completion = std::make_shared<Completion>();
     auto lifetime = std::make_shared<Lifetime>();
     auto released = lifetime->released.get_future();
@@ -304,7 +290,7 @@ TEST_F(WriteCallbackTest, RejectedSubmissionDoesNotInvokeCallback) {
     });
     EXPECT_FALSE(result.Ok());
     EXPECT_TRUE(completion->Results().empty());
-    // Both failed submissions must return the only slot.
+    // Both failed submissions must not register a callback.
     ASSERT_OK(writer.Append(Row(), [completion](fluss::Result completed) {
         completion->Record(std::move(completed));
     }));
@@ -312,160 +298,38 @@ TEST_F(WriteCallbackTest, RejectedSubmissionDoesNotInvokeCallback) {
     ASSERT_OK(writer.Flush());
 }
 
-TEST_F(WriteCallbackTest, ArrowBatchCapacitySurvivesMovesAndDoesNotAffectWaitOrFlush) {
+TEST_F(WriteCallbackTest, SameBucketCallbacksFireInSubmissionOrder) {
     CreateTable();
-    UseWriterBufferWaitTimeout(250);
     fluss::AppendWriter writer;
-    ASSERT_OK(table_.NewAppend().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
-    arrow::Int32Builder ids;
-    arrow::StringBuilder values;
-    ASSERT_TRUE(ids.AppendValues({1, 2, 3}).ok());
-    ASSERT_TRUE(values.AppendValues({"a", "b", "c"}).ok());
-    auto batch = arrow::RecordBatch::Make(
-        arrow::schema({arrow::field("id", arrow::int32()), arrow::field("value", arrow::utf8())}),
-        3, {ids.Finish().ValueOrDie(), values.Finish().ValueOrDie()});
-    auto started = std::make_shared<Completion>();
-    auto gate = std::make_shared<std::promise<void>>();
-    auto resume = gate->get_future().share();
-    ASSERT_OK(writer.AppendArrowBatch(batch, [started, resume](fluss::Result result) {
-        started->Record(std::move(result));
-        resume.wait_for(std::chrono::seconds(20));
-    }));
-    ASSERT_TRUE(started->Await());  // The three-row batch fits in one slot.
-
-    fluss::AppendWriter moved(std::move(writer));
-    writer = std::move(moved);
-    EXPECT_FALSE(moved.Available());
-    auto rejected = std::make_shared<Completion>();
-    auto callback = [rejected](fluss::Result result) { rejected->Record(std::move(result)); };
-    auto row_result = writer.Append(Row(4), callback);
-    auto batch_result = writer.AppendArrowBatch(batch, callback);
-    EXPECT_NE(row_result.error_message.find("Timed out"), std::string::npos);
-    EXPECT_NE(batch_result.error_message.find("Timed out"), std::string::npos);
-    // Independent writers do not share the capacity limit.
-    fluss::AppendWriter independent;
-    ASSERT_OK(table_.NewAppend().CreateWriter(independent));
-    auto other = std::make_shared<Completion>();
-    ASSERT_OK(independent.Append(
-        Row(5), [other](fluss::Result result) { other->Record(std::move(result)); }));
-    ASSERT_TRUE(other->Await());
-
-    fluss::WriteResult pending;
-    ASSERT_OK(writer.Append(Row(6), pending));
-    ASSERT_OK(pending.Wait());
-    ASSERT_OK(writer.Append(Row(7)));
-    // Release the gate so the first callback finishes and returns capacity.
-    gate->set_value();
-    ASSERT_OK(writer.Flush());
-    EXPECT_TRUE(rejected->Results().empty());
-    // Capacity is now available after the first callback completed.
-    ASSERT_OK(writer.Append(Row(8), callback));
-    ASSERT_TRUE(rejected->Await());
-    ASSERT_OK(writer.Flush());
-    EXPECT_EQ(rejected->Results().size(), 1u);
-}
-
-// End-to-end through the public writer API: when the writer's capacity is exhausted, a
-// callback submission must return within the connection's client.writer.buffer.wait-timeout
-// rather than blocking on the occupied slot until the running callback releases it.
-TEST_F(WriteCallbackTest, CapacityFullSubmissionReturnsWithinWaitTimeout) {
-    CreateTable();
-    constexpr uint64_t wait_timeout_ms = 200;
-    UseWriterBufferWaitTimeout(wait_timeout_ms);
-    fluss::AppendWriter writer;
-    ASSERT_OK(table_.NewAppend().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
-
-    // Occupy the single slot with a callback that blocks until released, so the next
-    // submission has to wait for capacity instead of completing normally.
-    auto started = std::make_shared<Completion>();
-    auto gate = std::make_shared<std::promise<void>>();
-    auto resume = gate->get_future().share();
-    ASSERT_OK(writer.Append(Row(), [started, resume](fluss::Result result) {
-        started->Record(std::move(result));
-        resume.wait_for(std::chrono::seconds(20));
-    }));
-    ASSERT_TRUE(started->Await());
-
-    auto rejected = std::make_shared<Completion>();
-    auto start = std::chrono::steady_clock::now();
-    auto result = writer.Append(
-        Row(2), [rejected](fluss::Result completed) { rejected->Record(std::move(completed)); });
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    EXPECT_FALSE(result.Ok());
-    EXPECT_NE(result.error_message.find("Timed out"), std::string::npos);
-    // Returned because the shared budget elapsed: not immediately, and well before the
-    // 20-second callback block that would otherwise gate the slot.
-    EXPECT_GE(elapsed, std::chrono::milliseconds(wait_timeout_ms));
-    EXPECT_LT(elapsed, std::chrono::seconds(5));
-    EXPECT_TRUE(rejected->Results().empty());
-
-    gate->set_value();
-    ASSERT_OK(writer.Flush());
-}
-
-TEST_F(WriteCallbackTest, UpsertAndDeleteShareCapacityAndReturnItOnSubmissionErrors) {
-    CreateTable(true);
-    UseWriterBufferWaitTimeout(250);
-    fluss::UpsertWriter writer;
-    ASSERT_OK(table_.NewUpsert().CreateWriter(writer, fluss::WriteCallbackOptions{1}));
+    ASSERT_OK(table_.NewAppend().CreateWriter(writer));
     auto completion = std::make_shared<Completion>();
-    auto callback = [completion](fluss::Result result) { completion->Record(std::move(result)); };
-    fluss::GenericRow invalid(2);
-    invalid.SetString(0, "not an integer primary key");
-    invalid.SetString(1, "value");
-    EXPECT_FALSE(writer.Upsert(invalid, callback).Ok());
-    EXPECT_FALSE(writer.Delete(invalid, callback).Ok());
-    EXPECT_TRUE(completion->Results().empty());
-
-    auto gate = std::make_shared<std::promise<void>>();
-    auto resume = gate->get_future().share();
-    ASSERT_OK(writer.Upsert(Row(), [completion, resume](fluss::Result result) {
-        completion->Record(std::move(result));
-        resume.wait_for(std::chrono::seconds(20));
-    }));
-    ASSERT_TRUE(completion->Await());
-    fluss::UpsertWriter moved(std::move(writer));
-    writer = std::move(moved);
-    EXPECT_FALSE(moved.Available());
-    EXPECT_NE(writer.Upsert(Row(2), callback).error_message.find("Timed out"), std::string::npos);
-    EXPECT_NE(writer.Delete(Row(), callback).error_message.find("Timed out"), std::string::npos);
-    gate->set_value();
+    auto order_mutex = std::make_shared<std::mutex>();
+    auto order = std::make_shared<std::vector<int32_t>>();
+    // A shared id keeps every record on one bucket, so completion order must
+    // match submission order. The single callback worker must not reorder them.
+    constexpr int32_t kWrites = 128;
+    for (int32_t index = 0; index < kWrites; ++index) {
+        ASSERT_OK(writer.Append(
+            Row(7), [completion, order_mutex, order, index](fluss::Result result) {
+                {
+                    std::lock_guard<std::mutex> lock(*order_mutex);
+                    order->push_back(index);
+                }
+                completion->Record(std::move(result));
+            }));
+    }
+    ASSERT_TRUE(completion->Await(kWrites));
     ASSERT_OK(writer.Flush());
-    ASSERT_OK(writer.Delete(Row(), callback));
-    ASSERT_TRUE(completion->Await(2));
-    ASSERT_OK(writer.Flush());
-    EXPECT_EQ(completion->Results().size(), 2u);
-}
-
-TEST_F(WriteCallbackTest, CallbackDoesNotWaitForCapacityOnAnotherWriter) {
-    CreateTable();
-    auto full_writer = std::make_shared<fluss::AppendWriter>();
-    ASSERT_OK(table_.NewAppend().CreateWriter(*full_writer, fluss::WriteCallbackOptions{1}));
-    auto started = std::make_shared<Completion>();
-    auto gate = std::make_shared<std::promise<void>>();
-    auto resume = gate->get_future().share();
-    ASSERT_OK(full_writer->Append(Row(), [started, resume](fluss::Result result) {
-        started->Record(std::move(result));
-        resume.wait_for(std::chrono::seconds(20));
-    }));
-    ASSERT_TRUE(started->Await());
-    fluss::AppendWriter other;
-    ASSERT_OK(table_.NewAppend().CreateWriter(other));
-    auto attempted = std::make_shared<Completion>();
-    auto unexpected = std::make_shared<Completion>();
-    auto row = std::make_shared<fluss::GenericRow>(Row(2));
-    ASSERT_OK(other.Append(Row(3), [full_writer, row, attempted, unexpected](fluss::Result) {
-        // No submitting thread accesses full_writer concurrently with this callback.
-        auto result = full_writer->Append(*row, [unexpected](fluss::Result completed) {
-            unexpected->Record(std::move(completed));
-        });
-        attempted->Record(std::move(result));
-    }));
-    ASSERT_TRUE(attempted->Await());
-    EXPECT_EQ(attempted->Results().front().error_message, "Write callback capacity is full");
-    EXPECT_TRUE(unexpected->Results().empty());
-    gate->set_value();
-    ASSERT_OK(other.Flush());
+    auto results = completion->Results();
+    ASSERT_EQ(results.size(), static_cast<size_t>(kWrites));
+    for (const auto& result : results) {
+        EXPECT_OK(result);
+    }
+    std::lock_guard<std::mutex> lock(*order_mutex);
+    ASSERT_EQ(order->size(), static_cast<size_t>(kWrites));
+    for (int32_t index = 0; index < kWrites; ++index) {
+        EXPECT_EQ((*order)[index], index);
+    }
 }
 
 TEST_F(WriteCallbackTest, BatchedCallbacksSurviveExceptionsAndCoexistWithWait) {
@@ -593,23 +457,6 @@ TEST(WriteCallbackBridgeTest, ContainsCallbackExceptions) {
     EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
     fluss::ffi::WriteCallback unknown([](fluss::Result) { throw 42; });
     EXPECT_NO_THROW(unknown.Complete(0, ""));
-}
-
-TEST(WriteCallbackBridgeTest, ValidatesCallbackOptions) {
-    fluss::WriteCallbackOptions options;
-    EXPECT_EQ(options.max_pending_operations, 262144u);
-    EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
-    options.max_pending_operations = 0;
-    EXPECT_FALSE(fluss::ffi::WriteCallbackCapacity::Validate(options).Ok());
-    fluss::Table table;
-    fluss::AppendWriter append;
-    fluss::UpsertWriter upsert;
-    EXPECT_EQ(table.NewAppend().CreateWriter(append, options).error_message,
-              "max_pending_operations must be positive");
-    EXPECT_EQ(table.NewUpsert().CreateWriter(upsert, options).error_message,
-              "max_pending_operations must be positive");
-    options.max_pending_operations = 1;
-    EXPECT_OK(fluss::ffi::WriteCallbackCapacity::Validate(options));
 }
 
 TEST(WriteCallbackBridgeTest, CapacityRejectsOverflowWithoutDroppingReservations) {

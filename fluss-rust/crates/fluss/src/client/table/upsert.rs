@@ -351,8 +351,10 @@ impl UpsertWriter {
         self.upsert_with_deadline(row, None)
     }
 
-    /// Like [`Self::upsert`], but bounds the buffer-memory wait by `deadline`. A deadline
-    /// already in the past makes the submit fail fast when the buffer is full.
+    /// Internal: bounds the buffer-memory wait by `deadline` so a language binding can keep
+    /// a whole callback submission within one `client.writer.buffer.wait-timeout` budget. Not a
+    /// public deadline API; use [`Self::upsert`], which passes `None` and defers to the config.
+    #[doc(hidden)]
     pub fn upsert_with_deadline<R: InternalRow>(
         &self,
         row: &R,
@@ -403,8 +405,10 @@ impl UpsertWriter {
         self.delete_with_deadline(row, None)
     }
 
-    /// Like [`Self::delete`], but bounds the buffer-memory wait by `deadline`. A deadline
-    /// already in the past makes the submit fail fast when the buffer is full.
+    /// Internal: bounds the buffer-memory wait by `deadline` so a language binding can keep
+    /// a whole callback submission within one `client.writer.buffer.wait-timeout` budget. Not a
+    /// public deadline API; use [`Self::delete`], which passes `None` and defers to the config.
+    #[doc(hidden)]
     pub fn delete_with_deadline<R: InternalRow>(
         &self,
         row: &R,

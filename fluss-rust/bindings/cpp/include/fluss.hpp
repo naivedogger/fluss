@@ -555,32 +555,23 @@ struct Result {
 /// with SDK idempotence enabled. Retain input identifiers and recovery state as
 /// needed; one callback invocation is not an exactly-once delivery guarantee.
 ///
-/// Callback threads are shared across connections. Do not wait for another
-/// callback from a callback: it can exhaust the worker pool. Synchronous SDK
-/// calls require exclusive writer access. Callback submissions to a full writer
-/// fail immediately when called from a callback, instead of blocking the workers.
-/// WriteCallbackOptions bounds outstanding callback operations per writer.
+/// Callbacks run on a single shared worker, so they fire in the order writes
+/// complete. Do not wait for another callback from a callback: it stalls that
+/// worker. Synchronous SDK calls require exclusive writer access. Callback
+/// submissions to a full writer fail immediately when called from a callback,
+/// instead of blocking the worker. Each writer bounds its outstanding callback
+/// operations from the write buffer size, so admission tracks memory backpressure.
 /// Hand off retries or expensive work without blocking; bound application queues
 /// and handle overflow without silently discarding failed operations.
 ///
 /// Exceptions thrown by callbacks are caught and reported to stderr; they do not
 /// change the write outcome or retry the callback. Stop submissions before Flush().
-/// After a successful Rust write flush, Flush() waits up to 60 seconds for pending
-/// callbacks to finish. On error, referenced state may still be in use.
+/// After a successful Rust write flush, Flush() blocks until pending callbacks finish,
+/// acting as a barrier, so a callback that never returns hangs it. On error, referenced
+/// state may still be in use.
 /// Inside a callback only the callback wait is skipped; the write flush may block.
 /// Flush() does not wait for work handed to application workers or retry queues.
 using WriteCallback = std::function<void(Result)>;
-
-/// Admission limits for callback overloads only; Wait and fire-and-forget are unchanged.
-struct WriteCallbackOptions {
-    /// Maximum operations reserved for submission or awaiting callback completion.
-    /// Must be positive. One AppendArrowBatch call counts as one operation, not its rows.
-    /// Per-writer count, not preallocated storage or a byte limit. Reduce for many
-    /// writers or large captures; independent of Configuration::writer_buffer_memory_size.
-    /// Waiting for a free slot is bounded by client.writer.buffer.wait-timeout, the same
-    /// budget as the buffer-backpressure wait.
-    size_t max_pending_operations = 262144;
-};
 
 struct TablePath {
     std::string database_name;
@@ -1794,8 +1785,6 @@ class TableAppend {
     TableAppend& operator=(TableAppend&&) noexcept = default;
 
     Result CreateWriter(AppendWriter& out);
-    /// Create a writer with per-writer callback admission limits.
-    Result CreateWriter(AppendWriter& out, const WriteCallbackOptions& options);
 
    private:
     friend class Table;
@@ -1815,8 +1804,6 @@ class TableUpsert {
     TableUpsert& PartialUpdateByName(std::vector<std::string> column_names);
 
     Result CreateWriter(UpsertWriter& out);
-    /// Create a writer with per-writer callback admission limits shared by Upsert and Delete.
-    Result CreateWriter(UpsertWriter& out, const WriteCallbackOptions& options);
 
    private:
     friend class Table;
@@ -1959,7 +1946,7 @@ class AppendWriter {
     /// covering callback capacity and buffer backpressure: within it, Ok means the
     /// write was accepted and the callback fires exactly once, an error means
     /// submission failed and no callback runs. A zero timeout makes submission
-    /// non-blocking. See WriteCallbackOptions.
+    /// non-blocking.
     Result Append(const GenericRow& row, WriteCallback callback);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch, WriteResult& out);
@@ -2006,7 +1993,7 @@ class UpsertWriter {
     /// covering callback capacity and buffer backpressure: within it, Ok means the
     /// write was accepted and the callback fires exactly once, an error means
     /// submission failed and no callback runs. A zero timeout makes submission
-    /// non-blocking. See WriteCallbackOptions.
+    /// non-blocking.
     Result Upsert(const GenericRow& row, WriteCallback callback);
     Result Delete(const GenericRow& row);
     Result Delete(const GenericRow& row, WriteResult& out);

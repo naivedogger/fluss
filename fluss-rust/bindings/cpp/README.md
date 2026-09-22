@@ -76,15 +76,14 @@ not apply to `CreateBucketBatchScanner()`.
   [C++ API reference](../../website/docs/user-guide/cpp/api-reference.md) and
   [log-table examples](../../website/docs/user-guide/cpp/example/log-tables.md).
 
-The callback section configures `WriteCallbackOptions` to bound outstanding callback
-operations. The SDK executes callbacks; applications do not need a waiting thread or
-poll loop. The example uses the default `max_pending_operations = 262144` per Writer.
-A callback submit is bounded by `client.writer.buffer.wait-timeout`, covering callback
-capacity plus buffer backpressure, so it returns a definite result within that budget
-and a zero timeout makes the submit non-blocking. It does not bound ACKs, retries, or
-callback duration.
+The SDK executes callbacks on a single shared worker, so they fire in the order writes
+complete; applications do not need a waiting thread or poll loop. Each Writer bounds its
+outstanding callback operations from the write buffer size, so admission tracks memory
+backpressure rather than a separate knob. A callback submit is bounded by
+`client.writer.buffer.wait-timeout`, covering callback capacity plus buffer backpressure,
+so it returns a definite result within that budget and a zero timeout makes the submit
+non-blocking. It does not bound ACKs, retries, or callback duration.
 
-The callback limit counts operations, not bytes; it does not preallocate 262144 slots.
 The separate `Configuration::writer_buffer_memory_size` remains 64 MiB by default,
 shared across all tables and writers on a Connection. Neither setting caps process RSS.
 For a high-throughput starting configuration, see the
@@ -97,9 +96,10 @@ counts and logs outcomes; it does not implement durable recovery. Keep callbacks
 short, protect shared state, and handle retries outside the callback with an
 application recovery policy.
 
-After submissions stop, `Flush()` first flushes writes and, on success, waits up to
-60 seconds for pending callbacks. This is not a whole-call timeout. If it returns an
-error, keep callback state alive; if it succeeds, still check individual write results.
+After submissions stop, `Flush()` first flushes writes and, on success, blocks until
+pending callbacks finish, acting as a barrier. A callback that never returns hangs it.
+If it returns an error, the write flush itself failed, so keep callback state alive; if
+it succeeds, still check individual write results.
 See the [callback guarantees and recovery guidance](../../website/docs/user-guide/cpp/api-reference.md#write-guarantees-and-recovery)
 for result semantics, callback implementation, and shutdown requirements.
 

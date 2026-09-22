@@ -23,24 +23,20 @@ use std::thread::{self, JoinHandle};
 
 use crate::{RUNTIME, WriteResult, client_err, err_from_core_error, ffi, ok_result};
 
-const DEFAULT_CALLBACK_WORKERS: usize = 4;
-const COMPLETION_BATCH_SIZE: usize = 64;
 type Completion = Box<dyn FnOnce() + Send + 'static>;
 
-// Process-wide worker count. Override with FLUSS_CALLBACK_WORKERS; invalid or
-// zero values fall back to the default.
-fn callback_workers() -> usize {
-    std::env::var("FLUSS_CALLBACK_WORKERS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|count| *count > 0)
-        .unwrap_or(DEFAULT_CALLBACK_WORKERS)
-}
+// A single worker gives callbacks a global FIFO order that matches server
+// completion order, so a batch's callbacks never interleave with another's and
+// same-bucket writes report in the order they finished. This mirrors the Java
+// client, whose completion stages run on the one Sender thread. The future path
+// to more parallelism is sharding the executor by writer or bucket key, which
+// keeps per-key order while still using CallbackExecutor::new.
+const CALLBACK_WORKERS: usize = 1;
 
 // Like RUNTIME, the executor is process-wide and lives until process exit.
 // Initialize it on the submitting thread, not an async I/O worker.
 static CALLBACK_EXECUTOR: LazyLock<Option<CallbackExecutor>> =
-    LazyLock::new(|| match CallbackExecutor::new(callback_workers()) {
+    LazyLock::new(|| match CallbackExecutor::new(CALLBACK_WORKERS) {
         Ok(executor) => Some(executor),
         Err(error) => {
             // The write has already been accepted. Keep the old dispatch path
@@ -72,9 +68,9 @@ impl CallbackExecutor {
                     .spawn(move || {
                         loop {
                             let completion = {
-                                // Each job already contains up to 64 callbacks.
-                                // Do not prefetch 64 jobs here: that would let a
-                                // worker hoard up to 4096 callbacks.
+                                // Take one job at a time; a job runs a whole
+                                // completed batch. Do not prefetch, so no worker
+                                // hoards queued batches.
                                 let receiver = receiver.lock().unwrap();
                                 let Ok(completion) = receiver.recv() else {
                                     break;
@@ -163,10 +159,9 @@ fn dispatch_write(
 }
 
 fn dispatch_batch(batch: fluss::client::WriteCallbackBatch) {
-    let executor = CALLBACK_EXECUTOR.as_ref();
-    for chunk in batch.into_chunks(COMPLETION_BATCH_SIZE) {
-        deliver(executor, Box::new(move || chunk.run()));
-    }
+    // Deliver the whole batch as one job so its callbacks stay together and the
+    // single worker runs them in completion order.
+    deliver(CALLBACK_EXECUTOR.as_ref(), Box::new(move || batch.run()));
 }
 
 fn to_ffi_result(result: Result<(), fluss::error::Error>) -> ffi::FfiResult {
@@ -383,6 +378,30 @@ mod tests {
         drop(executor);
         assert_eq!(completed.load(Ordering::Relaxed), 1000);
         assert_eq!(Arc::strong_count(&completed), 1);
+    }
+
+    #[test]
+    fn test_single_worker_runs_callbacks_in_enqueue_order() {
+        // A single worker must not reorder callbacks. This is the executor-level
+        // guarantee behind same-bucket completions reporting in the order they
+        // finished: the results come out exactly as enqueued, not just once each.
+        let executor = CallbackExecutor::new(1).unwrap();
+        let (tx, rx) = mpsc::channel();
+        for index in 0..1000 {
+            let tx = tx.clone();
+            assert!(
+                executor
+                    .enqueue(Box::new(move || {
+                        tx.send(index).unwrap();
+                    }))
+                    .is_ok()
+            );
+        }
+        drop(tx);
+        let observed: Vec<_> = (0..1000)
+            .map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap())
+            .collect();
+        assert_eq!(observed, (0..1000).collect::<Vec<_>>());
     }
 
     #[test]

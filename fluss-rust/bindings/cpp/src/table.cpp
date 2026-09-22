@@ -1281,20 +1281,12 @@ bool Table::HasPrimaryKey() const {
 TableAppend::TableAppend(ffi::Table* table) noexcept : table_(table) {}
 
 Result TableAppend::CreateWriter(AppendWriter& out) {
-    return CreateWriter(out, WriteCallbackOptions{});
-}
-
-Result TableAppend::CreateWriter(AppendWriter& out, const WriteCallbackOptions& options) {
-    auto validation = ffi::WriteCallbackCapacity::Validate(options);
-    if (!validation.Ok()) {
-        return validation;
-    }
     if (table_ == nullptr) {
         return utils::make_client_error("Table not available");
     }
 
     auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
-        options.max_pending_operations, table_->writer_buffer_wait_timeout_ms());
+        table_->estimated_callback_capacity(), table_->writer_buffer_wait_timeout_ms());
     auto ffi_result = table_->new_append_writer();
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
@@ -1349,21 +1341,13 @@ std::vector<size_t> TableUpsert::ResolveNameProjection() const {
 }
 
 Result TableUpsert::CreateWriter(UpsertWriter& out) {
-    return CreateWriter(out, WriteCallbackOptions{});
-}
-
-Result TableUpsert::CreateWriter(UpsertWriter& out, const WriteCallbackOptions& options) {
-    auto validation = ffi::WriteCallbackCapacity::Validate(options);
-    if (!validation.Ok()) {
-        return validation;
-    }
     if (table_ == nullptr) {
         return utils::make_client_error("Table not available");
     }
 
     try {
         auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
-            options.max_pending_operations, table_->writer_buffer_wait_timeout_ms());
+            table_->estimated_callback_capacity(), table_->writer_buffer_wait_timeout_ms());
         auto resolved_indices = !column_names_.empty() ? ResolveNameProjection() : column_indices_;
 
         rust::Vec<size_t> rust_indices;
@@ -1785,7 +1769,9 @@ Result AppendWriter::Flush() {
     auto ffi_result = writer_->flush();
     auto result = utils::from_ffi_result(ffi_result);
     if (!result.Ok()) return result;
-    return callback_capacity_->AwaitAll(std::chrono::seconds(60));
+    // Writes are flushed; block until their callbacks drain so Flush is a real barrier.
+    callback_capacity_->AwaitAll();
+    return {};
 }
 
 // ============================================================================
@@ -1920,7 +1906,9 @@ Result UpsertWriter::Flush() {
     auto ffi_result = writer_->upsert_flush();
     auto result = utils::from_ffi_result(ffi_result);
     if (!result.Ok()) return result;
-    return callback_capacity_->AwaitAll(std::chrono::seconds(60));
+    // Writes are flushed; block until their callbacks drain so Flush is a real barrier.
+    callback_capacity_->AwaitAll();
+    return {};
 }
 
 // ============================================================================

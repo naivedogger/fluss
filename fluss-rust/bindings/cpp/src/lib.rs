@@ -532,6 +532,7 @@ mod ffi {
         fn get_table_path(self: &Table) -> FfiTablePath;
         fn has_primary_key(self: &Table) -> bool;
         fn writer_buffer_wait_timeout_ms(self: &Table) -> u64;
+        fn estimated_callback_capacity(self: &Table) -> usize;
         fn create_upsert_writer(self: &Table, column_indices: Vec<usize>) -> FfiPtrResult;
         fn new_lookuper(self: &Table) -> FfiPtrResult;
         fn new_prefix_lookuper(self: &Table, lookup_column_names: Vec<String>) -> FfiPtrResult;
@@ -2089,6 +2090,24 @@ impl Table {
     /// used by the C++ callback path to bound the whole submit. UINT64_MAX means unbounded.
     fn writer_buffer_wait_timeout_ms(&self) -> u64 {
         self.connection.config().writer_buffer_wait_timeout_ms
+    }
+
+    /// Per-writer callback admission limit, derived from the write buffer so it stays consistent
+    /// with memory backpressure instead of being a separate knob. It approximates how many rows
+    /// fit in the buffer: buffer bytes / estimated row size. The row estimate uses only the
+    /// schema's fixed-length part (variable-length payloads are not counted), so the limit is
+    /// generous and mainly guards against a slow-callback backlog; the buffer-memory wait remains
+    /// the real backpressure. Floored so tiny buffers still allow pipelining.
+    fn estimated_callback_capacity(&self) -> usize {
+        const MIN_CALLBACK_CAPACITY: usize = 1024;
+        let fields = self.table_info.get_row_type().fields();
+        let mut row_size = fcore::row::binary_array::calculate_header_in_bytes(fields.len());
+        for field in fields {
+            row_size += fcore::row::binary_array::calculate_fix_length_part_size(field.data_type());
+        }
+        let row_size = row_size.max(1);
+        let buffer = self.connection.config().writer_buffer_memory_size;
+        (buffer / row_size).max(MIN_CALLBACK_CAPACITY)
     }
 
     fn create_upsert_writer(&self, column_indices: Vec<usize>) -> ffi::FfiPtrResult {

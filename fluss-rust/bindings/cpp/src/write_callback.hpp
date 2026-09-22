@@ -40,13 +40,6 @@ class WriteCallbackCapacity {
     WriteCallbackCapacity(size_t max_pending_operations, uint64_t wait_timeout_ms)
         : max_pending_(max_pending_operations), wait_timeout_ms_(wait_timeout_ms) {}
 
-    static Result Validate(const WriteCallbackOptions& options) {
-        if (options.max_pending_operations == 0) {
-            return {ErrorCode::CLIENT_ERROR, "max_pending_operations must be positive"};
-        }
-        return {};
-    }
-
     Result Acquire() {
         std::unique_lock<std::mutex> lock(mutex_);
         if (pending_ == max_pending_) {
@@ -87,6 +80,16 @@ class WriteCallbackCapacity {
             return {ErrorCode::CLIENT_ERROR, "Timed out waiting for pending callbacks"};
         }
         return {};
+    }
+
+    /// Block until every reserved operation has finished its callback. Used as a flush
+    /// barrier after the write flush already succeeded, so it has no deadline of its own;
+    /// a callback that never returns would hang here. Returns immediately when called from
+    /// within a callback to avoid deadlocking the worker on itself.
+    void AwaitAll() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (in_callback_) return;
+        available_.wait(lock, [&] { return pending_ == 0; });
     }
 
     /// Milliseconds left in the client.writer.buffer.wait-timeout budget since `start`, so

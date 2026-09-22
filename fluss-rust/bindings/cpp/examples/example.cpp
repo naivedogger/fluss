@@ -96,15 +96,7 @@ int main() {
 
     // 5) Write rows with scalar and temporal values
     fluss::AppendWriter writer;
-    // Callback admission limit, shown with its default. It bounds the callback overloads
-    // only; Wait and fire-and-forget writes are unaffected. Passing no options uses this
-    // same value, so this block is equivalent to CreateWriter(writer).
-    fluss::WriteCallbackOptions callback_options;
-    // Pending callback operations per writer. Lower it for large captures or many
-    // writers; independent of the Connection's write-buffer byte budget. Waiting for a
-    // free slot is bounded by the connection's writer_buffer_wait_timeout_ms set above.
-    callback_options.max_pending_operations = 262144;
-    check("new_append_writer", table.NewAppend().CreateWriter(writer, callback_options));
+    check("new_append_writer", table.NewAppend().CreateWriter(writer));
 
     struct RowData {
         int id;
