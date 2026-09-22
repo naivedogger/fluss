@@ -18,82 +18,62 @@
 #[cfg(test)]
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{LazyLock, mpsc};
 use std::thread::{self, JoinHandle};
 
 use crate::{RUNTIME, WriteResult, client_err, err_from_core_error, ffi, ok_result};
 
 type Completion = Box<dyn FnOnce() + Send + 'static>;
 
-// A single worker gives callbacks a global FIFO order that matches server
-// completion order, so a batch's callbacks never interleave with another's and
-// same-bucket writes report in the order they finished. This mirrors the Java
-// client, whose completion stages run on the one Sender thread. The future path
-// to more parallelism is sharding the executor by writer or bucket key, which
-// keeps per-key order while still using CallbackExecutor::new.
-const CALLBACK_WORKERS: usize = 1;
+// One process-wide worker preserves dispatch order without running user code
+// on I/O threads. Admission is bounded independently for each C++ writer.
+// Initialize before accepting any callback write. Failure is sticky and returned
+// synchronously; silently switching to a parallel pool would break ordering.
+static CALLBACK_EXECUTOR: LazyLock<std::io::Result<CallbackExecutor>> =
+    LazyLock::new(CallbackExecutor::new);
 
-// Like RUNTIME, the executor is process-wide and lives until process exit.
-// Initialize it on the submitting thread, not an async I/O worker.
-static CALLBACK_EXECUTOR: LazyLock<Option<CallbackExecutor>> =
-    LazyLock::new(|| match CallbackExecutor::new(CALLBACK_WORKERS) {
-        Ok(executor) => Some(executor),
-        Err(error) => {
-            // The write has already been accepted. Keep the old dispatch path
-            // as a resource-exhaustion fallback rather than lose its callback.
-            eprintln!("Fluss callback worker initialization failed: {error}; using blocking pool");
-            None
-        }
-    });
+pub(crate) fn ensure_callback_executor() -> ffi::FfiResult {
+    executor_status(&CALLBACK_EXECUTOR)
+}
+
+fn executor_status(executor: &std::io::Result<CallbackExecutor>) -> ffi::FfiResult {
+    match executor {
+        Ok(_) => ok_result(),
+        Err(error) => client_err(format!(
+            "Cannot initialize write callback executor: {error}"
+        )),
+    }
+}
 
 struct CallbackExecutor {
     sender: Option<mpsc::Sender<Completion>>,
-    workers: Vec<JoinHandle<()>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl CallbackExecutor {
-    fn new(worker_count: usize) -> std::io::Result<Self> {
-        assert!(worker_count > 0);
+    fn new() -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel::<Completion>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        let mut executor = Self {
+        let worker = thread::Builder::new()
+            .name("fluss-callback".to_string())
+            .spawn(move || {
+                while let Ok(completion) = receiver.recv() {
+                    // This is a dedicated OS thread, not a Tokio runtime worker.
+                    // No receiver mutex or user-configurable worker count is needed.
+                    if catch_unwind(AssertUnwindSafe(completion)).is_err() {
+                        eprintln!("Fluss callback worker contained a Rust panic");
+                    }
+                }
+            })?;
+        Ok(Self {
             sender: Some(sender),
-            workers: Vec::with_capacity(worker_count),
-        };
-        for index in 0..worker_count {
-            let receiver = Arc::clone(&receiver);
-            executor.workers.push(
-                thread::Builder::new()
-                    .name(format!("fluss-callback-{index}"))
-                    .spawn(move || {
-                        loop {
-                            let completion = {
-                                // Take one job at a time; a job runs a whole
-                                // completed batch. Do not prefetch, so no worker
-                                // hoards queued batches.
-                                let receiver = receiver.lock().unwrap();
-                                let Ok(completion) = receiver.recv() else {
-                                    break;
-                                };
-                                completion
-                            };
-                            // Never hold a queue lock or enter a Tokio runtime
-                            // while running user code. Synchronous SDK calls
-                            // from a callback can safely use RUNTIME.block_on.
-                            if catch_unwind(AssertUnwindSafe(completion)).is_err() {
-                                eprintln!("Fluss callback worker contained a Rust panic");
-                            }
-                        }
-                    })?,
-            );
-        }
-        Ok(executor)
+            worker: Some(worker),
+        })
     }
 
     fn enqueue(&self, completion: Completion) -> Result<(), Completion> {
         // An unbounded completion queue keeps slow user callbacks from blocking
-        // async I/O workers. Applications must bound outstanding callbacks;
-        // this caps threads, not queued captures or total process memory.
+        // async I/O workers. Per-writer admission bounds callback operations,
+        // not the bytes retained by captures or total process memory.
         self.sender
             .as_ref()
             .unwrap()
@@ -104,10 +84,10 @@ impl CallbackExecutor {
 
 impl Drop for CallbackExecutor {
     fn drop(&mut self) {
-        // Also handles partial worker initialization and lets tests verify
-        // drain/release. The process-wide static is not dropped at exit.
+        // Tests own executors and verify drain/release. The process-wide static
+        // lives until process exit and is not automatically drained there.
         drop(self.sender.take());
-        for worker in self.workers.drain(..) {
+        if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
@@ -143,7 +123,7 @@ fn dispatch_write(
     callback: impl FnOnce(ffi::FfiResult) + Send + 'static,
 ) {
     // Force worker initialization before registering with an in-flight batch.
-    let _ = CALLBACK_EXECUTOR.as_ref();
+    assert_eq!(ensure_callback_executor().error_code, 0);
     let callback = move |result| callback(to_ffi_result(result));
     if let Err((future, callback)) = future.try_on_complete(callback, dispatch_batch) {
         // Only futures already polled before registration need this path.
@@ -151,7 +131,9 @@ fn dispatch_write(
         RUNTIME.spawn(async move {
             let result = future.await;
             deliver(
-                CALLBACK_EXECUTOR.as_ref(),
+                CALLBACK_EXECUTOR
+                    .as_ref()
+                    .expect("callback executor initialized before submission"),
                 Box::new(move || callback(result)),
             );
         });
@@ -161,7 +143,12 @@ fn dispatch_write(
 fn dispatch_batch(batch: fluss::client::WriteCallbackBatch) {
     // Deliver the whole batch as one job so its callbacks stay together and the
     // single worker runs them in completion order.
-    deliver(CALLBACK_EXECUTOR.as_ref(), Box::new(move || batch.run()));
+    deliver(
+        CALLBACK_EXECUTOR
+            .as_ref()
+            .expect("callback executor initialized before submission"),
+        Box::new(move || batch.run()),
+    );
 }
 
 fn to_ffi_result(result: Result<(), fluss::error::Error>) -> ffi::FfiResult {
@@ -176,35 +163,33 @@ fn dispatch(
     future: impl Future<Output = Result<(), fluss::error::Error>> + Send + 'static,
     callback: impl FnOnce(ffi::FfiResult) + Send + 'static,
 ) {
-    let executor = CALLBACK_EXECUTOR.as_ref();
+    let executor = CALLBACK_EXECUTOR
+        .as_ref()
+        .expect("callback executor initialized");
     RUNTIME.spawn(async move {
         let result = to_ffi_result(future.await);
         deliver(executor, Box::new(move || callback(result)));
     });
 }
 
-fn deliver(executor: Option<&CallbackExecutor>, completion: Completion) {
-    let completion = match executor {
-        Some(executor) => match executor.enqueue(completion) {
-            Ok(()) => return,
-            Err(completion) => completion,
-        },
-        None => completion,
-    };
-    // Preserve completion even if dedicated workers could not be started or
-    // their channel disconnected. Never execute user code on the I/O worker.
-    RUNTIME.spawn_blocking(completion);
+fn deliver(executor: &CallbackExecutor, completion: Completion) {
+    if executor.enqueue(completion).is_err() {
+        // The static executor is never shut down and contains callback panics.
+        // Disconnection is an internal invariant violation, not an overload policy.
+        // Do not silently lose accepted notifications or run them out of order.
+        eprintln!("Fluss callback executor unexpectedly disconnected");
+        std::process::abort();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Duration;
 
-    use super::{CallbackExecutor, deliver, dispatch, dispatch_write};
+    use super::{CallbackExecutor, dispatch, dispatch_write, executor_status};
     use crate::{CLIENT_ERROR_CODE, RUNTIME};
 
     #[test]
@@ -305,28 +290,21 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_bounds_workers_and_does_not_block_the_runtime() {
-        let executor = CallbackExecutor::new(2).unwrap();
+    fn test_slow_callback_does_not_block_runtime_or_run_callbacks_concurrently() {
+        let executor = CallbackExecutor::new().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let mut releases = Vec::new();
-        let mut worker_ids = HashSet::new();
-        for _ in 0..2 {
-            let (release_tx, release_rx) = mpsc::channel();
-            releases.push(release_tx);
-            let started_tx = started_tx.clone();
-            assert!(
-                executor
-                    .enqueue(Box::new(move || {
-                        started_tx.send(thread::current().id()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                    }))
-                    .is_ok()
-            );
-            // Ensure this worker is occupied before giving another worker work.
-            worker_ids.insert(started_rx.recv_timeout(Duration::from_secs(10)).unwrap());
-        }
-        assert_eq!(worker_ids.len(), 2);
+        assert!(
+            executor
+                .enqueue(Box::new(move || {
+                    started_tx.send(thread::current().id()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }))
+                .is_ok()
+        );
+        let worker_id = started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(worker_id, thread::current().id());
         for _ in 0..256 {
             let done_tx = done_tx.clone();
             assert!(
@@ -347,18 +325,19 @@ mod tests {
             }),
             42
         );
-        for release in releases {
-            release.send(()).unwrap();
-        }
+        release_tx.send(()).unwrap();
         drop(executor);
         for _ in 0..256 {
-            assert!(worker_ids.contains(&done_rx.recv_timeout(Duration::from_secs(10)).unwrap()));
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                worker_id
+            );
         }
     }
 
     #[test]
     fn test_executor_drains_and_survives_a_panicking_callback() {
-        let executor = CallbackExecutor::new(1).unwrap();
+        let executor = CallbackExecutor::new().unwrap();
         let completed = Arc::new(AtomicUsize::new(0));
         assert!(
             executor
@@ -385,7 +364,7 @@ mod tests {
         // A single worker must not reorder callbacks. This is the executor-level
         // guarantee behind same-bucket completions reporting in the order they
         // finished: the results come out exactly as enqueued, not just once each.
-        let executor = CallbackExecutor::new(1).unwrap();
+        let executor = CallbackExecutor::new().unwrap();
         let (tx, rx) = mpsc::channel();
         for index in 0..1000 {
             let tx = tx.clone();
@@ -406,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_producers_complete_each_job_once() {
-        let executor = Arc::new(CallbackExecutor::new(4).unwrap());
+        let executor = Arc::new(CallbackExecutor::new().unwrap());
         let (tx, rx) = mpsc::channel();
         let mut producers = Vec::new();
         for producer in 0..4 {
@@ -436,21 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unavailable_executor_falls_back_off_the_caller_thread() {
-        let (tx, rx) = mpsc::channel();
-        deliver(
-            None,
-            Box::new(move || {
-                let answer = RUNTIME.block_on(async { 42 });
-                tx.send((thread::current().id(), answer)).unwrap();
-            }),
-        );
-        let (thread_id, answer) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_ne!(thread_id, thread::current().id());
-        assert_eq!(answer, 42);
-        assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
+    fn test_executor_initialization_error_is_reported_without_fallback() {
+        let unavailable = Err(std::io::Error::other("thread creation failed"));
+        let status = executor_status(&unavailable);
+        assert_eq!(status.error_code, CLIENT_ERROR_CODE);
+        assert!(status.error_message.contains("thread creation failed"));
+        assert!(unavailable.is_err());
+        let ready = Ok(CallbackExecutor::new().unwrap());
+        assert_eq!(executor_status(&ready).error_code, 0);
     }
 }

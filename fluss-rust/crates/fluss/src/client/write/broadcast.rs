@@ -30,8 +30,8 @@ type Dispatcher<T> = fn(CompletionBatch<T>);
 
 /// An owned set of callbacks sharing one published result.
 ///
-/// Binding executors split this into bounded jobs and run those jobs off the
-/// I/O thread. User callbacks are never invoked by the broadcast itself.
+/// Binding executors enqueue this batch and run it off the I/O thread.
+/// User callbacks are never invoked by the broadcast itself.
 #[doc(hidden)]
 pub struct CompletionBatch<T> {
     result: Arc<Result<T>>,
@@ -39,23 +39,6 @@ pub struct CompletionBatch<T> {
 }
 
 impl<T> CompletionBatch<T> {
-    /// Split into jobs of at most `limit` callbacks without waiting to fill one.
-    pub fn into_chunks(self, limit: usize) -> impl Iterator<Item = Self> {
-        assert!(limit > 0);
-        let mut callbacks = self.callbacks.into_iter();
-        std::iter::from_fn(move || {
-            let chunk: Vec<_> = callbacks.by_ref().take(limit).collect();
-            if chunk.is_empty() {
-                None
-            } else {
-                Some(Self {
-                    result: Arc::clone(&self.result),
-                    callbacks: chunk,
-                })
-            }
-        })
-    }
-
     /// Execute every callback, isolating panics so later callbacks still run.
     pub fn run(self) {
         for callback in self.callbacks {
@@ -100,30 +83,29 @@ impl<T: Clone + Send + Sync> BroadcastOnceReceiver<T> {
         self.shared.data.read().as_deref().cloned()
     }
 
-    /// Register under the result read lock, so publication cannot overtake
-    /// registration. A late registration is dispatched immediately, not lost.
+    /// Register under the result read lock. Late registrations join the same
+    /// dispatch queue, so they cannot overtake callbacks awaiting dispatch.
     pub(crate) fn subscribe(&self, callback: Callback<T>, dispatch: Dispatcher<T>) {
         let data = self.shared.data.read();
-        if let Some(result) = data.as_ref() {
-            let result = Arc::clone(result);
-            drop(data);
-            dispatch(CompletionBatch {
-                result,
-                callbacks: vec![callback],
-            });
-        } else {
-            let mut groups = self.shared.callbacks.lock();
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|group| std::ptr::fn_addr_eq(group.dispatch, dispatch))
+        let result = data.as_ref().map(Arc::clone);
+        {
+            let mut state = self.shared.callbacks.lock();
+            if let Some(group) = state
+                .groups
+                .last_mut()
+                .filter(|group| std::ptr::fn_addr_eq(group.dispatch, dispatch))
             {
                 group.callbacks.push(callback);
             } else {
-                groups.push(CallbackGroup {
+                state.groups.push(CallbackGroup {
                     dispatch,
                     callbacks: vec![callback],
                 });
             }
+        }
+        drop(data);
+        if let Some(result) = result {
+            self.shared.dispatch_callbacks(result, false);
         }
     }
 
@@ -161,20 +143,60 @@ impl<T: Clone + Send + Sync> BroadcastOnceReceiver<T> {
 struct Shared<T> {
     data: RwLock<Option<Arc<Result<T>>>>,
     notify: Notify,
-    callbacks: Mutex<Vec<CallbackGroup<T>>>,
+    callbacks: Mutex<CallbackState<T>>,
+}
+
+#[derive(Debug)]
+struct CallbackState<T> {
+    groups: Vec<CallbackGroup<T>>,
+    dispatching: bool,
+    publication_notified: bool,
+}
+
+impl<T> Default for CallbackState<T> {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            dispatching: false,
+            publication_notified: false,
+        }
+    }
 }
 
 impl<T> Shared<T> {
     fn notify_completion(&self, result: Arc<Result<T>>) {
-        // Registration takes data then callbacks. Publication has already
-        // released data, so neither dispatcher nor user code runs under locks.
-        let groups = std::mem::take(&mut *self.callbacks.lock());
         self.notify.notify_waiters();
-        for group in groups {
-            (group.dispatch)(CompletionBatch {
-                result: Arc::clone(&result),
-                callbacks: group.callbacks,
-            });
+        self.dispatch_callbacks(result, true);
+    }
+
+    fn dispatch_callbacks(&self, result: Arc<Result<T>>, publishing: bool) {
+        let mut state = self.callbacks.lock();
+        state.publication_notified |= publishing;
+        // The publishing thread must own the first drain. A late subscriber
+        // must not steal it while publication is between storing the result
+        // and notifying: the publisher could otherwise return and complete
+        // the next batch before this batch has actually been dispatched.
+        if !state.publication_notified || state.dispatching {
+            return;
+        }
+        state.dispatching = true;
+        loop {
+            let groups = std::mem::take(&mut state.groups);
+            if groups.is_empty() {
+                state.dispatching = false;
+                return;
+            }
+            drop(state);
+            // Exactly one drainer invokes dispatchers, outside every lock.
+            // Registrations during dispatch (including reentrant ones) queue
+            // behind this batch rather than dispatching ahead of it.
+            for group in groups {
+                (group.dispatch)(CompletionBatch {
+                    result: Arc::clone(&result),
+                    callbacks: group.callbacks,
+                });
+            }
+            state = self.callbacks.lock();
         }
     }
 }
@@ -288,19 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn test_chunks_bound_work_and_panics_do_not_drop_remaining_callbacks() {
+    fn test_panics_do_not_drop_remaining_callbacks() {
         fn dispatch(batch: CompletionBatch<u32>) {
-            let chunks: Vec<_> = batch.into_chunks(64).collect();
-            assert_eq!(
-                chunks
-                    .iter()
-                    .map(|chunk| chunk.callbacks.len())
-                    .collect::<Vec<_>>(),
-                vec![64, 64, 3]
-            );
-            for chunk in chunks {
-                chunk.run();
-            }
+            batch.run();
         }
         let broadcast = BroadcastOnce::default();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -404,6 +416,52 @@ mod tests {
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn test_late_registration_cannot_overtake_published_callbacks() {
+        let broadcast = BroadcastOnce::<u32>::default();
+        let receiver = broadcast.receiver();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first = tx.clone();
+        receiver.subscribe(
+            Box::new(move |_| first.send(1).unwrap()),
+            CompletionBatch::run,
+        );
+        // Pause publication exactly between making data visible and notifying.
+        let result = Arc::new(Ok(42));
+        *receiver.shared.data.write() = Some(Arc::clone(&result));
+        receiver.subscribe(Box::new(move |_| tx.send(2).unwrap()), CompletionBatch::run);
+        // Merely observing the published data must not take ownership of the
+        // publisher's first dispatch, including its earlier registered callback.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        receiver.shared.notify_completion(result);
+        assert_eq!(rx.into_iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_reentrant_registration_runs_after_existing_callbacks() {
+        let broadcast = BroadcastOnce::<u32>::default();
+        let receiver = broadcast.receiver();
+        let nested = receiver.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first = tx.clone();
+        receiver.subscribe(
+            Box::new(move |_| {
+                first.send(1).unwrap();
+                nested.subscribe(
+                    Box::new(move |_| first.send(3).unwrap()),
+                    CompletionBatch::run,
+                );
+            }),
+            CompletionBatch::run,
+        );
+        receiver.subscribe(Box::new(move |_| tx.send(2).unwrap()), CompletionBatch::run);
+        broadcast.broadcast(42);
+        assert_eq!(rx.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     struct InspectOnWake {

@@ -72,7 +72,9 @@ class Completion {
 // A plain function pointer has no capture. This state lives for the process.
 Completion function_completion;
 
-void RecordFunctionCallback(fluss::Result result) { function_completion.Record(std::move(result)); }
+void RecordFunctionCallback(const fluss::WriteCompletion& completion) {
+    function_completion.Record(completion.result);
+}
 
 struct Lifetime {
     std::promise<void> released;
@@ -154,12 +156,13 @@ TEST_F(WriteCallbackTest, FlushWaitsForPendingCallbacks) {
     std::weak_ptr<Lifetime> weak_lifetime = lifetime;
     {
         auto row = Row();
-        fluss::WriteCallback callback = [started, finished, resume,
-                                         owned = std::move(lifetime)](fluss::Result result) {
+        fluss::WriteCallback callback = [started, finished, resume, owned = std::move(lifetime)](
+                                            const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
             started->Record(result);
             // Bounded even when a preceding assertion fails.
             resume.wait_for(std::chrono::seconds(20));
-            finished->Record(std::move(result));
+            finished->Record(result);
         };
         ASSERT_OK(writer.Append(row, std::move(callback)));
     }
@@ -167,8 +170,15 @@ TEST_F(WriteCallbackTest, FlushWaitsForPendingCallbacks) {
     EXPECT_FALSE(weak_lifetime.expired());
     // Flush now waits for pending callbacks, not just for server ACK.
     // The callback is blocked on the gate, so Flush must not return yet.
+    std::promise<void> flush_started;
+    auto flush = std::async(std::launch::async, [&] {
+        flush_started.set_value();
+        return writer.Flush();
+    });
+    flush_started.get_future().wait();
+    EXPECT_EQ(flush.wait_for(std::chrono::milliseconds(25)), std::future_status::timeout);
     gate->set_value();
-    ASSERT_OK(writer.Flush());
+    ASSERT_OK(flush.get());
     // After Flush returns, the callback has finished and captures are released.
     EXPECT_FALSE(finished->Results().empty());
     EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
@@ -190,8 +200,11 @@ TEST_F(WriteCallbackTest, AppendArrowBatchNotifiesOnce) {
             arrow::RecordBatch::Make(arrow::schema({arrow::field("id", arrow::int32()),
                                                     arrow::field("value", arrow::utf8())}),
                                      6, {ids.Finish().ValueOrDie(), values.Finish().ValueOrDie()});
-        ASSERT_OK(writer.AppendArrowBatch(
-            batch, [completion](fluss::Result result) { completion->Record(std::move(result)); }));
+        ASSERT_OK(writer.AppendArrowBatch(batch,
+                                          [completion](const fluss::WriteCompletion& notification) {
+                                              const auto& result = notification.result;
+                                              completion->Record(result);
+                                          }));
     }
     ASSERT_TRUE(completion->Await());
     ASSERT_EQ(completion->Results().size(), 1u);
@@ -204,8 +217,9 @@ TEST_F(WriteCallbackTest, UpsertAndDeleteNotifyCompletion) {
     fluss::UpsertWriter writer;
     ASSERT_OK(table_.NewUpsert().CreateWriter(writer));
     auto completion = std::make_shared<Completion>();
-    fluss::WriteCallback callback = [completion](fluss::Result result) {
-        completion->Record(std::move(result));
+    fluss::WriteCallback callback = [completion](const fluss::WriteCompletion& notification) {
+        const auto& result = notification.result;
+        completion->Record(result);
     };
     ASSERT_OK(writer.Upsert(Row(), callback));
     ASSERT_TRUE(completion->Await());
@@ -238,8 +252,10 @@ TEST_F(WriteCallbackTest, ServerRejectionIsReportedThroughCallback) {
     ASSERT_OK(pending.Wait());
 
     auto completion = std::make_shared<Completion>();
-    auto submitted = writer.Delete(
-        Row(), [completion](fluss::Result result) { completion->Record(std::move(result)); });
+    auto submitted = writer.Delete(Row(), [completion](const fluss::WriteCompletion& notification) {
+        const auto& result = notification.result;
+        completion->Record(result);
+    });
     // The write is accepted locally; only the callback reports server rejection.
     ASSERT_OK(submitted);
     ASSERT_TRUE(completion->Await());
@@ -255,8 +271,9 @@ TEST_F(WriteCallbackTest, MultipleOutstandingWritesEachNotifyOnce) {
     ASSERT_OK(table_.NewAppend().CreateWriter(writer));
     auto completion = std::make_shared<Completion>();
     for (int32_t id = 0; id < 64; ++id) {
-        ASSERT_OK(writer.Append(Row(id), [completion](fluss::Result result) {
-            completion->Record(std::move(result));
+        ASSERT_OK(writer.Append(Row(id), [completion](const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
+            completion->Record(result);
         }));
     }
     ASSERT_TRUE(completion->Await(64));
@@ -277,22 +294,26 @@ TEST_F(WriteCallbackTest, RejectedSubmissionDoesNotInvokeCallback) {
     auto released = lifetime->released.get_future();
     fluss::GenericRow invalid(1);
     invalid.SetInt32(0, 1);  // Table requires two columns.
-    auto result =
-        writer.Append(invalid, [completion, owned = std::move(lifetime)](fluss::Result completed) {
-            completion->Record(std::move(completed));
-        });
+    auto result = writer.Append(invalid, [completion, owned = std::move(lifetime)](
+                                             const fluss::WriteCompletion& notification) {
+        const auto& completed = notification.result;
+        completion->Record(completed);
+    });
     EXPECT_FALSE(result.Ok());
     EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
     EXPECT_TRUE(completion->Results().empty());
 
-    result = writer.AppendArrowBatch(nullptr, [completion](fluss::Result completed) {
-        completion->Record(std::move(completed));
-    });
+    result =
+        writer.AppendArrowBatch(nullptr, [completion](const fluss::WriteCompletion& notification) {
+            const auto& completed = notification.result;
+            completion->Record(completed);
+        });
     EXPECT_FALSE(result.Ok());
     EXPECT_TRUE(completion->Results().empty());
     // Both failed submissions must not register a callback.
-    ASSERT_OK(writer.Append(Row(), [completion](fluss::Result completed) {
-        completion->Record(std::move(completed));
+    ASSERT_OK(writer.Append(Row(), [completion](const fluss::WriteCompletion& notification) {
+        const auto& completed = notification.result;
+        completion->Record(completed);
     }));
     ASSERT_TRUE(completion->Await());
     ASSERT_OK(writer.Flush());
@@ -309,14 +330,15 @@ TEST_F(WriteCallbackTest, SameBucketCallbacksFireInSubmissionOrder) {
     // match submission order. The single callback worker must not reorder them.
     constexpr int32_t kWrites = 128;
     for (int32_t index = 0; index < kWrites; ++index) {
-        ASSERT_OK(writer.Append(
-            Row(7), [completion, order_mutex, order, index](fluss::Result result) {
-                {
-                    std::lock_guard<std::mutex> lock(*order_mutex);
-                    order->push_back(index);
-                }
-                completion->Record(std::move(result));
-            }));
+        ASSERT_OK(writer.Append(Row(7), [completion, order_mutex, order,
+                                         index](const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
+            {
+                std::lock_guard<std::mutex> lock(*order_mutex);
+                order->push_back(index);
+            }
+            completion->Record(result);
+        }));
     }
     ASSERT_TRUE(completion->Await(kWrites));
     ASSERT_OK(writer.Flush());
@@ -340,12 +362,14 @@ TEST_F(WriteCallbackTest, BatchedCallbacksSurviveExceptionsAndCoexistWithWait) {
     constexpr int count = 1024;
     for (int i = 0; i < count; ++i) {
         // The same bucket key encourages shared internal batches.
-        ASSERT_OK(writer.Append(Row(1), [completion, i](fluss::Result result) {
-            completion->Record(std::move(result));
-            if (i % 64 == 0) {
-                throw std::runtime_error("isolated batch callback exception");
-            }
-        }));
+        ASSERT_OK(
+            writer.Append(Row(1), [completion, i](const fluss::WriteCompletion& notification) {
+                const auto& result = notification.result;
+                completion->Record(result);
+                if (i % 64 == 0) {
+                    throw std::runtime_error("isolated batch callback exception");
+                }
+            }));
     }
     fluss::WriteResult pending;
     ASSERT_OK(writer.Append(Row(1), pending));
@@ -369,8 +393,10 @@ TEST_F(WriteCallbackTest, BatchedServerFailureNotifiesEveryAcceptedDelete) {
     auto completion = std::make_shared<Completion>();
     constexpr int count = 257;
     for (int i = 0; i < count; ++i) {
-        ASSERT_OK(writer.Delete(
-            Row(), [completion](fluss::Result result) { completion->Record(std::move(result)); }));
+        ASSERT_OK(writer.Delete(Row(), [completion](const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
+            completion->Record(result);
+        }));
     }
     ASSERT_TRUE(completion->Await(count));
     auto results = completion->Results();
@@ -390,8 +416,11 @@ TEST_F(WriteCallbackTest, EmptyArrowBatchCallbackIsStillAsynchronous) {
         arrow::schema({arrow::field("id", arrow::int32()), arrow::field("value", arrow::utf8())}),
         0, {ids.Finish().ValueOrDie(), values.Finish().ValueOrDie()});
     auto completion = std::make_shared<Completion>();
-    ASSERT_OK(writer.AppendArrowBatch(
-        batch, [completion](fluss::Result result) { completion->Record(std::move(result)); }));
+    ASSERT_OK(
+        writer.AppendArrowBatch(batch, [completion](const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
+            completion->Record(result);
+        }));
     ASSERT_TRUE(completion->Await());
     ASSERT_EQ(completion->Results().size(), 1u);
     EXPECT_OK(completion->Results().front());
@@ -421,7 +450,10 @@ TEST_F(WriteCallbackTest, EmptyCallbacksAreRejectedBeforeSubmission) {
 
 TEST_F(WriteCallbackTest, UnavailableWritersDoNotInvokeCallbacks) {
     auto completion = std::make_shared<Completion>();
-    auto callback = [completion](fluss::Result result) { completion->Record(std::move(result)); };
+    auto callback = [completion](const fluss::WriteCompletion& notification) {
+        const auto& result = notification.result;
+        completion->Record(result);
+    };
     fluss::AppendWriter append;
     fluss::UpsertWriter upsert;
     EXPECT_FALSE(append.Append(Row(), callback).Ok());
@@ -436,8 +468,9 @@ TEST(WriteCallbackBridgeTest, ForwardsErrorAndReleasesCaptures) {
     auto lifetime = std::make_shared<Lifetime>();
     auto released = lifetime->released.get_future();
     fluss::ffi::WriteCallback callback(
-        [completion, owned = std::move(lifetime)](fluss::Result result) {
-            completion->Record(std::move(result));
+        [completion, owned = std::move(lifetime)](const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
+            completion->Record(result);
         });
     callback.Complete(fluss::ErrorCode::DELETION_DISABLED_EXCEPTION, "Deletion is disabled");
     EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
@@ -450,12 +483,13 @@ TEST(WriteCallbackBridgeTest, ForwardsErrorAndReleasesCaptures) {
 TEST(WriteCallbackBridgeTest, ContainsCallbackExceptions) {
     auto lifetime = std::make_shared<Lifetime>();
     auto released = lifetime->released.get_future();
-    fluss::ffi::WriteCallback callback([owned = std::move(lifetime)](fluss::Result) {
-        throw std::runtime_error("callback failure");
-    });
+    fluss::ffi::WriteCallback callback(
+        [owned = std::move(lifetime)](const fluss::WriteCompletion&) {
+            throw std::runtime_error("callback failure");
+        });
     EXPECT_NO_THROW(callback.Complete(0, ""));
     EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
-    fluss::ffi::WriteCallback unknown([](fluss::Result) { throw 42; });
+    fluss::ffi::WriteCallback unknown([](const fluss::WriteCompletion&) { throw 42; });
     EXPECT_NO_THROW(unknown.Complete(0, ""));
 }
 
@@ -472,7 +506,7 @@ TEST(WriteCallbackBridgeTest, CapacityRejectsOverflowWithoutDroppingReservations
     for (size_t i = 0; i < max_pending_operations; ++i) {
         capacity.Release();
     }
-    EXPECT_OK(capacity.AwaitAll(std::chrono::milliseconds(0)));
+    capacity.AwaitAll();
 }
 
 TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {
@@ -482,10 +516,11 @@ TEST(WriteCallbackBridgeTest, CapacityLastsThroughCallbackAndCaptureCleanup) {
         EXPECT_FALSE(capacity->Acquire().Ok());
         delete value;
     });
-    fluss::ffi::WriteCallback callback([capacity, owned = std::move(capture)](fluss::Result) {
-        EXPECT_FALSE(capacity->Acquire().Ok());
-        throw std::runtime_error("callback failure");
-    });
+    fluss::ffi::WriteCallback callback(
+        [capacity, owned = std::move(capture)](const fluss::WriteCompletion&) {
+            EXPECT_FALSE(capacity->Acquire().Ok());
+            throw std::runtime_error("callback failure");
+        });
     ASSERT_OK(callback.Reserve(capacity));
     EXPECT_FALSE(capacity->Acquire().Ok());
     callback.Complete(0, "");
@@ -498,7 +533,7 @@ TEST(WriteCallbackBridgeTest, UnsubmittedCallbackReturnsCapacityOnException) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     int calls = 0;
     try {
-        fluss::ffi::WriteCallback callback([&](fluss::Result) { ++calls; });
+        fluss::ffi::WriteCallback callback([&](const fluss::WriteCompletion&) { ++calls; });
         ASSERT_OK(callback.Reserve(capacity));
         throw std::bad_alloc();
     } catch (const std::bad_alloc&) {
@@ -511,7 +546,7 @@ TEST(WriteCallbackBridgeTest, UnsubmittedCallbackReturnsCapacityOnException) {
 TEST(WriteCallbackBridgeTest, ReservationOutlivesWriterOwnership) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     std::weak_ptr<fluss::ffi::WriteCallbackCapacity> weak = capacity;
-    fluss::ffi::WriteCallback callback([](fluss::Result) {});
+    fluss::ffi::WriteCallback callback([](const fluss::WriteCompletion&) {});
     ASSERT_OK(callback.Reserve(capacity));
     capacity.reset();
     EXPECT_FALSE(weak.expired());
@@ -522,7 +557,7 @@ TEST(WriteCallbackBridgeTest, ReservationOutlivesWriterOwnership) {
 TEST(WriteCallbackBridgeTest, CapacityTimeoutDoesNotDiscardAcceptedCallback) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 25);
     int calls = 0;
-    fluss::ffi::WriteCallback accepted([&](fluss::Result) { ++calls; });
+    fluss::ffi::WriteCallback accepted([&](const fluss::WriteCompletion&) { ++calls; });
     ASSERT_OK(accepted.Reserve(capacity));
     auto start = std::chrono::steady_clock::now();
     auto result = capacity->Acquire();
@@ -538,7 +573,7 @@ TEST(WriteCallbackBridgeTest, CapacityTimeoutDoesNotDiscardAcceptedCallback) {
 
 TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 5000);
-    fluss::ffi::WriteCallback accepted([](fluss::Result) {});
+    fluss::ffi::WriteCallback accepted([](const fluss::WriteCompletion&) {});
     ASSERT_OK(accepted.Reserve(capacity));
     std::promise<void> started;
     auto waiter = std::async(std::launch::async, [&] {
@@ -558,7 +593,7 @@ TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
 TEST(WriteCallbackBridgeTest, CallbackRejectsFullOtherWriterAndRestoresThreadContext) {
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 25);
     ASSERT_OK(capacity->Acquire());  // Full writer unrelated to the executing callback.
-    fluss::ffi::WriteCallback callback([capacity](fluss::Result) {
+    fluss::ffi::WriteCallback callback([capacity](const fluss::WriteCompletion&) {
         auto result = capacity->Acquire();
         EXPECT_EQ(result.error_message, "Write callback capacity is full");
         throw 42;
@@ -580,7 +615,7 @@ TEST(WriteCallbackBridgeTest, ConcurrentCapacityReservationsStayBounded) {
     for (int i = 0; i < 8; ++i) {
         threads.emplace_back([&] {
             for (int j = 0; j < 250; ++j) {
-                fluss::ffi::WriteCallback callback([&](fluss::Result) {
+                fluss::ffi::WriteCallback callback([&](const fluss::WriteCompletion&) {
                     --active;
                     ++completed;
                 });
@@ -596,4 +631,62 @@ TEST(WriteCallbackBridgeTest, ConcurrentCapacityReservationsStayBounded) {
     }
     EXPECT_EQ(active.load(), 0u);
     EXPECT_EQ(completed.load(), 2000u);
+}
+
+TEST(WriteCallbackBridgeTest, FlushRejectsCallbackReentryBeforeTouchingEitherWriter) {
+    fluss::AppendWriter append;
+    fluss::UpsertWriter upsert;
+    EXPECT_FALSE(fluss::ffi::WriteCallbackCapacity::InCallback());
+    fluss::ffi::WriteCallback callback([&](const fluss::WriteCompletion&) {
+        EXPECT_TRUE(fluss::ffi::WriteCallbackCapacity::InCallback());
+        EXPECT_EQ(append.Flush().error_message, "Flush cannot be called from a write callback");
+        EXPECT_EQ(upsert.Flush().error_message, "Flush cannot be called from a write callback");
+        throw std::runtime_error("restore callback context after exception");
+    });
+    callback.Complete(0, "");
+    EXPECT_FALSE(fluss::ffi::WriteCallbackCapacity::InCallback());
+    EXPECT_EQ(append.Flush().error_message, "AppendWriter not available");
+    EXPECT_EQ(upsert.Flush().error_message, "UpsertWriter not available");
+}
+
+TEST_F(WriteCallbackTest, RejectsZeroCapacityWithoutCreatingWriter) {
+    CreateTable(true);
+    fluss::WriteCallbackOptions options;
+    EXPECT_EQ(options.max_pending_operations, 262144u);
+    options.max_pending_operations = 0;
+    fluss::AppendWriter append;
+    fluss::UpsertWriter upsert;
+    auto appended = table_.NewAppend().CreateWriter(append, options);
+    auto upserted = table_.NewUpsert().CreateWriter(upsert, options);
+    EXPECT_EQ(appended.error_message, "max_pending_operations must be greater than zero");
+    EXPECT_EQ(upserted.error_message, "max_pending_operations must be greater than zero");
+    EXPECT_FALSE(append.Available());
+    EXPECT_FALSE(upsert.Available());
+}
+
+TEST_F(WriteCallbackTest, ConfiguredCapacityBlocksUntilCallbackFinishes) {
+    CreateTable();
+    fluss::WriteCallbackOptions options;
+    options.max_pending_operations = 1;
+    fluss::AppendWriter writer;
+    ASSERT_OK(table_.NewAppend().CreateWriter(writer, options));
+    auto gate = std::make_shared<std::promise<void>>();
+    auto resume = gate->get_future().share();
+    auto started = std::make_shared<std::promise<void>>();
+    auto ready = started->get_future();
+    ASSERT_OK(writer.Append(Row(), [started, resume](const fluss::WriteCompletion&) {
+        started->set_value();
+        resume.wait_for(std::chrono::seconds(10));
+    }));
+    ASSERT_EQ(ready.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    std::promise<void> submitting;
+    auto submitted = std::async(std::launch::async, [&] {
+        submitting.set_value();
+        return writer.Append(Row(2), [](const fluss::WriteCompletion&) {});
+    });
+    submitting.get_future().wait();
+    EXPECT_EQ(submitted.wait_for(std::chrono::milliseconds(25)), std::future_status::timeout);
+    gate->set_value();
+    ASSERT_OK(submitted.get());
+    ASSERT_OK(writer.Flush());
 }

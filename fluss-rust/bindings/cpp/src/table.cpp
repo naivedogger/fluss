@@ -1281,12 +1281,19 @@ bool Table::HasPrimaryKey() const {
 TableAppend::TableAppend(ffi::Table* table) noexcept : table_(table) {}
 
 Result TableAppend::CreateWriter(AppendWriter& out) {
+    return CreateWriter(out, WriteCallbackOptions{});
+}
+
+Result TableAppend::CreateWriter(AppendWriter& out, const WriteCallbackOptions& options) {
+    if (options.max_pending_operations == 0) {
+        return utils::make_client_error("max_pending_operations must be greater than zero");
+    }
     if (table_ == nullptr) {
         return utils::make_client_error("Table not available");
     }
 
     auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
-        table_->estimated_callback_capacity(), table_->writer_buffer_wait_timeout_ms());
+        options.max_pending_operations, table_->writer_buffer_wait_timeout_ms());
     auto ffi_result = table_->new_append_writer();
     auto result = utils::from_ffi_result(ffi_result.result);
     if (result.Ok()) {
@@ -1341,13 +1348,20 @@ std::vector<size_t> TableUpsert::ResolveNameProjection() const {
 }
 
 Result TableUpsert::CreateWriter(UpsertWriter& out) {
+    return CreateWriter(out, WriteCallbackOptions{});
+}
+
+Result TableUpsert::CreateWriter(UpsertWriter& out, const WriteCallbackOptions& options) {
+    if (options.max_pending_operations == 0) {
+        return utils::make_client_error("max_pending_operations must be greater than zero");
+    }
     if (table_ == nullptr) {
         return utils::make_client_error("Table not available");
     }
 
     try {
         auto capacity = std::make_shared<ffi::WriteCallbackCapacity>(
-            table_->estimated_callback_capacity(), table_->writer_buffer_wait_timeout_ms());
+            options.max_pending_operations, table_->writer_buffer_wait_timeout_ms());
         auto resolved_indices = !column_names_.empty() ? ResolveNameProjection() : column_indices_;
 
         rust::Vec<size_t> rust_indices;
@@ -1680,10 +1694,14 @@ Result AppendWriter::Append(const GenericRow& row, WriteCallback callback) {
     if (!callback) {
         return utils::make_client_error("Write callback must not be empty");
     }
+    auto executor_status = utils::from_ffi_result(ffi::ensure_callback_executor());
+    if (!executor_status.Ok()) {
+        return executor_status;
+    }
     // Allocate before submission so an allocation failure cannot lose an
     // already accepted write's completion notification.
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
-    // Bound the whole submit (capacity reservation + buffer wait) by client.writer.buffer.wait-timeout.
+    // Share the capacity and buffer wait budget from client.writer.buffer.wait-timeout.
     const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
     if (!reserved.Ok()) {
@@ -1746,6 +1764,10 @@ Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>&
     if (!callback) {
         return utils::make_client_error("Write callback must not be empty");
     }
+    auto executor_status = utils::from_ffi_result(ffi::ensure_callback_executor());
+    if (!executor_status.Ok()) {
+        return executor_status;
+    }
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
     const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
@@ -1762,6 +1784,9 @@ Result AppendWriter::AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>&
 }
 
 Result AppendWriter::Flush() {
+    if (ffi::WriteCallbackCapacity::InCallback()) {
+        return utils::make_client_error("Flush cannot be called from a write callback");
+    }
     if (!Available()) {
         return utils::make_client_error("AppendWriter not available");
     }
@@ -1840,6 +1865,10 @@ Result UpsertWriter::Upsert(const GenericRow& row, WriteCallback callback) {
     if (!callback) {
         return utils::make_client_error("Write callback must not be empty");
     }
+    auto executor_status = utils::from_ffi_result(ffi::ensure_callback_executor());
+    if (!executor_status.Ok()) {
+        return executor_status;
+    }
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
     const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
@@ -1884,6 +1913,10 @@ Result UpsertWriter::Delete(const GenericRow& row, WriteCallback callback) {
     if (!callback) {
         return utils::make_client_error("Write callback must not be empty");
     }
+    auto executor_status = utils::from_ffi_result(ffi::ensure_callback_executor());
+    if (!executor_status.Ok()) {
+        return executor_status;
+    }
     auto completion = std::make_unique<ffi::WriteCallback>(std::move(callback));
     const auto submit_start = std::chrono::steady_clock::now();
     auto reserved = completion->Reserve(callback_capacity_);
@@ -1899,6 +1932,9 @@ Result UpsertWriter::Delete(const GenericRow& row, WriteCallback callback) {
 }
 
 Result UpsertWriter::Flush() {
+    if (ffi::WriteCallbackCapacity::InCallback()) {
+        return utils::make_client_error("Flush cannot be called from a write callback");
+    }
     if (!Available()) {
         return utils::make_client_error("UpsertWriter not available");
     }

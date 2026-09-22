@@ -48,10 +48,12 @@ TEST(WriteCallbackBridgeTest, ErrorTextAllocationFailureStillCompletesAndRelease
     std::weak_ptr<int> weak = lifetime;
     fluss::Result observed;
     int calls = 0;
-    fluss::ffi::WriteCallback callback([&, owned = std::move(lifetime)](fluss::Result result) {
-        ++calls;
-        observed = std::move(result);
-    });
+    fluss::ffi::WriteCallback callback(
+        [&, owned = std::move(lifetime)](const fluss::WriteCompletion& notification) {
+            const auto& result = notification.result;
+            ++calls;
+            observed = result;
+        });
     auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
     ASSERT_TRUE(callback.Reserve(capacity).Ok());
     const rust::Str text(message);

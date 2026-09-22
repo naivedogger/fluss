@@ -141,8 +141,8 @@ impl AppendWriter {
         self.append_with_deadline(row, None)
     }
 
-    /// Internal: bounds the buffer-memory wait by `deadline` so a language binding can keep
-    /// a whole callback submission within one `client.writer.buffer.wait-timeout` budget. Not a
+    /// Internal: bounds the buffer-memory wait by `deadline` so a language binding can share
+    /// one `client.writer.buffer.wait-timeout` budget with callback admission waits. Not a
     /// public deadline API; use [`Self::append`], which passes `None` and defers to the config.
     #[doc(hidden)]
     pub fn append_with_deadline<R: InternalRow>(
@@ -188,8 +188,8 @@ impl AppendWriter {
         self.append_arrow_batch_with_deadline(batch, None)
     }
 
-    /// Internal: bounds the buffer-memory wait by `deadline` so a language binding can keep
-    /// a whole callback submission within one `client.writer.buffer.wait-timeout` budget. Not a
+    /// Internal: bounds the buffer-memory wait by `deadline` so a language binding can share
+    /// one `client.writer.buffer.wait-timeout` budget with callback admission waits. Not a
     /// public deadline API; use [`Self::append_arrow_batch`], which passes `None`.
     #[doc(hidden)]
     pub fn append_arrow_batch_with_deadline(

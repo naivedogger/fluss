@@ -36,7 +36,7 @@ namespace ffi {
 class WriteCallbackCapacity {
    public:
     /// `wait_timeout_ms` is the connection's client.writer.buffer.wait-timeout, used as
-    /// the shared budget for the whole submit. UINT64_MAX means block until a slot frees.
+    /// the shared budget for capacity and buffer waits. UINT64_MAX means block until a slot frees.
     WriteCallbackCapacity(size_t max_pending_operations, uint64_t wait_timeout_ms)
         : max_pending_(max_pending_operations), wait_timeout_ms_(wait_timeout_ms) {}
 
@@ -71,24 +71,13 @@ class WriteCallbackCapacity {
         available_.notify_all();
     }
 
-    /// Wait for all reserved operations to finish their callbacks.
-    /// When called from within a callback this returns immediately to avoid deadlock.
-    Result AwaitAll(std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (in_callback_) return {};
-        if (!available_.wait_for(lock, timeout, [&] { return pending_ == 0; })) {
-            return {ErrorCode::CLIENT_ERROR, "Timed out waiting for pending callbacks"};
-        }
-        return {};
-    }
+    /// True only while this thread executes a user callback or destroys its captures.
+    static bool InCallback() { return in_callback_; }
 
-    /// Block until every reserved operation has finished its callback. Used as a flush
-    /// barrier after the write flush already succeeded, so it has no deadline of its own;
-    /// a callback that never returns would hang here. Returns immediately when called from
-    /// within a callback to avoid deadlocking the worker on itself.
+    /// Wait until every reserved callback and its captures have finished.
+    /// Flush rejects callback reentry before starting any write flush.
     void AwaitAll() {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (in_callback_) return;
         available_.wait(lock, [&] { return pending_ == 0; });
     }
 
@@ -156,7 +145,7 @@ class WriteCallback {
                          error_code);
         }
         try {
-            callback(std::move(result));
+            callback(WriteCompletion{std::move(result)});
         } catch (const std::exception& e) {
             std::fprintf(stderr, "Fluss write callback threw an exception: %s\n", e.what());
         } catch (...) {

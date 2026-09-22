@@ -536,14 +536,26 @@ struct Result {
     bool IsRetriable() const { return ErrorCode::IsRetriable(error_code); }
 };
 
+/// Write-specific completion metadata. The reference passed to a callback is valid
+/// only for that invocation; copy the result when retaining it for later work.
+struct WriteCompletion {
+    Result result;
+};
+
+/// Per-writer admission control for callback operations, independent of buffer bytes.
+struct WriteCallbackOptions {
+    // Includes accepted writes awaiting completion and callbacks queued or executing.
+    // Must be greater than zero. This is not a byte limit on callback captures.
+    size_t max_pending_operations{262144};
+};
+
 /// Receives the final outcome of an accepted write. Function pointers and lambdas
 /// are supported. An empty callback is rejected before submitting the write.
 ///
 /// During normal operation, the SDK owns the callback until completion and invokes
-/// it exactly once on SDK-managed background threads; no caller polling or waiting
-/// thread is needed. Process exit or a crash can prevent delivery. Callbacks never
-/// run inline in the submitting call, but may run concurrently and out of order,
-/// including before the call returns.
+/// it exactly once on a shared SDK worker; no caller polling or waiting thread
+/// is needed. Process exit or a crash can prevent delivery. Callbacks never run
+/// inline in the submitting call, but may start before the call returns.
 /// Keep callbacks short and synchronize access to shared state, including writers.
 /// Callback overloads do not make writers safe for concurrent access. Captured
 /// references must remain valid until the callback finishes; capturing shared
@@ -555,12 +567,13 @@ struct Result {
 /// with SDK idempotence enabled. Retain input identifiers and recovery state as
 /// needed; one callback invocation is not an exactly-once delivery guarantee.
 ///
-/// Callbacks run on a single shared worker, so they fire in the order writes
-/// complete. Do not wait for another callback from a callback: it stalls that
+/// Callbacks run serially in dispatch order on a single shared worker. There is
+/// no cross-bucket submission-order guarantee; late registrations are queued
+/// when registered. Do not wait for another callback from a callback: it stalls that
 /// worker. Synchronous SDK calls require exclusive writer access. Callback
 /// submissions to a full writer fail immediately when called from a callback,
 /// instead of blocking the worker. Each writer bounds its outstanding callback
-/// operations from the write buffer size, so admission tracks memory backpressure.
+/// operations using WriteCallbackOptions, independently of the write buffer size.
 /// Hand off retries or expensive work without blocking; bound application queues
 /// and handle overflow without silently discarding failed operations.
 ///
@@ -569,9 +582,9 @@ struct Result {
 /// After a successful Rust write flush, Flush() blocks until pending callbacks finish,
 /// acting as a barrier, so a callback that never returns hangs it. On error, referenced
 /// state may still be in use.
-/// Inside a callback only the callback wait is skipped; the write flush may block.
+/// Flush() called inside any write callback returns a client error without flushing.
 /// Flush() does not wait for work handed to application workers or retry queues.
-using WriteCallback = std::function<void(Result)>;
+using WriteCallback = std::function<void(const WriteCompletion&)>;
 
 struct TablePath {
     std::string database_name;
@@ -1598,8 +1611,8 @@ struct Configuration {
     // Shared write-batch memory budget per Connection, across its tables and writers
     // (default 64 MiB). Not a process RSS limit or a callback-capture memory budget.
     size_t writer_buffer_memory_size{64 * 1024 * 1024};
-    // Maximum time in milliseconds to block waiting for buffer memory. This also bounds
-    // the whole callback submission, including callback capacity and buffer backpressure.
+    // Shared wait budget in milliseconds for buffer memory and callback capacity.
+    // Does not bound data conversion, scheduling, ACKs, or callback execution.
     // UINT64_MAX waits indefinitely; zero fails fast when capacity or memory is unavailable.
     uint64_t writer_buffer_wait_timeout_ms{std::numeric_limits<uint64_t>::max()};
     // Maximum KV backpressure throttle in milliseconds
@@ -1785,6 +1798,8 @@ class TableAppend {
     TableAppend& operator=(TableAppend&&) noexcept = default;
 
     Result CreateWriter(AppendWriter& out);
+    /// Create a writer with an independent, positive callback operation limit.
+    Result CreateWriter(AppendWriter& out, const WriteCallbackOptions& options);
 
    private:
     friend class Table;
@@ -1804,6 +1819,8 @@ class TableUpsert {
     TableUpsert& PartialUpdateByName(std::vector<std::string> column_names);
 
     Result CreateWriter(UpsertWriter& out);
+    /// Create a writer sharing one callback operation limit across upserts and deletes.
+    Result CreateWriter(UpsertWriter& out, const WriteCallbackOptions& options);
 
    private:
     friend class Table;
@@ -1942,11 +1959,11 @@ class AppendWriter {
     Result Append(const GenericRow& row);
     Result Append(const GenericRow& row, WriteResult& out);
     /// Submit a row and notify callback of its final outcome without waiting for
-    /// acknowledgment. Submission is bounded by client.writer.buffer.wait-timeout,
-    /// covering callback capacity and buffer backpressure: within it, Ok means the
-    /// write was accepted and the callback fires exactly once, an error means
-    /// submission failed and no callback runs. A zero timeout makes submission
-    /// non-blocking.
+    /// acknowledgment. Callback capacity and buffer waits share the budget from
+    /// client.writer.buffer.wait-timeout. Ok means the write was accepted and the
+    /// callback fires exactly once during normal operation; an error means
+    /// submission failed and no callback runs. A zero timeout makes admission
+    /// fail fast when callback capacity or buffer memory is unavailable.
     Result Append(const GenericRow& row, WriteCallback callback);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch);
     Result AppendArrowBatch(const std::shared_ptr<arrow::RecordBatch>& batch, WriteResult& out);
@@ -1989,11 +2006,11 @@ class UpsertWriter {
     Result Upsert(const GenericRow& row);
     Result Upsert(const GenericRow& row, WriteResult& out);
     /// Submit an upsert and notify callback of its final outcome without waiting
-    /// for acknowledgment. Submission is bounded by client.writer.buffer.wait-timeout,
-    /// covering callback capacity and buffer backpressure: within it, Ok means the
-    /// write was accepted and the callback fires exactly once, an error means
-    /// submission failed and no callback runs. A zero timeout makes submission
-    /// non-blocking.
+    /// for acknowledgment. Callback capacity and buffer waits share the budget from
+    /// client.writer.buffer.wait-timeout. Ok means the write was accepted and the
+    /// callback fires exactly once during normal operation; an error means
+    /// submission failed and no callback runs. A zero timeout makes admission
+    /// fail fast when callback capacity or buffer memory is unavailable.
     Result Upsert(const GenericRow& row, WriteCallback callback);
     Result Delete(const GenericRow& row);
     Result Delete(const GenericRow& row, WriteResult& out);

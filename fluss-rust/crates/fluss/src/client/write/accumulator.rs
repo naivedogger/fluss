@@ -78,7 +78,7 @@ impl MemoryLimiter {
     /// Like [`acquire`], but bounds the wait by `deadline` when provided instead of
     /// the limiter's configured `wait_timeout`. A deadline already in the past makes
     /// this non-blocking (fail fast if memory is unavailable), which callers use to
-    /// keep a submit within a caller-supplied budget (e.g. the callback submission budget).
+    /// share the buffer wait budget with callback admission, not bound the whole API call.
     pub fn acquire_within(
         self: &Arc<Self>,
         size: usize,
