@@ -61,6 +61,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -69,6 +70,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -108,7 +110,8 @@ public class TieringSourceEnumerator
     private final ScheduledExecutorService timerService;
     private final SplitEnumeratorMetricGroup enumeratorMetricGroup;
     private final long pollTieringTableIntervalMs;
-    private final List<TieringSplit> pendingSplits;
+    // Also inspected by asynchronous heartbeat requests.
+    private final Deque<TieringSplit> pendingSplits;
     private final Set<Integer> readersAwaitingSplit;
 
     private final Map<Long, Long> tieringTableEpochs;
@@ -158,7 +161,7 @@ public class TieringSourceEnumerator
         this.timerService = timerService;
         this.enumeratorMetricGroup = context.metricGroup();
         this.pollTieringTableIntervalMs = pollTieringTableIntervalMs;
-        this.pendingSplits = Collections.synchronizedList(new ArrayList<>());
+        this.pendingSplits = new ConcurrentLinkedDeque<>();
         this.readersAwaitingSplit = Collections.synchronizedSet(new TreeSet<>());
         this.tieringTableEpochs = new ConcurrentHashMap<>();
         this.finishedTables = new ConcurrentHashMap<>();
@@ -410,8 +413,8 @@ public class TieringSourceEnumerator
                     readersAwaitingSplit.remove(nextAwaitingReader);
                     continue;
                 }
-                if (!pendingSplits.isEmpty()) {
-                    TieringSplit tieringSplit = pendingSplits.remove(0);
+                TieringSplit tieringSplit = pendingSplits.pollFirst();
+                if (tieringSplit != null) {
                     context.assignSplit(tieringSplit, nextAwaitingReader);
                     LOG.info("Assigning split {} to readers {}", tieringSplit, nextAwaitingReader);
                     readersAwaitingSplit.remove(nextAwaitingReader);

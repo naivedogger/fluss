@@ -52,8 +52,42 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-/** Tests for empty-table continuation in {@link TieringSourceEnumerator}. */
+/** Tests for split assignment and table scheduling in {@link TieringSourceEnumerator}. */
 class TieringSourceEnumeratorSchedulingTest {
+
+    @Test
+    void testPendingSplitsAssignedInOrder() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            List<TieringSplit> splits = new ArrayList<>();
+            for (int bucket = 0; bucket < 4; bucket++) {
+                splits.add(
+                        new TieringLogSplit(
+                                TablePath.of("db", "table"),
+                                new TableBucket(1, bucket),
+                                null,
+                                0,
+                                1));
+            }
+            fixture.enumerator.addSplitsBack(splits.subList(0, 2), 0);
+            // Returned splits join the tail of the remaining queue.
+            fixture.enumerator.addSplitsBack(splits.subList(2, splits.size()), 0);
+            for (int i = 2; i < splits.size(); i++) {
+                fixture.requestTable();
+            }
+
+            List<TieringSplit> assignedSplits =
+                    fixture.context.getSplitsAssignmentSequence().stream()
+                            .flatMap(assignment -> assignment.assignment().get(0).stream())
+                            .collect(Collectors.toList());
+            assertThat(assignedSplits).containsExactlyElementsOf(splits);
+            assertThat(fixture.claims()).isEmpty();
+
+            // Once drained, another request polls for a new table without reassigning old splits.
+            fixture.requestTable();
+            assertThat(fixture.claims()).hasSize(1);
+            assertThat(fixture.context.getSplitsAssignmentSequence()).hasSize(splits.size());
+        }
+    }
 
     @Test
     void testEmptyTablesShareContinuationAndAdvance() throws Throwable {
