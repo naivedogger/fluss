@@ -19,8 +19,9 @@
 
 #pragma once
 
-#include <condition_variable>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <exception>
 #include <limits>
@@ -33,6 +34,8 @@ namespace fluss {
 namespace ffi {
 
 /// Per-writer admission control; independent of Rust buffer memory and ACK completion.
+/// Acquire, Cancel and AwaitAll require the writer's existing external serialization.
+/// Release is called by the single SDK callback worker, after capture destruction.
 class WriteCallbackCapacity {
    public:
     /// `wait_timeout_ms` is the connection's client.writer.buffer.wait-timeout, used as
@@ -41,34 +44,36 @@ class WriteCallbackCapacity {
         : max_pending_(max_pending_operations), wait_timeout_ms_(wait_timeout_ms) {}
 
     Result Acquire() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (pending_ == max_pending_) {
-            auto has_slot = [&] { return pending_ < max_pending_; };
+        // Only the submitter consumes capacity. A stale completion count therefore
+        // underestimates free slots, never admits more than the configured limit.
+        if (issued_ - observed_completed_ == max_pending_ && !HasSlot()) {
             // Fail fast from within a callback to avoid stalling the shared workers on
             // their own capacity; a zero budget also rejects immediately.
             if (in_callback_ || wait_timeout_ms_ == 0) {
                 return {ErrorCode::CLIENT_ERROR, "Write callback capacity is full"};
             }
-            if (IsUnbounded()) {
-                available_.wait(lock, has_slot);
-            } else if (!available_.wait_for(lock, std::chrono::milliseconds(wait_timeout_ms_),
-                                            has_slot)) {
+            if (!Wait([&] { return HasSlot(); }, false)) {
                 return {ErrorCode::CLIENT_ERROR, "Timed out waiting for write callback capacity"};
             }
         }
-        ++pending_;
+        ++issued_;
         return {};
     }
 
+    /// Return a reservation that was never transferred to an accepted callback.
+    /// This stays on the serialized submission side, not the completion counter.
+    void Cancel() noexcept { --issued_; }
+
     void Release() noexcept {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            --pending_;
+        // One completion writer: no shared read-modify-write on the hot path.
+        // This is a count, NOT the sequence number of a contiguous completed prefix.
+        completed_.store(++worker_completed_, std::memory_order_seq_cst);
+        if (waiting_.load(std::memory_order_seq_cst)) {
+            // Pair with Wait's registration/recheck under this mutex. Publication
+            // itself never needs the mutex; only an actual waiter needs a wakeup.
+            std::lock_guard<std::mutex> lock(wait_mutex_);
+            available_.notify_all();
         }
-        // notify_all: Acquire() waiters and the AwaitAll() waiter share this condvar,
-        // so waking only one risks waking AwaitAll() (still pending) while an Acquire()
-        // waiter keeps sleeping despite the freed slot.
-        available_.notify_all();
     }
 
     /// True only while this thread executes a user callback or destroys its captures.
@@ -77,8 +82,12 @@ class WriteCallbackCapacity {
     /// Wait until every reserved callback and its captures have finished.
     /// Flush rejects callback reentry before starting any write flush.
     void AwaitAll() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        available_.wait(lock, [&] { return pending_ == 0; });
+        Wait(
+            [&] {
+                observed_completed_ = completed_.load(std::memory_order_seq_cst);
+                return issued_ == observed_completed_;
+            },
+            true);
     }
 
     /// Milliseconds left in the client.writer.buffer.wait-timeout budget since `start`, so
@@ -99,11 +108,40 @@ class WriteCallbackCapacity {
     friend class WriteCallback;
     inline static thread_local bool in_callback_ = false;
     bool IsUnbounded() const { return wait_timeout_ms_ == std::numeric_limits<uint64_t>::max(); }
+    bool HasSlot() {
+        observed_completed_ = completed_.load(std::memory_order_seq_cst);
+        return issued_ - observed_completed_ < max_pending_;
+    }
+
+    template <typename Predicate>
+    bool Wait(Predicate ready, bool unbounded) {
+        std::unique_lock<std::mutex> lock(wait_mutex_);
+        // The SC store/load pairs here and in Release forbid both threads from
+        // missing each other: either this recheck sees completion or Release
+        // observes a registered waiter and takes the mutex before notifying.
+        waiting_.store(true, std::memory_order_seq_cst);
+        struct Registration {
+            std::atomic<bool>& waiting;
+            ~Registration() { waiting.store(false, std::memory_order_seq_cst); }
+        } registration{waiting_};
+        if (unbounded || IsUnbounded()) {
+            available_.wait(lock, ready);
+            return true;
+        }
+        return available_.wait_for(lock, std::chrono::milliseconds(wait_timeout_ms_), ready);
+    }
+
     const size_t max_pending_;
     const uint64_t wait_timeout_ms_;
-    std::mutex mutex_;
+    // Unsigned differences allow wraparound; outstanding reservations remain bounded.
+    // Separate submit-side writes from completion publication/cache lines.
+    alignas(128) size_t issued_ = 0;
+    size_t observed_completed_ = 0;
+    alignas(128) size_t worker_completed_ = 0;
+    std::atomic<size_t> completed_{0};
+    alignas(128) std::atomic<bool> waiting_{false};
+    std::mutex wait_mutex_;
     std::condition_variable available_;
-    size_t pending_ = 0;
 };
 
 /// Owns a callback transferred to Rust. Access is exclusive, never concurrent.
@@ -129,7 +167,7 @@ class WriteCallback {
     /// Invoke once, containing all C++ exceptions on this side of the FFI boundary.
     void Complete(int32_t error_code, rust::Str error_message) noexcept {
         // Release captures before the reservation, even if this wrapper outlives Complete().
-        Reservation reservation{std::move(reservation_.capacity)};
+        CompletedReservation reservation{std::move(reservation_.capacity)};
         CallbackScope scope;
         // Moving std::function alone need not empty the source. Swap with an
         // empty function so captures are released even if the callback throws.
@@ -157,6 +195,15 @@ class WriteCallback {
     struct Reservation {
         std::shared_ptr<WriteCallbackCapacity> capacity;
         ~Reservation() {
+            if (capacity) {
+                capacity->Cancel();
+            }
+        }
+    };
+
+    struct CompletedReservation {
+        std::shared_ptr<WriteCallbackCapacity> capacity;
+        ~CompletedReservation() {
             if (capacity) {
                 capacity->Release();
             }

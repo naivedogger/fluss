@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -580,7 +581,7 @@ TEST(WriteCallbackBridgeTest, WaitingSubmitterResumesAfterCompletion) {
         started.set_value();
         auto result = capacity->Acquire();
         if (result.Ok()) {
-            capacity->Release();
+            capacity->Cancel();
         }
         return result;
     });
@@ -606,31 +607,164 @@ TEST(WriteCallbackBridgeTest, CallbackRejectsFullOtherWriterAndRestoresThreadCon
     capacity->Release();
 }
 
-TEST(WriteCallbackBridgeTest, ConcurrentCapacityReservationsStayBounded) {
+TEST(WriteCallbackBridgeTest, IndependentSubmittersAndSingleWorkerStayBounded) {
     constexpr size_t limit = 3;
-    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(limit, 5000);
-    std::atomic<size_t> active{0};
     std::atomic<size_t> completed{0};
+    std::mutex queue_mutex;
+    std::condition_variable ready;
+    std::deque<std::unique_ptr<fluss::ffi::WriteCallback>> queue;
+    bool stopped = false;
+    // Match the public contract: serialized submission per writer, one SDK
+    // completion worker shared by independent writers. Same-writer concurrent
+    // Acquire calls are not supported by the C++ writer API.
+    std::thread worker([&] {
+        for (;;) {
+            std::unique_ptr<fluss::ffi::WriteCallback> callback;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                ready.wait(lock, [&] { return stopped || !queue.empty(); });
+                if (queue.empty()) {
+                    return;
+                }
+                callback = std::move(queue.front());
+                queue.pop_front();
+            }
+            callback->Complete(0, "");
+        }
+    });
     std::vector<std::thread> threads;
     for (int i = 0; i < 8; ++i) {
         threads.emplace_back([&] {
+            auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(limit, 5000);
+            auto active = std::make_shared<std::atomic<size_t>>(0);
             for (int j = 0; j < 250; ++j) {
-                fluss::ffi::WriteCallback callback([&](const fluss::WriteCompletion&) {
-                    --active;
-                    ++completed;
-                });
-                ASSERT_OK(callback.Reserve(capacity));
-                EXPECT_LE(++active, limit);
-                std::this_thread::yield();
-                callback.Complete(0, "");
+                // Submission failure can race with successful completion, but
+                // must only roll back the submit-side reservation.
+                {
+                    fluss::ffi::WriteCallback rejected([](const fluss::WriteCompletion&) {
+                        ADD_FAILURE() << "Unsubmitted callback must not execute";
+                    });
+                    ASSERT_OK(rejected.Reserve(capacity));
+                }
+                auto callback = std::make_unique<fluss::ffi::WriteCallback>(
+                    [&, active](const fluss::WriteCompletion&) {
+                        --*active;
+                        ++completed;
+                    });
+                ASSERT_OK(callback->Reserve(capacity));
+                EXPECT_LE(++*active, limit);
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    queue.push_back(std::move(callback));
+                }
+                ready.notify_one();
             }
+            capacity->AwaitAll();
+            EXPECT_EQ(active->load(), 0u);
         });
     }
     for (auto& thread : threads) {
         thread.join();
     }
-    EXPECT_EQ(active.load(), 0u);
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        stopped = true;
+    }
+    ready.notify_one();
+    worker.join();
     EXPECT_EQ(completed.load(), 2000u);
+}
+
+TEST(WriteCallbackBridgeTest, NewWriterDoesNotInheritOldWriterCompletions) {
+    auto old_capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
+    auto new_capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 0);
+    fluss::ffi::WriteCallback old_callback([](const fluss::WriteCompletion&) {});
+    fluss::ffi::WriteCallback new_callback([](const fluss::WriteCompletion&) {});
+    ASSERT_OK(old_callback.Reserve(old_capacity));
+    ASSERT_OK(new_callback.Reserve(new_capacity));
+    std::weak_ptr<fluss::ffi::WriteCallbackCapacity> old_weak = old_capacity;
+    old_capacity.reset();
+    old_callback.Complete(0, "");
+    EXPECT_TRUE(old_weak.expired());
+    EXPECT_FALSE(new_capacity->Acquire().Ok());
+    new_callback.Complete(0, "");
+    ASSERT_OK(new_capacity->Acquire());
+    new_capacity->Cancel();
+    new_capacity->AwaitAll();
+}
+
+TEST(WriteCallbackBridgeTest, OutOfOrderCompletionReturnsOnlyOneSlot) {
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(3, 0);
+    std::vector<std::unique_ptr<fluss::ffi::WriteCallback>> callbacks;
+    for (int i = 0; i < 3; ++i) {
+        auto callback =
+            std::make_unique<fluss::ffi::WriteCallback>([](const fluss::WriteCompletion&) {});
+        ASSERT_OK(callback->Reserve(capacity));
+        callbacks.push_back(std::move(callback));
+    }
+    callbacks[2]->Complete(0, "");
+    ASSERT_OK(capacity->Acquire());
+    EXPECT_FALSE(capacity->Acquire().Ok());
+    capacity->Cancel();
+    callbacks[0]->Complete(0, "");
+    callbacks[1]->Complete(0, "");
+    capacity->AwaitAll();
+}
+
+TEST(WriteCallbackBridgeTest, FlushWaitsUntilCaptureDestructionPublishesCompletion) {
+    auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, 5000);
+    std::promise<void> destructor_started;
+    std::promise<void> allow_destruction;
+    auto allowed = allow_destruction.get_future();
+    auto capture = std::shared_ptr<int>(new int(0), [&](int* value) {
+        destructor_started.set_value();
+        allowed.wait();
+        delete value;
+    });
+    fluss::ffi::WriteCallback callback(
+        [owned = std::move(capture)](const fluss::WriteCompletion&) {});
+    ASSERT_OK(callback.Reserve(capacity));
+    auto worker = std::async(std::launch::async, [&] { callback.Complete(0, ""); });
+    destructor_started.get_future().wait();
+    auto flush = std::async(std::launch::async, [&] { capacity->AwaitAll(); });
+    EXPECT_EQ(flush.wait_for(std::chrono::milliseconds(25)), std::future_status::timeout);
+    allow_destruction.set_value();
+    worker.get();
+    flush.get();
+}
+
+TEST(WriteCallbackBridgeTest, CapacityOneRepeatedHandoffDoesNotLoseWakeups) {
+    for (uint64_t timeout : {uint64_t{5000}, std::numeric_limits<uint64_t>::max()}) {
+        auto capacity = std::make_shared<fluss::ffi::WriteCallbackCapacity>(1, timeout);
+        std::atomic<size_t> published{0};
+        constexpr size_t operations = 10000;
+        std::thread worker([&] {
+            for (size_t i = 0; i < operations; ++i) {
+                while (published.load(std::memory_order_acquire) <= i) {
+                    std::this_thread::yield();
+                }
+                capacity->Release();
+            }
+        });
+        size_t accepted = 0;
+        for (; accepted < operations; ++accepted) {
+            auto result = capacity->Acquire();
+            EXPECT_TRUE(result.Ok()) << result.error_message;
+            if (!result.Ok()) {
+                break;
+            }
+            published.store(accepted + 1, std::memory_order_release);
+        }
+        if (accepted != operations) {
+            // Let the worker exit on a failed assertion instead of hanging the
+            // test. The state is not reused after this failure.
+            published.store(operations, std::memory_order_release);
+        }
+        worker.join();
+        if (accepted == operations) {
+            capacity->AwaitAll();
+        }
+    }
 }
 
 TEST(WriteCallbackBridgeTest, FlushRejectsCallbackReentryBeforeTouchingEitherWriter) {
@@ -689,4 +823,42 @@ TEST_F(WriteCallbackTest, ConfiguredCapacityBlocksUntilCallbackFinishes) {
     gate->set_value();
     ASSERT_OK(submitted.get());
     ASSERT_OK(writer.Flush());
+}
+
+TEST_F(WriteCallbackTest, MovedWriterAndNewWriterKeepIndependentReservations) {
+    CreateTable();
+    fluss::WriteCallbackOptions options;
+    options.max_pending_operations = 1;
+    fluss::AppendWriter original;
+    ASSERT_OK(table_.NewAppend().CreateWriter(original, options));
+    auto started = std::make_shared<std::promise<void>>();
+    auto ready = started->get_future();
+    auto gate = std::make_shared<std::promise<void>>();
+    auto resume = gate->get_future().share();
+    auto completed = std::make_shared<std::atomic<size_t>>(0);
+    ASSERT_OK(
+        original.Append(Row(), [completed, started, resume](const fluss::WriteCompletion& result) {
+            EXPECT_OK(result.result);
+            started->set_value();
+            resume.wait_for(std::chrono::seconds(10));
+            ++*completed;
+        }));
+    ASSERT_EQ(ready.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    fluss::AppendWriter moved(std::move(original));
+    EXPECT_FALSE(original.Available());
+    // Reusing the wrapper/table must create a new capacity identity, while the
+    // moved writer keeps the old, still-full state.
+    ASSERT_OK(table_.NewAppend().CreateWriter(original, options));
+    auto submission = std::async(std::launch::async, [&] {
+        return original.Append(Row(2), [completed](const fluss::WriteCompletion& result) {
+            EXPECT_OK(result.result);
+            ++*completed;
+        });
+    });
+    EXPECT_EQ(submission.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    gate->set_value();
+    ASSERT_OK(submission.get());
+    ASSERT_OK(moved.Flush());
+    ASSERT_OK(original.Flush());
+    EXPECT_EQ(completed->load(), 2u);
 }
