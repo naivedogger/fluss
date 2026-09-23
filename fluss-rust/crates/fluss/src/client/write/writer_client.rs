@@ -26,7 +26,7 @@ use crate::client::write::sender::Sender;
 use crate::client::{RecordAccumulator, ResultHandle, WriteRecord};
 use crate::config::Config;
 use crate::config::NoKeyAssigner;
-use crate::error::{Error, FlussError, Result};
+use crate::error::{Error, Result};
 use crate::metadata::{PhysicalTablePath, TableInfo};
 use crate::metrics::WriterMetrics;
 use log::warn;
@@ -114,20 +114,11 @@ impl WriterClient {
                 message: "Cannot send: writer is closed".to_string(),
             });
         }
-        let cluster = self.metadata.get_cluster();
-        // Validate once against the same snapshot used for routing and append.
-        // Preserve the missing-table error before entering the bucket assigner.
-        let table_path = record.physical_table_path.get_table_path();
-        let table_info = cluster.get_table(table_path).map_err(|e| {
-            if e.api_error() == Some(FlussError::InvalidTableException) {
-                Error::table_not_exist(format!("Table not found: {table_path}"))
-            } else {
-                e
-            }
-        })?;
         let result = self
-            .accumulate
-            .append_routed(record, &cluster, table_info)?;
+            .metadata
+            .with_write_metadata(&record.physical_table_path, |cluster, table_info| {
+                self.accumulate.append_routed(record, cluster, table_info)
+            })?;
 
         if result.batch_is_full || result.new_batch_created {
             self.accumulate.wakeup_sender();

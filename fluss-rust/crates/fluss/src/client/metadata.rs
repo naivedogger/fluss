@@ -17,25 +17,51 @@
 
 use crate::cluster::{Cluster, ServerNode, ServerType};
 use crate::error::{Error, FlussError, Result};
-use crate::metadata::{PhysicalTablePath, TableBucket, TablePath};
+use crate::metadata::{PhysicalTablePath, TableBucket, TableInfo, TablePath};
 use crate::proto::MetadataResponse;
 use crate::rpc::message::{GetTableRequest, UpdateMetadataRequest};
 use crate::rpc::{RpcClient, ServerConnection};
 use crate::{PartitionId, TableId};
 use log::{info, warn};
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 
 const MAX_BOOTSTRAP_RETRIES: usize = 3;
 const BOOTSTRAP_RETRY_INTERVAL_MS: u64 = 100;
 
+// Globally unique generations also distinguish different Metadata instances on
+// the same thread. Never reuse a generation, including after an instance drops.
+static NEXT_SNAPSHOT_VERSION: AtomicU64 = AtomicU64::new(1);
+
+fn next_snapshot_version() -> u64 {
+    NEXT_SNAPSHOT_VERSION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+        .expect("metadata snapshot version exhausted")
+}
+
+struct CachedWriteMetadata {
+    version: u64,
+    cluster: Arc<Cluster>,
+    table: Option<(Arc<PhysicalTablePath>, TableInfo)>,
+}
+
+thread_local! {
+    // One entry, not an unbounded per-connection/table map. No connection or
+    // writer is retained. Each submitting thread borrows its own snapshot so
+    // stable per-row reads do not contend on the shared lock or Arc counter.
+    static WRITE_METADATA: RefCell<Option<CachedWriteMetadata>> = const { RefCell::new(None) };
+}
+
 pub struct Metadata {
     cluster: RwLock<Arc<Cluster>>,
+    snapshot_version: AtomicU64,
     unavailable_tablet_server_ids: RwLock<HashSet<i32>>,
     connections: Arc<RpcClient>,
     bootstrap: Arc<str>,
@@ -54,6 +80,7 @@ impl Metadata {
         let (cluster_version_tx, _) = watch::channel(0);
         Ok(Metadata {
             cluster: RwLock::new(Arc::new(cluster)),
+            snapshot_version: AtomicU64::new(next_snapshot_version()),
             unavailable_tablet_server_ids: RwLock::new(HashSet::new()),
             connections,
             bootstrap: bootstrap.into(),
@@ -259,6 +286,7 @@ impl Metadata {
             .write()
             .retain(|id| cluster.get_tablet_server(*id).is_none());
         *guard = Arc::new(cluster);
+        self.publish_snapshot_version();
     }
 
     pub fn invalidate_server(&self, server_id: &i32, table_ids: Vec<i64>) {
@@ -266,6 +294,7 @@ impl Metadata {
             let mut cluster_guard = self.cluster.write();
             let updated_cluster = cluster_guard.invalidate_server(server_id, table_ids);
             *cluster_guard = Arc::new(updated_cluster);
+            self.publish_snapshot_version();
         }
         self.notify_cluster_changed();
     }
@@ -279,6 +308,7 @@ impl Metadata {
             let updated_cluster =
                 cluster_guard.invalidate_physical_table_meta(physical_tables_to_invalid);
             *cluster_guard = Arc::new(updated_cluster);
+            self.publish_snapshot_version();
         }
         self.notify_cluster_changed();
     }
@@ -312,6 +342,7 @@ impl Metadata {
             let mut cluster_guard = self.cluster.write();
             let updated_cluster = cluster_guard.evict_table(table_path);
             *cluster_guard = Arc::new(updated_cluster);
+            self.publish_snapshot_version();
         }
         self.notify_cluster_changed();
     }
@@ -472,6 +503,81 @@ impl Metadata {
         guard.clone()
     }
 
+    // Called while holding cluster's write lock, after replacing its value.
+    // Slow readers capture the generation and snapshot under that same lock.
+    fn publish_snapshot_version(&self) {
+        self.snapshot_version
+            .store(next_snapshot_version(), Ordering::Release);
+    }
+
+    /// Borrow a current metadata snapshot and resolved table for a synchronous
+    /// write. The cache is thread-local, not writer-local: concurrent Rust
+    /// writers retain their existing thread-safety guarantees.
+    ///
+    /// A stable generation avoids both shared reference-count updates and
+    /// rehashing the same table path. Every replacement/invalidation publishes
+    /// a new generation before releasing the metadata write lock.
+    pub(crate) fn with_write_metadata<T>(
+        &self,
+        path: &Arc<PhysicalTablePath>,
+        f: impl FnOnce(&Arc<Cluster>, &TableInfo) -> Result<T>,
+    ) -> Result<T> {
+        fn resolve<'a>(cluster: &'a Cluster, path: &PhysicalTablePath) -> Result<&'a TableInfo> {
+            let table_path = path.get_table_path();
+            cluster.get_table(table_path).map_err(|e| {
+                if e.api_error() == Some(FlussError::InvalidTableException) {
+                    Error::table_not_exist(format!("Table not found: {table_path}"))
+                } else {
+                    e
+                }
+            })
+        }
+
+        let mut f = Some(f);
+        let result = WRITE_METADATA.try_with(|slot| {
+            let f = f.take().expect("write closure consumed once");
+            // Reentrant calls must not panic or replace a snapshot still in
+            // use by the outer call. The ordinary uncached path is safe here.
+            let Ok(mut cached) = slot.try_borrow_mut() else {
+                let cluster = self.get_cluster();
+                return f(&cluster, resolve(&cluster, path)?);
+            };
+            let version = self.snapshot_version.load(Ordering::Acquire);
+            if cached.as_ref().is_none_or(|entry| entry.version != version) {
+                let cluster = self.cluster.read();
+                *cached = Some(CachedWriteMetadata {
+                    version: self.snapshot_version.load(Ordering::Relaxed),
+                    cluster: Arc::clone(&cluster),
+                    table: None,
+                });
+            }
+            let cached = cached.as_mut().expect("initialized metadata snapshot");
+            if cached.table.as_ref().is_none_or(|(cached_path, _)| {
+                !Arc::ptr_eq(cached_path, path)
+                    && cached_path.get_table_path() != path.get_table_path()
+            }) {
+                cached.table = Some((Arc::clone(path), resolve(&cached.cluster, path)?.clone()));
+            }
+            f(
+                &cached.cluster,
+                &cached.table.as_ref().expect("resolved table").1,
+            )
+        });
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                // Another TLS destructor may submit after this cache has been
+                // destroyed. Caching is optional; never introduce a panic into
+                // the write API merely because the fast path is unavailable.
+                let cluster = self.get_cluster();
+                f.take().expect("TLS access failed before invoking closure")(
+                    &cluster,
+                    resolve(&cluster, path)?,
+                )
+            }
+        }
+    }
+
     const MAX_RETRY_TIMES: u8 = 3;
 
     pub async fn leader_for(
@@ -525,6 +631,7 @@ impl Metadata {
         let (cluster_version_tx, _) = watch::channel(0);
         Metadata {
             cluster: RwLock::new(cluster),
+            snapshot_version: AtomicU64::new(next_snapshot_version()),
             unavailable_tablet_server_ids: RwLock::new(HashSet::new()),
             connections: Arc::new(RpcClient::new()),
             bootstrap: Arc::from(""),
@@ -532,6 +639,10 @@ impl Metadata {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "metadata_write_cache_tests.rs"]
+mod write_cache_tests;
 
 #[cfg(test)]
 mod tests {
