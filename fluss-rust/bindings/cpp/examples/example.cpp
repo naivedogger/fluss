@@ -93,11 +93,11 @@ int main() {
 
     // 5) Write rows with scalar and temporal values
     fluss::AppendWriter writer;
-    fluss::WriteCallbackOptions callback_options;
-    // Per writer, independent of config.writer_buffer_memory_size (per Connection).
-    // CreateWriter(writer) without options uses the default 262144-operation limit.
-    callback_options.max_pending_operations = 4096;
-    check("new_append_writer", table.NewAppend().CreateWriter(writer, callback_options));
+    // Use the default per-writer limit of 262144 outstanding callback operations.
+    // This is independent of config.writer_buffer_memory_size (per Connection).
+    // To tune it, pass WriteCallbackOptions based on measured completion latency
+    // and capture memory; a smaller limit can throttle writes before the buffer fills.
+    check("new_append_writer", table.NewAppend().CreateWriter(writer));
 
     struct RowData {
         int id;
