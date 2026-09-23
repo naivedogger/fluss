@@ -79,7 +79,7 @@ fn fixture(port: u32, max_inflight: usize) -> (Sender, Arc<Cluster>) {
     (sender, cluster)
 }
 
-fn append(sender: &Sender, cluster: &Cluster, table_id: TableId) -> Result<ResultHandle> {
+fn append(sender: &Sender, cluster: &Arc<Cluster>, table_id: TableId) -> Result<ResultHandle> {
     let path = TablePath::new("db", format!("table_{table_id}"));
     let info = Arc::new(build_table_info(path.clone(), table_id, 1));
     let physical = Arc::new(PhysicalTablePath::of(Arc::new(path)));
@@ -89,9 +89,82 @@ fn append(sender: &Sender, cluster: &Cluster, table_id: TableId) -> Result<Resul
     let record = WriteRecord::for_append(info, physical, 1, &row);
     Ok(sender
         .accumulator
-        .append(&record, 0, cluster, false)?
+        .append_routed(
+            &record,
+            cluster,
+            cluster.get_table(record.physical_table_path.get_table_path())?,
+        )?
         .result_handle
         .expect("result handle"))
+}
+
+#[tokio::test]
+async fn cached_routed_writes_preserve_row_sequence_and_ack_completion_order() -> Result<()> {
+    use crate::client::{WriteCallbackBatch, WriteResultFuture};
+    use crate::record::{LogRecordBatch, ReadContext, to_arrow_schema};
+    use crate::row::DataGetters;
+
+    let (sender, cluster) = fixture(9092, 1);
+    let path = TablePath::new("db", "table_1");
+    let info = Arc::new(build_table_info(path.clone(), 1, 1));
+    let physical = Arc::new(PhysicalTablePath::of(Arc::new(path)));
+    let nodes = HashSet::from([cluster.get_tablet_server(1).unwrap().clone()]);
+    let read_context = ReadContext::new(
+        to_arrow_schema(info.get_row_type())?,
+        Arc::new(info.get_row_type().clone()),
+        false,
+    );
+    let callbacks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut decoded = Vec::new();
+
+    for sequence in 0..3 {
+        for id in sequence * 64..(sequence + 1) * 64 {
+            let row = GenericRow {
+                values: vec![Datum::Int32(id)],
+            };
+            let record = WriteRecord::for_append(info.clone(), physical.clone(), 1, &row);
+            let handle = sender
+                .metadata
+                .with_write_metadata(&physical, |cluster, current_table| {
+                    sender
+                        .accumulator
+                        .append_routed(&record, cluster, current_table)
+                })?
+                .result_handle
+                .expect("accepted write has a result");
+            let callbacks = callbacks.clone();
+            // Inline batch dispatch is deliberate for this core unit test.
+            // The C++ binding's unchanged worker/queue has separate tests.
+            assert!(
+                WriteResultFuture::new(handle)
+                    .try_on_complete(
+                        move |result| callbacks.lock().push((id, result.is_ok())),
+                        WriteCallbackBatch::run,
+                    )
+                    .is_ok()
+            );
+        }
+        let mut drained = sender
+            .accumulator
+            .drain(cluster.clone(), &nodes, 1024 * 1024)?;
+        sender.add_to_inflight_batches(&drained);
+        let mut batches = drained.remove(&1).expect("ready batch");
+        assert_eq!(batches.len(), 1);
+        let mut batch = batches.pop().unwrap();
+        assert_eq!(batch.write_batch.batch_sequence(), sequence);
+        let records = LogRecordBatch::new(batch.write_batch.build()?);
+        for record in records.records(&read_context)? {
+            decoded.push(record.row().get_int(0)?);
+        }
+        // Merely accepting, draining and serializing must not report success.
+        assert_eq!(callbacks.lock().len(), (sequence * 64) as usize);
+        sender.complete_batch(batch);
+        let expected: Vec<_> = (0..(sequence + 1) * 64).map(|id| (id, true)).collect();
+        assert_eq!(*callbacks.lock(), expected);
+    }
+    assert_eq!(decoded, (0..192).collect::<Vec<_>>());
+    assert!(!sender.accumulator.has_incomplete());
+    Ok(())
 }
 
 async fn independent_completions(fast_error: FlussError) -> Result<()> {
