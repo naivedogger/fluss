@@ -200,6 +200,12 @@ equivalent algorithm under the same semantics.
   would need an explicit coverage contract.
 - Default plans use one logical split per selected `(partition, bucket)`.
   Native plans may use file/row-group tasks and engine-controlled parallelism.
+- The current context and default planner assume a uniform table-wide bucket
+  count. Preparation rejects live partitions reporting another count, and the
+  Paimon backend rejects selected lake tasks with another `total_buckets` value.
+  Per-partition bucket rescaling is not yet supported; rejecting it prevents
+  omitted log buckets and pruning with an incorrect hash modulus. Legacy
+  partition metadata without a count uses the table default.
 - The default PK overlay has no spill or hard memory cap. Fully superseded
   batches are released; partially live batches can retain obsolete buffers.
   Survivor output is incremental, but survivor indexes also consume memory.

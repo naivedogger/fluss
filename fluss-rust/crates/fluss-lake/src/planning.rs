@@ -138,6 +138,9 @@ pub(crate) async fn freeze_read_boundary_for_table(
             .list_partition_infos(table_path)
             .await
             .map_err(|error| planning_client_error("list table partitions", error))?;
+        for partition in &partition_infos {
+            validate_partition_bucket_count(partition, table_info.num_buckets)?;
+        }
         partition_infos.sort_by(|left, right| {
             left.get_partition_name()
                 .cmp(&right.get_partition_name())
@@ -185,6 +188,23 @@ pub(crate) async fn freeze_read_boundary_for_table(
         readable_lake_snapshot_id: readable_snapshot.map(|snapshot| snapshot.snapshot_id),
         bucket_ranges,
     })
+}
+
+/// The current context and bucket pruner carry one table-wide bucket count.
+/// Reject rescaled layouts rather than omit buckets or prune with the wrong hash.
+fn validate_partition_bucket_count(
+    partition: &PartitionInfo,
+    table_bucket_count: i32,
+) -> Result<()> {
+    let count = partition.get_bucket_count();
+    if count != table_bucket_count
+    {
+        return Err(FlussLakeError::PlanningFailed(format!(
+            "partition {} has {count} buckets, but bounded UnionRead currently requires the table bucket count {table_bucket_count}; per-partition bucket rescaling is not supported",
+            partition.get_partition_id()
+        )));
+    }
+    Ok(())
 }
 
 fn partition_identity(
@@ -361,6 +381,23 @@ fn planning_client_error(action: &str, error: ClientError) -> FlussLakeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_rescaled_partition_layouts_before_capturing_ranges() {
+        use fluss::metadata::ResolvedPartitionSpec;
+        use std::sync::Arc;
+
+        let spec =
+            ResolvedPartitionSpec::new(Arc::from(["region".to_string()]), vec!["US".to_string()])
+                .unwrap();
+        let partition = PartitionInfo::new(42, spec);
+        for count in [None, Some(4), Some(2), Some(8), Some(0), Some(-1)] {
+            let mut pb = partition.to_pb();
+            pb.bucket_count = count;
+            let result = validate_partition_bucket_count(&PartitionInfo::from_pb(&pb), 4);
+            assert_eq!(result.is_ok(), count == Some(4));
+        }
+    }
 
     fn root_range(
         snapshot_offset: Option<i64>,
