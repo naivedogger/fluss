@@ -15,14 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FIP-48 table, scan, and reader APIs.
+//! FIP-48 table and scan APIs.
 
-use crate::executor::execute_split;
 use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
-use crate::{
-    FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReadSplit, RecordBatchStream,
-    Result,
-};
+use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, RecordBatchStream, Result};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
@@ -99,6 +95,7 @@ impl FlussLakeTable {
             filter: None,
             batch_size: None,
             lake_only: false,
+            lake_source: None,
             catalog_property_overrides: self.catalog_property_overrides.clone(),
         }
     }
@@ -128,8 +125,8 @@ impl Debug for FlussLakeTable {
 
 /// Immutable configuration for one bounded FIP-48 read.
 ///
-/// This is the planner and reader input itself; it is not translated through a
-/// second request model before planning or execution.
+/// Planning freezes this configuration together with the source inputs.
+/// Create readers from the resulting plan, not from an independently configured scan.
 #[derive(Clone)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
@@ -138,11 +135,13 @@ pub struct FlussLakeScan {
     filter: Option<Predicate>,
     batch_size: Option<usize>,
     lake_only: bool,
+    pub(crate) lake_source: Option<Arc<dyn crate::LakeSource>>,
     catalog_property_overrides: HashMap<String, String>,
 }
 
 impl FlussLakeScan {
     /// Restricts output to table field indexes, in the requested order.
+    /// An empty projection preserves row counts in zero-column output batches.
     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
         self.projection = Some(FlussLakeProjection::Indices(projection));
         self
@@ -186,8 +185,8 @@ impl FlussLakeScan {
 
     /// Prepares source boundaries and builds the complete default read plan.
     ///
-    /// Existing `Table -> Scan -> Plan -> Reader` consumers need no changes.
-    /// Lake file planning uses the optional default lake backend.
+    /// Create the reader using `plan.new_reader()`. Lake planning and reading
+    /// use the injected source or the feature-selected default implementation.
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
         plan_union_read(self).await
     }
@@ -205,9 +204,12 @@ impl FlussLakeScan {
         plan_with_context(self, context).await
     }
 
-    /// Creates a reusable reader using this scan's immutable configuration.
-    pub fn new_reader(&self) -> FlussLakeReader {
-        FlussLakeReader { scan: self.clone() }
+    /// Use a lake backend instead of the feature-selected default implementation.
+    /// The source owns both task planning and reading; it may delegate either
+    /// operation to another compatible source. It must match the table format.
+    pub fn with_lake_source(mut self, source: Arc<dyn crate::LakeSource>) -> Self {
+        self.lake_source = Some(source);
+        self
     }
 
     pub(crate) fn connection(&self) -> &Arc<FlussConnection> {
@@ -273,6 +275,7 @@ impl FlussLakeScan {
         self.lake_only
     }
 
+    #[cfg(feature = "paimon")]
     pub(crate) fn catalog_property_overrides(&self) -> &HashMap<String, String> {
         &self.catalog_property_overrides
     }
@@ -286,19 +289,6 @@ impl FlussLakeScan {
         if self.batch_size == Some(0) {
             return Err(FlussLakeError::PlanningFailed(
                 "batch size must be greater than zero".to_string(),
-            ));
-        }
-        if self.projection.as_ref().is_some_and(|projection| {
-            matches!(
-                projection,
-                FlussLakeProjection::Indices(fields) if fields.is_empty()
-            ) || matches!(
-                projection,
-                FlussLakeProjection::Names(fields) if fields.is_empty()
-            )
-        }) {
-            return Err(FlussLakeError::PlanningFailed(
-                "output projection must not be empty when present".to_string(),
             ));
         }
         Ok(())
@@ -318,48 +308,6 @@ impl Debug for FlussLakeScan {
                 "catalog_property_override_count",
                 &self.catalog_property_overrides.len(),
             )
-            .finish()
-    }
-}
-
-/// Reusable bounded reader created by [`FlussLakeScan`].
-#[derive(Clone)]
-pub struct FlussLakeReader {
-    scan: FlussLakeScan,
-}
-
-impl FlussLakeReader {
-    /// Reads one logical split as a finite Arrow batch stream.
-    ///
-    /// The stream terminates after its first error. In particular,
-    /// [`FlussLakeError::DataUnavailable`] invalidates this plan attempt and no
-    /// later rows from the same split are emitted.
-    pub async fn read_split(&self, split: &FlussLakeReadSplit) -> Result<RecordBatchStream> {
-        execute_split(split.clone(), &self.scan).map(stop_after_first_error)
-    }
-
-    /// Reads all logical splits as one unordered finite stream.
-    ///
-    /// The first split error terminates the merged stream and drops every
-    /// sibling stream. If that error is [`FlussLakeError::DataUnavailable`],
-    /// callers must discard rows already produced by this plan, create a new
-    /// plan, and execute it from the beginning.
-    pub async fn read_splits(&self, splits: &[FlussLakeReadSplit]) -> Result<RecordBatchStream> {
-        let streams = splits
-            .iter()
-            .map(|split| execute_split(split.clone(), &self.scan))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(stop_after_first_error(Box::pin(
-            futures::stream::select_all(streams),
-        )))
-    }
-}
-
-impl Debug for FlussLakeReader {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FlussLakeReader")
-            .field("scan", &self.scan)
             .finish()
     }
 }
@@ -406,7 +354,7 @@ fn table_client_error(action: &str, error: ClientError) -> FlussLakeError {
 ///
 /// This is especially important for `read_splits`: dropping `select_all`
 /// cancels every sibling split as soon as one split invalidates the attempt.
-fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
+pub(crate) fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
     Box::pin(futures::stream::unfold(Some(stream), |stream| async move {
         let mut stream = stream?;
         match stream.next().await {
@@ -420,48 +368,14 @@ fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayRef, Int32Array};
+    use arrow::array::{ArrayRef, Int32Array};
     use fluss::metadata::{DataTypes, Schema};
-    use futures::TryStreamExt;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn reader_is_send_and_sync() {
-        assert_send_sync::<FlussLakeReader>();
-    }
-
-    #[test]
-    fn multiple_split_streams_are_exposed_as_one_stream() {
-        let batch = |value| {
-            arrow::record_batch::RecordBatch::try_from_iter(vec![(
-                "id",
-                Arc::new(Int32Array::from(vec![value])) as ArrayRef,
-            )])
-            .unwrap()
-        };
-        let streams: Vec<RecordBatchStream> = vec![
-            Box::pin(futures::stream::iter(vec![Ok(batch(1))])),
-            Box::pin(futures::stream::iter(vec![Ok(batch(2))])),
-        ];
-
-        let batches: Vec<_> =
-            futures::executor::block_on(futures::stream::select_all(streams).try_collect())
-                .unwrap();
-        let mut values: Vec<i32> = batches
-            .iter()
-            .map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .value(0)
-            })
-            .collect();
-        values.sort_unstable();
-
-        assert_eq!(values, vec![1, 2]);
+        assert_send_sync::<crate::FlussLakeReader>();
     }
 
     #[test]

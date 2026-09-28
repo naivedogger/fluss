@@ -49,7 +49,7 @@ pub enum FlussLakeError {
     #[error("unsupported merge engine: {0}")]
     UnsupportedMergeEngine(String),
 
-    /// Split descriptor version is newer than this reader supports.
+    /// Split or backend payload version is not supported by this reader.
     #[error("incompatible UnionRead split version: {0}")]
     IncompatibleSplitVersion(String),
 

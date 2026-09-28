@@ -28,6 +28,7 @@ use fluss::client::FlussAdmin;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{LakeSnapshotInfo, PartitionInfo, TableBucket, TableInfo, TablePath};
 use fluss::rpc::message::OffsetSpec;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 
 pub(crate) use crate::FlussLakeLogRange as FrozenBucketRange;
@@ -46,7 +47,7 @@ pub(crate) fn create_logical_split(
     schema_id: i32,
     bucket_range: &FrozenBucketRange,
     snapshot_id: Option<i64>,
-    lake_splits: Vec<String>,
+    lake_splits: Vec<crate::LakeSplit>,
     primary_key_indexes: Vec<usize>,
     statistics: SplitStatistics,
 ) -> Result<FlussLakeReadSplit> {
@@ -72,11 +73,8 @@ pub(crate) fn create_logical_split(
         (FlussLakePartitionIdentity::KeyValues(_), Some(partition_id)) => partition_id.to_string(),
         (FlussLakePartitionIdentity::KeyValues(key_values), None) => format!(
             "lake-only({})",
-            key_values
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join("/")
+            serde_json::to_string(key_values)
+                .map_err(|error| FlussLakeError::Internal(error.to_string()))?
         ),
         (FlussLakePartitionIdentity::Unpartitioned, Some(partition_id)) => {
             return Err(FlussLakeError::Internal(format!(
@@ -93,7 +91,7 @@ pub(crate) fn create_logical_split(
         bucket_range.table_bucket.bucket_id(),
         bucket_range.partition_identity.clone(),
         CURRENT_FLUSS_LAKE_SPLIT_VERSION,
-        descriptor.encode()?,
+        descriptor,
         statistics,
     )
 }
@@ -133,7 +131,7 @@ pub(crate) async fn freeze_read_boundary_for_table(
 
     let snapshot_offsets =
         collect_snapshot_offsets(table_path, table_info.table_id, readable_snapshot.as_ref())?;
-    let mut partitions = if table_info.partition_keys.is_empty() {
+    let partitions = if table_info.partition_keys.is_empty() {
         vec![(None, None, FlussLakePartitionIdentity::Unpartitioned)]
     } else {
         let mut partition_infos = admin
@@ -152,11 +150,21 @@ pub(crate) async fn freeze_read_boundary_for_table(
     };
 
     let bucket_ids: Vec<i32> = (0..table_info.num_buckets).collect();
-    let mut bucket_ranges = Vec::with_capacity(partitions.len() * bucket_ids.len());
-    for (partition_id, partition_name, partition_identity) in partitions.drain(..) {
-        let (earliest_offsets, latest_offsets) =
-            load_server_offsets(admin, table_path, partition_name.as_deref(), &bucket_ids).await?;
-
+    // Bound metadata fan-out and preserve the canonical partition order.
+    let mut partitions =
+        futures::stream::iter(partitions.into_iter().map(|(id, name, identity)| {
+            let bucket_ids = &bucket_ids;
+            async move {
+                let offsets =
+                    load_server_offsets(admin, table_path, name.as_deref(), bucket_ids).await?;
+                Ok::<_, FlussLakeError>((id, identity, offsets))
+            }
+        }))
+        .buffered(8);
+    let mut bucket_ranges = Vec::new();
+    while let Some((partition_id, partition_identity, (earliest_offsets, latest_offsets))) =
+        partitions.try_next().await?
+    {
         for bucket_id in &bucket_ids {
             let table_bucket =
                 TableBucket::new_with_partition(table_info.table_id, partition_id, *bucket_id);
@@ -430,7 +438,11 @@ mod tests {
             3,
             &range,
             Some(42),
-            vec!["{\"bucket\":2}".to_string()],
+            vec![crate::LakeSplit {
+                bucket_id: 2,
+                partition: range.partition_identity.clone(),
+                ..crate::source::testing_split()
+            }],
             Vec::new(),
             SplitStatistics::default(),
         )
@@ -460,13 +472,17 @@ mod tests {
             3,
             &range,
             Some(42),
-            vec!["{\"bucket\":2}".to_string()],
+            vec![crate::LakeSplit {
+                bucket_id: 2,
+                partition: range.partition_identity.clone(),
+                ..crate::source::testing_split()
+            }],
             Vec::new(),
             SplitStatistics::new(Some(3), Some(100)),
         )
         .unwrap();
 
-        assert!(split.split_id.contains("lake-only(region=US)"));
+        assert!(split.split_id.contains("lake-only("));
         assert_eq!(
             split.partition,
             FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())])
@@ -476,5 +492,34 @@ mod tests {
         assert_eq!(descriptor.table_bucket().partition_id(), None);
         assert_eq!(descriptor.start_offset(), 0);
         assert_eq!(descriptor.stop_offset(), 0);
+    }
+
+    #[test]
+    fn lake_only_split_ids_do_not_collide_on_partition_delimiters() {
+        let split = |a: &str, b: &str| {
+            let range = FrozenBucketRange::lake_only(
+                5,
+                0,
+                FlussLakePartitionIdentity::KeyValues(vec![
+                    ("a".into(), a.into()),
+                    ("b".into(), b.into()),
+                ]),
+            );
+            create_logical_split(
+                &TablePath::new("fluss", "orders"),
+                3,
+                &range,
+                Some(42),
+                vec![crate::LakeSplit {
+                    partition: range.partition_identity.clone(),
+                    ..crate::source::testing_split()
+                }],
+                Vec::new(),
+                SplitStatistics::default(),
+            )
+            .unwrap()
+        };
+        // Both used to produce "a=x/b=y/b=z" with delimiter concatenation.
+        assert_ne!(split("x/b=y", "z").split_id, split("x", "y/b=z").split_id);
     }
 }

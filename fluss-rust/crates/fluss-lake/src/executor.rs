@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::FlussLakeReadPlan;
 use crate::split_descriptor::SplitDescriptor;
-use crate::table::FlussLakeScan;
 use crate::{FlussLakeError, FlussLakeReadSplit, RecordBatchStream, Result};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
@@ -36,37 +36,37 @@ use std::sync::Arc;
 /// no-progress deadline; cancellation and query timeouts belong to the caller.
 const TAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Executes one opaque split with the configuration held by its scan.
+/// Executes a validated task using only its owning plan's configuration.
 pub(crate) fn execute_split(
-    split: FlussLakeReadSplit,
-    scan: &FlussLakeScan,
+    split: &FlussLakeReadSplit,
+    plan: &FlussLakeReadPlan,
 ) -> Result<RecordBatchStream> {
-    scan.validate_configuration()?;
-    // Structural validation fails fast; environment work is deferred to the
-    // first poll of the returned stream.
     let descriptor = split.decode_execution_descriptor()?;
-    execute_logical_split(descriptor, scan.clone())
-}
-
-fn execute_logical_split(
-    descriptor: SplitDescriptor,
-    scan: FlussLakeScan,
-) -> Result<RecordBatchStream> {
-    if descriptor.is_empty() || (scan.lake_only() && descriptor.lake_splits().is_empty()) {
+    if descriptor.is_empty()
+        || (plan.execution().scan.lake_only() && descriptor.lake_splits().is_empty())
+    {
         return Ok(Box::pin(futures::stream::empty()));
     }
-    Ok(lazy_stream(open_logical_stream(descriptor, scan)))
+    Ok(lazy_stream(open_logical_stream(
+        descriptor,
+        split.partition.clone(),
+        plan.clone(),
+    )))
 }
 
 async fn open_logical_stream(
     descriptor: SplitDescriptor,
-    scan: FlussLakeScan,
+    partition: crate::FlussLakePartitionIdentity,
+    plan: FlussLakeReadPlan,
 ) -> Result<RecordBatchStream> {
+    let execution = plan.execution();
+    let scan = &execution.scan;
     let table = scan
         .connection()
         .get_table(descriptor.table_path())
         .await
         .map_err(|error| execution_client_error("open Fluss table", error))?;
+    execution.context.validate_table(table.get_table_info())?;
     validate_frozen_identity(
         &table,
         descriptor.table_path(),
@@ -74,43 +74,68 @@ async fn open_logical_stream(
         descriptor.schema_id(),
     )?;
     if table.has_primary_key() != descriptor.is_primary_key() {
-        return Err(FlussLakeError::Internal(format!(
-            "logical split primary-key identity no longer matches table {}",
-            descriptor.table_path()
-        )));
+        return Err(FlussLakeError::SchemaIncompatible(
+            "split primary-key identity no longer matches table".to_string(),
+        ));
     }
-
     let table_info = table.get_table_info();
-    let output_projection = scan.resolve_projection(table_info.row_type())?;
-    let filter = BoundPredicate::bind(scan.filter(), table_info.row_type()).map_err(|error| {
-        FlussLakeError::PlanningFailed(format!("failed to bind filter predicate: {error}"))
-    })?;
+    let filter = &execution.filter;
     let physical = PhysicalProjection::resolve(
         table_info.row_type(),
-        output_projection.as_deref(),
-        &filter,
+        execution.output_projection.as_deref(),
+        filter,
         descriptor.primary_key_indexes(),
     )?;
     let physical_schema = physical.arrow_schema(table_info.row_type())?;
-    let lake_stream = normalize_stream_schema(
-        open_logical_lake_stream(
-            &descriptor,
+    let lake_stream = if descriptor.lake_splits().is_empty() {
+        Box::pin(futures::stream::empty()) as RecordBatchStream
+    } else {
+        let source = execution.lake_source.as_ref().ok_or_else(|| {
+            FlussLakeError::Internal("plan has lake tasks but no LakeSource".to_string())
+        })?;
+        let snapshot_id = descriptor
+            .snapshot_id()
+            .ok_or_else(|| FlussLakeError::Internal("lake tasks need a snapshot".to_string()))?;
+        let tasks = descriptor.lake_splits();
+        for task in tasks {
+            task.validate(source.format(), snapshot_id, table_info.num_buckets)?;
+            if task.bucket_id != descriptor.table_bucket().bucket_id()
+                || task.partition != partition
+            {
+                return Err(FlussLakeError::PlanningFailed(
+                    "lake task does not belong to the logical split".to_string(),
+                ));
+            }
+        }
+        let safe_filter = crate::source::lake_pushdown_filter(
+            filter,
             table_info,
-            scan.catalog_property_overrides(),
-            &physical,
-            &filter,
             descriptor.is_primary_key() && !scan.lake_only(),
         )
-        .await?,
-        physical_schema.clone(),
-    );
-
-    let output_column_count = output_projection.as_ref().map(Vec::len);
+        .unwrap_or(BoundPredicate::AlwaysTrue);
+        source
+            .read(crate::LakeReaderContext {
+                table_info,
+                snapshot_id,
+                semantics: if descriptor.is_primary_key() {
+                    crate::LakeReadSemantics::PrimaryKey
+                } else {
+                    crate::LakeReadSemantics::Append
+                },
+                splits: tasks,
+                projection: &physical.field_indexes,
+                schema: physical_schema.clone(),
+                filter: &safe_filter,
+            })
+            .await?
+    };
+    let lake_stream = normalize_stream_schema(lake_stream, physical_schema.clone());
+    let output_column_count = execution.output_projection.as_ref().map(Vec::len);
     let batch_size = scan.batch_size();
     if scan.lake_only() {
         return Ok(apply_output_processing(
             lake_stream,
-            &filter,
+            filter,
             output_column_count,
             batch_size,
         ));
@@ -122,78 +147,21 @@ async fn open_logical_stream(
         fold_logical_changelog_tail(&table, &descriptor, &physical, &mut current_view).await?;
         return Ok(apply_output_processing(
             reconciled_stream(current_view, lake_stream, batch_size.unwrap_or(4096)),
-            &filter,
+            filter,
             output_column_count,
             batch_size,
         ));
     }
-
     let log_stream = normalize_stream_schema(
         open_logical_append_log_stream(&table, &descriptor, &physical, scan.filter()).await?,
         physical_schema,
     );
     Ok(apply_output_processing(
         Box::pin(lake_stream.chain(log_stream)),
-        &filter,
+        filter,
         output_column_count,
         batch_size,
     ))
-}
-
-#[cfg(feature = "paimon")]
-async fn open_logical_lake_stream(
-    descriptor: &SplitDescriptor,
-    table_info: &fluss::metadata::TableInfo,
-    table_properties: &HashMap<String, String>,
-    physical: &PhysicalProjection,
-    filter: &BoundPredicate,
-    reconcile_primary_key: bool,
-) -> Result<RecordBatchStream> {
-    if descriptor.lake_splits().is_empty() {
-        return Ok(Box::pin(futures::stream::empty()));
-    }
-    let snapshot_id = descriptor.snapshot_id().ok_or_else(|| {
-        FlussLakeError::Internal(format!(
-            "logical split for {} carries lake splits without a pinned snapshot id",
-            descriptor.table_path()
-        ))
-    })?;
-    let catalog_options = crate::paimon::PaimonCatalogOptions::from_table_info_with_overrides(
-        table_info,
-        table_properties,
-    )?;
-    let projected_fields =
-        crate::paimon::projected_field_names(table_info.row_type(), Some(&physical.field_indexes))?;
-    let lake_filter =
-        crate::paimon::lake_pushdown_filter(filter, table_info, reconcile_primary_key);
-    crate::paimon::read_snapshot_splits(
-        descriptor.table_path(),
-        &catalog_options,
-        snapshot_id,
-        descriptor.table_bucket().bucket_id(),
-        Some(&projected_fields),
-        descriptor.lake_splits(),
-        lake_filter.as_ref(),
-    )
-    .await
-}
-
-#[cfg(not(feature = "paimon"))]
-async fn open_logical_lake_stream(
-    descriptor: &SplitDescriptor,
-    _table_info: &fluss::metadata::TableInfo,
-    _table_properties: &HashMap<String, String>,
-    _physical: &PhysicalProjection,
-    _filter: &BoundPredicate,
-    _reconcile_primary_key: bool,
-) -> Result<RecordBatchStream> {
-    if descriptor.lake_splits().is_empty() {
-        return Ok(Box::pin(futures::stream::empty()));
-    }
-    Err(FlussLakeError::Internal(format!(
-        "logical split for {} carries lake splits, but this build has no lake format feature enabled",
-        descriptor.table_path()
-    )))
 }
 
 async fn open_logical_append_log_stream(
@@ -331,6 +299,11 @@ impl PhysicalProjection {
             if !field_indexes.contains(primary_key_index) {
                 field_indexes.push(*primary_key_index);
             }
+        }
+        // Some readers cannot preserve row counts for a zero-column physical
+        // read. Read one hidden field and project it away after reconciliation.
+        if field_indexes.is_empty() && field_count > 0 {
+            field_indexes.push(0);
         }
         let key_positions = primary_key_indexes
             .iter()
@@ -775,6 +748,45 @@ mod tests {
 
     fn bound(predicate: Predicate) -> BoundPredicate {
         BoundPredicate::bind(Some(&predicate), &pk_row_type()).unwrap()
+    }
+
+    #[test]
+    fn empty_output_projection_preserves_filtered_row_counts() {
+        let filter = bound(col("amount").gt(10_i64));
+        let physical =
+            PhysicalProjection::resolve(&pk_row_type(), Some(&[]), &filter, &[0]).unwrap();
+        assert_eq!(physical.field_indexes, vec![2, 0]);
+        let schema = physical.arrow_schema(&pk_row_type()).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![5, 15, 25])),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let stream = apply_output_processing(
+            Box::pin(futures::stream::iter([Ok(batch)])),
+            &filter,
+            Some(0),
+            Some(1),
+        );
+        let batches = futures::executor::block_on(stream.try_collect::<Vec<_>>()).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.num_rows() == 1 && b.num_columns() == 0)
+        );
+
+        let physical = PhysicalProjection::resolve(
+            &pk_row_type(),
+            Some(&[]),
+            &BoundPredicate::AlwaysTrue,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(physical.field_indexes, vec![0]);
     }
 
     /// Setup work must not run until the stream is polled, and its failure

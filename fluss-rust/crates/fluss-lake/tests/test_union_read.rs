@@ -116,7 +116,7 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         reused_plan.read_context().to_json().unwrap(),
         context.to_json().unwrap()
     );
-    let ids_reader = ids_scan.new_reader();
+    let ids_reader = reused_plan.new_reader();
     let mut ids: Vec<i32> = Vec::new();
     for split in reused_plan.splits() {
         let batches = tokio::time::timeout(
@@ -184,7 +184,7 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             .is_empty()
     );
 
-    let read = scan.new_reader();
+    let read = plan.new_reader();
     let stream = read
         .read_split(&transported_split)
         .await
@@ -304,7 +304,7 @@ async fn stale_schema_split_is_rejected_after_alter_table() {
 
     // `read_split` is asynchronous and lazy: schema drift is an environment
     // failure, so it surfaces as the first item of the returned stream.
-    let read = scan.new_reader();
+    let read = plan.new_reader();
     let stream = read
         .read_split(&stale_split)
         .await

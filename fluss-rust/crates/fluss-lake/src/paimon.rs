@@ -20,8 +20,8 @@
 //! A Fluss table tiered to Paimon is mirrored one-to-one: the Paimon
 //! identifier is the Fluss `database.table`, and the catalog is configured by
 //! the table's `table.datalake.paimon.*` properties. Planning resolves a
-//! readable lake snapshot into immutable Paimon splits; execution reads one
-//! split back as a finite Arrow batch stream.
+//! readable lake snapshot into immutable Paimon splits; execution reads a
+//! partition/bucket group back as a finite Arrow batch stream.
 //!
 //! Only Parquet data files are supported: the pinned paimon-rust build has ORC
 //! reads disabled, so an ORC table fails at read time with an explicit
@@ -40,21 +40,68 @@ use paimon::spec::{
 };
 use paimon::table::Table;
 use paimon::{CatalogFactory, DataSplit, DeletionFile, Options};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+
+/// Default Paimon LakeSource. Planning and reading share the same catalog mapping.
+/// Credentials stay in this runtime object, never in the split payload.
+#[derive(Clone)]
+pub struct PaimonLakeSource {
+    catalog_options: PaimonCatalogOptions,
+}
+
+impl PaimonLakeSource {
+    /// Resolve the runtime catalog from table properties and explicit overrides.
+    pub fn new(table_info: &TableInfo, overrides: &HashMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            catalog_options: PaimonCatalogOptions::from_table_info_with_overrides(
+                table_info, overrides,
+            )?,
+        })
+    }
+}
+
+impl crate::LakeSource for PaimonLakeSource {
+    fn format(&self) -> &str {
+        "paimon"
+    }
+
+    fn plan<'a>(
+        &'a self,
+        context: crate::LakePlannerContext<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<crate::LakeSplit>>> {
+        Box::pin(async move {
+            let info = context.table_info;
+            plan_snapshot_splits(
+                &info.table_path,
+                &self.catalog_options,
+                context.snapshot_id,
+                ExpectedPaimonLayout {
+                    partition_keys: &info.partition_keys,
+                    primary_keys: &info.primary_keys,
+                    bucket_keys: &info.bucket_keys,
+                    num_buckets: info.num_buckets,
+                },
+                context.semantics == crate::LakeReadSemantics::PrimaryKey,
+                Some(context.filter),
+            )
+            .await
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        context: crate::LakeReaderContext<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<RecordBatchStream>> {
+        Box::pin(read_snapshot_splits(&self.catalog_options, context))
+    }
+}
 
 /// Property prefix carrying the Paimon catalog configuration of a table.
 const PAIMON_PROPERTY_PREFIX: &str = "table.datalake.paimon.";
 
 /// Paimon table option that pins a scan to one snapshot id.
 const PAIMON_SCAN_VERSION_OPTION: &str = "scan.version";
-
-#[derive(Debug, Default)]
-pub(crate) struct PlannedPaimonBucket {
-    pub(crate) splits: Vec<String>,
-    pub(crate) estimated_rows: Option<usize>,
-    pub(crate) estimated_size: Option<usize>,
-}
 
 pub(crate) struct ExpectedPaimonLayout<'a> {
     pub(crate) partition_keys: &'a [String],
@@ -185,81 +232,6 @@ pub(crate) fn projected_field_names(
         names.push(field.name().to_string());
     }
     Ok(names)
-}
-
-/// Selects the part of the exact core predicate that is safe to evaluate
-/// inside the Paimon baseline reader.
-///
-/// Append and lake-only reads may push the complete predicate. During a
-/// primary-key UnionRead, only primary-key predicates are immutable across
-/// the lake baseline and changelog tail. Mixed top-level `AND` expressions
-/// therefore contribute only their safe key conjuncts; `OR` is pushed only
-/// when every branch is key-only.
-pub(crate) fn lake_pushdown_filter(
-    predicate: &BoundPredicate,
-    table_info: &TableInfo,
-    reconcile_primary_key: bool,
-) -> Option<BoundPredicate> {
-    if matches!(predicate, BoundPredicate::AlwaysTrue) {
-        return None;
-    }
-    if !reconcile_primary_key {
-        return Some(predicate.clone());
-    }
-
-    let primary_key_indexes: HashSet<usize> = table_info
-        .primary_keys
-        .iter()
-        .filter_map(|key| {
-            table_info
-                .row_type()
-                .fields()
-                .iter()
-                .position(|field| field.name() == key)
-        })
-        .collect();
-    if primary_key_indexes.len() != table_info.primary_keys.len() {
-        return None;
-    }
-    project_predicate_to_fields(predicate, &primary_key_indexes)
-}
-
-fn project_predicate_to_fields(
-    predicate: &BoundPredicate,
-    allowed_fields: &HashSet<usize>,
-) -> Option<BoundPredicate> {
-    match predicate {
-        BoundPredicate::AlwaysTrue => None,
-        BoundPredicate::Leaf { field_index, .. } => allowed_fields
-            .contains(field_index)
-            .then(|| predicate.clone()),
-        BoundPredicate::Compound {
-            function: CompoundFunction::And,
-            children,
-        } => {
-            let children: Vec<_> = children
-                .iter()
-                .filter_map(|child| project_predicate_to_fields(child, allowed_fields))
-                .collect();
-            (!children.is_empty()).then_some(BoundPredicate::Compound {
-                function: CompoundFunction::And,
-                children,
-            })
-        }
-        BoundPredicate::Compound {
-            function: CompoundFunction::Or,
-            children,
-        } => {
-            let children: Option<Vec<_>> = children
-                .iter()
-                .map(|child| project_predicate_to_fields(child, allowed_fields))
-                .collect();
-            Some(BoundPredicate::Compound {
-                function: CompoundFunction::Or,
-                children: children?,
-            })
-        }
-    }
 }
 
 /// Converts a schema-bound core predicate into Paimon's predicate model.
@@ -420,8 +392,7 @@ fn decimal_to_i128(value: &fluss::row::Decimal) -> Option<i128> {
 
 /// Plans the immutable Paimon splits of one readable lake snapshot.
 ///
-/// Splits are returned as JSON so that they can be embedded in opaque split
-/// descriptors and shipped to execution workers.
+/// Backend payloads use portable JSON inside the lake split envelope.
 pub(crate) async fn plan_snapshot_splits(
     table_path: &TablePath,
     catalog_options: &PaimonCatalogOptions,
@@ -429,7 +400,7 @@ pub(crate) async fn plan_snapshot_splits(
     expected_layout: ExpectedPaimonLayout<'_>,
     validate_merge_engine: bool,
     pushdown_filter: Option<&BoundPredicate>,
-) -> Result<HashMap<(FlussLakePartitionIdentity, i32), PlannedPaimonBucket>> {
+) -> Result<Vec<crate::LakeSplit>> {
     let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
     if validate_merge_engine {
         ensure_deduplicate_merge_engine(table.schema().options(), table_path)?;
@@ -455,39 +426,27 @@ pub(crate) async fn plan_snapshot_splits(
         .await
         .map_err(|error| paimon_error("plan Paimon snapshot splits", error))?;
 
-    let mut grouped = HashMap::new();
-    for split in plan.splits() {
-        if split.snapshot_id() != snapshot_id {
-            return Err(FlussLakeError::PlanningFailed(format!(
-                "Paimon scan pinned to snapshot {snapshot_id} of {table_path} produced a split for snapshot {}",
-                split.snapshot_id()
-            )));
-        }
-        if split.bucket() < 0 {
-            return Err(FlussLakeError::PlanningFailed(format!(
-                "Paimon snapshot {snapshot_id} of {table_path} produced a split with negative bucket {}",
-                split.bucket()
-            )));
-        }
-        let partition = split_partition_identity(split, &partition_keys)?;
-        let bucket = grouped
-            .entry((partition, split.bucket()))
-            .or_insert_with(|| PlannedPaimonBucket {
-                splits: Vec::new(),
-                estimated_rows: Some(0),
-                estimated_size: Some(0),
-            });
-        bucket
-            .splits
-            .push(encode_portable_split(split, table.location())?);
-        bucket.estimated_rows = add_i64_estimate(bucket.estimated_rows, split.merged_row_count());
-        let split_size = split
-            .data_files()
-            .iter()
-            .try_fold(0_i64, |total, file| total.checked_add(file.file_size));
-        bucket.estimated_size = add_i64_estimate(bucket.estimated_size, split_size);
-    }
-    Ok(grouped)
+    plan.splits()
+        .iter()
+        .map(|split| {
+            let task = crate::LakeSplit {
+                format: "paimon".to_string(),
+                snapshot_id: split.snapshot_id(),
+                partition: split_partition_identity(split, &partition_keys)?,
+                bucket_id: split.bucket(),
+                estimated_rows: split
+                    .merged_row_count()
+                    .and_then(|v| usize::try_from(v).ok()),
+                estimated_size: split.data_files().iter().try_fold(0usize, |total, file| {
+                    total.checked_add(usize::try_from(file.file_size).ok()?)
+                }),
+                payload_version: 1,
+                payload: encode_portable_split(split, table.location())?.into_bytes(),
+            };
+            task.validate("paimon", snapshot_id, expected_layout.num_buckets)?;
+            Ok(task)
+        })
+        .collect()
 }
 
 fn validate_paimon_layout(
@@ -564,10 +523,6 @@ pub(crate) fn ensure_deduplicate_merge_engine(
         )));
     }
     Ok(())
-}
-
-fn add_i64_estimate(current: Option<usize>, increment: Option<i64>) -> Option<usize> {
-    current?.checked_add(usize::try_from(increment?).ok()?)
 }
 
 fn split_partition_identity(
@@ -673,19 +628,60 @@ fn encode_portable_split(split: &DataSplit, table_location: &str) -> Result<Stri
 /// apache/paimon-rust#374 the reader deduplicates keys across the splits it
 /// is given, which is exactly the per-bucket exactly-once guarantee the
 /// primary-key merge presumes.
-pub(crate) async fn read_snapshot_splits(
-    table_path: &TablePath,
+async fn read_snapshot_splits(
     catalog_options: &PaimonCatalogOptions,
-    snapshot_id: i64,
-    expected_bucket_id: i32,
-    projected_fields: Option<&[String]>,
-    encoded_splits: &[String],
-    pushdown_filter: Option<&BoundPredicate>,
+    context: crate::LakeReaderContext<'_>,
 ) -> Result<RecordBatchStream> {
-    let table = open_pinned_table(table_path, catalog_options, snapshot_id).await?;
-    let splits = encoded_splits
+    let info = context.table_info;
+    let snapshot_id = context.snapshot_id;
+    let Some(first) = context.splits.first() else {
+        return Ok(Box::pin(futures::stream::empty()));
+    };
+    let expected_bucket_id = first.bucket_id;
+    let table = open_pinned_table(&info.table_path, catalog_options, snapshot_id).await?;
+    if context.semantics == crate::LakeReadSemantics::PrimaryKey {
+        ensure_deduplicate_merge_engine(table.schema().options(), &info.table_path)?;
+    }
+    validate_paimon_layout(
+        &info.table_path,
+        table.schema().partition_keys(),
+        table.schema().primary_keys(),
+        table.schema().trimmed_primary_keys(),
+        table.schema().options(),
+        &ExpectedPaimonLayout {
+            partition_keys: &info.partition_keys,
+            primary_keys: &info.primary_keys,
+            bucket_keys: &info.bucket_keys,
+            num_buckets: info.num_buckets,
+        },
+    )?;
+    let splits = context
+        .splits
         .iter()
-        .map(|encoded| decode_portable_split(encoded, table.location()))
+        .map(|task| {
+            task.validate("paimon", snapshot_id, info.num_buckets)?;
+            if task.payload_version != 1 {
+                return Err(FlussLakeError::IncompatibleSplitVersion(
+                    "Paimon requires V1 lake task payloads".to_string(),
+                ));
+            }
+            if task.bucket_id != expected_bucket_id || task.partition != first.partition {
+                return Err(FlussLakeError::PlanningFailed(
+                    "Paimon read tasks must belong to one partition/bucket".to_string(),
+                ));
+            }
+            let encoded = std::str::from_utf8(&task.payload).map_err(|_| {
+                FlussLakeError::PlanningFailed("invalid Paimon split encoding".to_string())
+            })?;
+            let split = decode_portable_split(encoded, table.location())?;
+            if split_partition_identity(&split, table.schema().partition_keys())? != task.partition
+            {
+                return Err(FlussLakeError::PlanningFailed(
+                    "Paimon payload partition does not match its envelope".to_string(),
+                ));
+            }
+            Ok(split)
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut expected_bucket_path: Option<&str> = None;
     for split in &splits {
@@ -713,15 +709,12 @@ pub(crate) async fn read_snapshot_splits(
         }
     }
     let mut read_builder = table.new_read_builder();
-    if let Some(field_names) = projected_fields {
-        let borrowed: Vec<&str> = field_names.iter().map(String::as_str).collect();
-        read_builder
-            .with_projection(&borrowed)
-            .map_err(|error| paimon_error("apply Paimon read projection", error))?;
-    }
-    if let Some(filter) =
-        pushdown_filter.and_then(|filter| to_paimon_predicate(filter, table.schema().fields()))
-    {
+    let field_names = projected_field_names(info.row_type(), Some(context.projection))?;
+    let borrowed: Vec<&str> = field_names.iter().map(String::as_str).collect();
+    read_builder
+        .with_projection(&borrowed)
+        .map_err(|e| paimon_error("apply Paimon read projection", e))?;
+    if let Some(filter) = to_paimon_predicate(context.filter, table.schema().fields()) {
         read_builder.with_filter(filter);
     }
     let stream = read_builder
@@ -1033,48 +1026,6 @@ mod tests {
             0,
             0,
         )
-    }
-
-    fn pk_table_info() -> TableInfo {
-        let schema = Schema::builder()
-            .column("id", DataTypes::int())
-            .column("name", DataTypes::string())
-            .column("amount", DataTypes::bigint())
-            .primary_key(["id"])
-            .unwrap()
-            .build()
-            .unwrap();
-        TableInfo::new(
-            TablePath::new("fluss", "pk_orders"),
-            7,
-            1,
-            schema,
-            vec!["id".to_string()],
-            Vec::<String>::new().into(),
-            4,
-            HashMap::new(),
-            HashMap::new(),
-            None,
-            0,
-            0,
-        )
-    }
-
-    #[test]
-    fn pk_union_pushes_only_safe_primary_key_conjuncts() {
-        let table_info = pk_table_info();
-        let predicate = col("id").eq(1_i32).and(col("amount").gt(10_i64));
-        let bound = BoundPredicate::bind(Some(&predicate), table_info.row_type()).unwrap();
-
-        let union_filter = lake_pushdown_filter(&bound, &table_info, true).unwrap();
-        assert_eq!(union_filter.referenced_field_indexes(), vec![0]);
-
-        let lake_only_filter = lake_pushdown_filter(&bound, &table_info, false).unwrap();
-        assert_eq!(lake_only_filter.referenced_field_indexes(), vec![0, 2]);
-
-        let mixed_or = col("id").eq(1_i32).or(col("amount").gt(10_i64));
-        let mixed_or = BoundPredicate::bind(Some(&mixed_or), table_info.row_type()).unwrap();
-        assert!(lake_pushdown_filter(&mixed_or, &table_info, true).is_none());
     }
 
     #[test]

@@ -22,8 +22,8 @@ use crate::{FlussLakeError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Maximum split descriptor version supported by this reader.
-pub(crate) const CURRENT_FLUSS_LAKE_SPLIT_VERSION: u32 = 1;
+/// Exact split descriptor version supported by this reader.
+pub(crate) const CURRENT_FLUSS_LAKE_SPLIT_VERSION: u32 = 2;
 
 /// Estimated work attached to one logical split during planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,36 +60,20 @@ pub struct FlussLakeReadSplit {
     pub estimated_size: Option<usize>,
     /// Version of the private execution descriptor.
     pub descriptor_version: u32,
-    execution_descriptor: Vec<u8>,
+    execution_descriptor: SplitDescriptor,
 }
 
 impl FlussLakeReadSplit {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         split_id: String,
         bucket_id: i32,
         partition: FlussLakePartitionIdentity,
         descriptor_version: u32,
-        execution_descriptor: Vec<u8>,
+        execution_descriptor: SplitDescriptor,
         statistics: SplitStatistics,
     ) -> Result<Self> {
-        if descriptor_version > CURRENT_FLUSS_LAKE_SPLIT_VERSION {
+        if descriptor_version != CURRENT_FLUSS_LAKE_SPLIT_VERSION {
             return Err(incompatible_split_version(descriptor_version));
-        }
-        if descriptor_version == 0 {
-            return Err(FlussLakeError::Internal(
-                "split descriptor version must be greater than zero".to_string(),
-            ));
-        }
-        if split_id.is_empty() {
-            return Err(FlussLakeError::Internal(
-                "split id must not be empty".to_string(),
-            ));
-        }
-        if execution_descriptor.is_empty() {
-            return Err(FlussLakeError::Internal(
-                "execution descriptor must not be empty".to_string(),
-            ));
         }
         let split = Self {
             split_id,
@@ -105,15 +89,8 @@ impl FlussLakeReadSplit {
     }
 
     pub(crate) fn decode_execution_descriptor(&self) -> Result<SplitDescriptor> {
-        if self.descriptor_version == 0 {
-            return Err(FlussLakeError::Internal(
-                "split descriptor version must be greater than zero".to_string(),
-            ));
-        }
-        if self.execution_descriptor.is_empty() {
-            return Err(FlussLakeError::Internal(
-                "execution descriptor must not be empty".to_string(),
-            ));
+        if self.descriptor_version != CURRENT_FLUSS_LAKE_SPLIT_VERSION {
+            return Err(incompatible_split_version(self.descriptor_version));
         }
         if self.split_id.is_empty() {
             return Err(FlussLakeError::Internal(
@@ -128,7 +105,7 @@ impl FlussLakeReadSplit {
         }
         validate_partition_identity(&self.partition)?;
 
-        let descriptor = decode_descriptor(self.descriptor_version, &self.execution_descriptor)?;
+        let descriptor = self.execution_descriptor.clone().validate()?;
         if descriptor.table_bucket().bucket_id() != self.bucket_id {
             return Err(FlussLakeError::Internal(format!(
                 "public split bucket id {} does not match execution descriptor bucket id {}",
@@ -143,6 +120,15 @@ impl FlussLakeReadSplit {
             return Err(FlussLakeError::Internal(
                 "public split partition identity does not match the execution descriptor"
                     .to_string(),
+            ));
+        }
+        if descriptor
+            .lake_splits()
+            .iter()
+            .any(|task| task.partition != self.partition)
+        {
+            return Err(FlussLakeError::Internal(
+                "lake task partition does not match the logical split".to_string(),
             ));
         }
         Ok(descriptor)
@@ -174,16 +160,9 @@ fn validate_partition_identity(partition: &FlussLakePartitionIdentity) -> Result
     Ok(())
 }
 
-fn decode_descriptor(version: u32, encoded: &[u8]) -> Result<SplitDescriptor> {
-    match version {
-        1 => SplitDescriptor::decode(encoded),
-        version => Err(incompatible_split_version(version)),
-    }
-}
-
 fn incompatible_split_version(split_version: u32) -> FlussLakeError {
     FlussLakeError::IncompatibleSplitVersion(format!(
-        "split descriptor version {split_version} is newer than reader maximum supported version {CURRENT_FLUSS_LAKE_SPLIT_VERSION}"
+        "split descriptor version {split_version} is incompatible with reader version {CURRENT_FLUSS_LAKE_SPLIT_VERSION}"
     ))
 }
 
@@ -193,7 +172,7 @@ mod tests {
     use crate::split_descriptor::SplitDescriptor;
     use fluss::metadata::{TableBucket, TablePath};
 
-    fn descriptor() -> Vec<u8> {
+    fn descriptor() -> SplitDescriptor {
         SplitDescriptor::try_new(
             TablePath::new("fluss", "orders"),
             1,
@@ -205,8 +184,6 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
-        .unwrap()
-        .encode()
         .unwrap()
     }
 
@@ -257,11 +234,56 @@ mod tests {
 
         match error {
             FlussLakeError::IncompatibleSplitVersion(message) => {
+                assert!(message.contains("version 3"));
                 assert!(message.contains("version 2"));
-                assert!(message.contains("version 1"));
             }
             other => panic!("expected incompatible split version, got {other}"),
         }
+    }
+
+    #[test]
+    fn old_descriptor_version_is_not_silently_reinterpreted() {
+        assert!(matches!(
+            FlussLakeReadSplit::try_new(
+                "orders/root/0".to_string(),
+                0,
+                FlussLakePartitionIdentity::Unpartitioned,
+                1,
+                descriptor(),
+                SplitStatistics::default(),
+            ),
+            Err(FlussLakeError::IncompatibleSplitVersion(_))
+        ));
+    }
+
+    #[test]
+    fn lake_task_partition_must_match_the_logical_split() {
+        let mut task = crate::source::testing_split();
+        task.partition =
+            FlussLakePartitionIdentity::KeyValues(vec![("region".into(), "US".into())]);
+        let descriptor = SplitDescriptor::try_new(
+            TablePath::new("fluss", "orders"),
+            1,
+            true,
+            TableBucket::new_with_partition(5, Some(1), 0),
+            0,
+            10,
+            Some(42),
+            vec![task],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            FlussLakeReadSplit::try_new(
+                "orders/EU/0".into(),
+                0,
+                FlussLakePartitionIdentity::KeyValues(vec![("region".into(), "EU".into())]),
+                CURRENT_FLUSS_LAKE_SPLIT_VERSION,
+                descriptor,
+                SplitStatistics::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -280,8 +302,8 @@ mod tests {
         let error = split.decode_execution_descriptor().unwrap_err();
         match error {
             FlussLakeError::IncompatibleSplitVersion(message) => {
+                assert!(message.contains("version 3"));
                 assert!(message.contains("version 2"));
-                assert!(message.contains("version 1"));
             }
             other => panic!("expected incompatible split version, got {other}"),
         }
