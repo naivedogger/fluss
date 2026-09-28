@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FIP-48 table and scan APIs.
+//! Table and scan APIs for bounded UnionRead.
 
 use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
 use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, RecordBatchStream, Result};
@@ -123,7 +123,7 @@ impl Debug for FlussLakeTable {
     }
 }
 
-/// Immutable configuration for one bounded FIP-48 read.
+/// Immutable configuration for one bounded UnionRead.
 ///
 /// Planning freezes this configuration together with the source inputs.
 /// Create readers from the resulting plan, not from an independently configured scan.

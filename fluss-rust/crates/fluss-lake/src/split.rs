@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Serializable FIP-48 logical read split.
+//! Serializable logical read split for bounded UnionRead.
 
 use crate::split_descriptor::SplitDescriptor;
 use crate::{FlussLakeError, Result};
