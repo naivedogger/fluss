@@ -429,6 +429,7 @@ pub(crate) async fn plan_snapshot_splits(
     plan.splits()
         .iter()
         .map(|split| {
+            validate_split_bucket_count(split, expected_layout.num_buckets)?;
             let task = crate::LakeSplit {
                 format: "paimon".to_string(),
                 snapshot_id: split.snapshot_id(),
@@ -447,6 +448,16 @@ pub(crate) async fn plan_snapshot_splits(
             Ok(task)
         })
         .collect()
+}
+
+fn validate_split_bucket_count(split: &DataSplit, expected: i32) -> Result<()> {
+    if split.total_buckets() != expected {
+        return Err(FlussLakeError::PlanningFailed(format!(
+            "Paimon split has {} buckets, but bounded UnionRead currently requires the table bucket count {expected}; per-partition bucket rescaling is not supported",
+            split.total_buckets()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_paimon_layout(
@@ -674,6 +685,7 @@ async fn read_snapshot_splits(
                 FlussLakeError::PlanningFailed("invalid Paimon split encoding".to_string())
             })?;
             let split = decode_portable_split(encoded, table.location())?;
+            validate_split_bucket_count(&split, info.num_buckets)?;
             if split_partition_identity(&split, table.schema().partition_keys())? != task.partition
             {
                 return Err(FlussLakeError::PlanningFailed(
@@ -1260,6 +1272,22 @@ mod tests {
             paimon_error("open pinned snapshot", error),
             FlussLakeError::DataUnavailable(_)
         ));
+    }
+
+    #[test]
+    fn rejects_rescaled_lake_tasks_even_when_bucket_id_is_in_range() {
+        for total in [2, 4, 8] {
+            let split = DataSplit::builder()
+                .with_snapshot(42)
+                .with_partition(paimon::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("s3://warehouse/orders/bucket-0".to_string())
+                .with_total_buckets(total)
+                .with_data_files(Vec::new())
+                .build()
+                .unwrap();
+            assert_eq!(validate_split_bucket_count(&split, 4).is_ok(), total == 4);
+        }
     }
 
     #[test]
