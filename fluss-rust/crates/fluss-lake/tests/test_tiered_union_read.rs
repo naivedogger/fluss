@@ -100,7 +100,7 @@ async fn verify() {
     let scenario = required_env("FLUSS_RUST_UNION_READ_SCENARIO");
     assert!(matches!(
         scenario.as_str(),
-        "append" | "append-grow" | "append-shrink"
+        "append" | "pk" | "append-grow" | "append-shrink" | "pk-grow" | "pk-shrink"
     ));
     let connection = Arc::new(
         FlussConnection::new(Config {
@@ -156,13 +156,17 @@ async fn verify() {
     assert_eq!(plan.splits().len(), 1);
     let split: FlussLakeReadSplit =
         serde_json::from_slice(&serde_json::to_vec(&plan.splits()[0]).unwrap()).unwrap();
-    let expected = vec![
-        (1, "lake-old"),
-        (2, "lake-delete"),
-        (3, "lake-keep"),
-        (4, "tail-4"),
-        (5, "tail-5"),
-    ]
+    let expected = if scenario == "pk" {
+        vec![(1, "tail-new"), (3, "lake-keep"), (4, "tail-insert")]
+    } else {
+        vec![
+            (1, "lake-old"),
+            (2, "lake-delete"),
+            (3, "lake-keep"),
+            (4, "tail-4"),
+            (5, "tail-5"),
+        ]
+    }
     .into_iter()
     .map(|(id, name)| (id, name.to_owned()))
     .collect::<Vec<_>>();
@@ -260,6 +264,29 @@ async fn verify() {
     assert_eq!(rows(&batches), expected);
     assert_eq!(custom_source.plans.load(Ordering::Relaxed), 1);
     assert_eq!(custom_source.reads.load(Ordering::Relaxed), 1);
+    if scenario == "pk" {
+        // Filtering before reconciliation would resurrect old/removed baseline rows.
+        for (value, count) in [("lake-old", 0), ("lake-delete", 0), ("tail-new", 1)] {
+            let filtered = table
+                .new_scan()
+                .with_filter(col("name").eq(value))
+                .with_projection(vec![1]);
+            let plan = filtered.plan_with_context(&context).await.unwrap();
+            let batches = plan
+                .new_reader()
+                .read_splits(plan.splits())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                count
+            );
+            assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+        }
+    }
 }
 
 fn partition_rows(batches: &[RecordBatch]) -> Vec<(i32, String, String)> {
@@ -294,6 +321,7 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
     } else {
         (4, 2)
     };
+    let primary_key = scenario.starts_with("pk");
     let plan = table.new_scan().plan().await.unwrap();
     let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
     assert_eq!(context.num_buckets(), new_count);
@@ -320,11 +348,23 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
     for partition in ["old", "expired", "new"] {
         for id in 0..16 {
             baseline.push((id, format!("lake-{id}"), partition.to_string()));
-            expected.push((id, format!("lake-{id}"), partition.to_string()));
+            if primary_key && partition != "expired" && id == 1 {
+                continue;
+            }
+            let value = if primary_key && partition != "expired" && id == 0 {
+                "tail-update".into()
+            } else {
+                format!("lake-{id}")
+            };
+            expected.push((id, value, partition.to_string()));
         }
         if partition != "expired" {
-            for id in [16, 17] {
-                expected.push((id, format!("tail-{id}"), partition.into()));
+            if primary_key {
+                expected.push((16, "tail-insert".into(), partition.into()));
+            } else {
+                for id in [16, 17] {
+                    expected.push((id, format!("tail-{id}"), partition.into()));
+                }
             }
         }
     }
@@ -395,6 +435,18 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
             read(filtered).await,
             wanted,
             "partition pruning {partition}"
+        );
+    }
+    if primary_key {
+        let filtered = table
+            .new_scan()
+            .with_filter(col("name").eq("lake-0"))
+            .plan_with_context(&context)
+            .await
+            .unwrap();
+        assert_eq!(
+            read(filtered).await,
+            vec![(0, "lake-0".into(), "expired".into())]
         );
     }
 }

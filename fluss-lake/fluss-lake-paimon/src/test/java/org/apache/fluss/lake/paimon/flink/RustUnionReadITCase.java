@@ -19,6 +19,8 @@ package org.apache.fluss.lake.paimon.flink;
 
 import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.lake.paimon.testutils.FlinkPaimonTieringTestBase;
@@ -101,14 +103,17 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"append"})
+    @ValueSource(strings = {"append", "pk"})
     void testRustUnionRead(String scenario) throws Exception {
+        boolean primaryKey = scenario.equals("pk");
         TablePath tablePath = TablePath.of(DEFAULT_DB, "rust_union_read_" + scenario);
         Schema.Builder schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING());
-
+        if (primaryKey) {
+            schema.primaryKey("id");
+        }
         long tableId =
                 createTable(
                         tablePath,
@@ -125,14 +130,27 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
             writeRows(
                     tablePath,
                     Arrays.asList(row(1, "lake-old"), row(2, "lake-delete"), row(3, "lake-keep")),
-                    true);
+                    !primaryKey);
             long seam = latestOffset(tablePath);
             assertThat(seam).isGreaterThan(0);
+            if (primaryKey) {
+                triggerAndWaitSnapshot(tableId, 1);
+            }
             tierUntilReadable(
                     tablePath, Collections.singletonMap(new TableBucket(tableId, 0), seam));
 
             // No tiering job remains: these rows must be read from the Fluss log.
-            writeRows(tablePath, Arrays.asList(row(4, "tail-4"), row(5, "tail-5")), true);
+            if (primaryKey) {
+                try (Table table = conn.getTable(tablePath)) {
+                    UpsertWriter writer = table.newUpsert().createWriter();
+                    writer.upsert(row(1, "tail-new")).get();
+                    writer.delete(row(2, "lake-delete")).get();
+                    writer.upsert(row(4, "tail-insert")).get();
+                    writer.flush();
+                }
+            } else {
+                writeRows(tablePath, Arrays.asList(row(4, "tail-4"), row(5, "tail-5")), true);
+            }
             assertThat(latestOffset(tablePath)).isGreaterThan(seam);
             runRustVerifier(tablePath, scenario);
         } finally {
@@ -141,8 +159,9 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"append-grow", "append-shrink"})
+    @ValueSource(strings = {"append-grow", "append-shrink", "pk-grow", "pk-shrink"})
     void testRustUnionReadWithPartitionBucketCounts(String scenario) throws Exception {
+        boolean primaryKey = scenario.startsWith("pk");
         int oldCount = scenario.endsWith("grow") ? 2 : 4;
         int newCount = scenario.endsWith("grow") ? 4 : 2;
         TablePath path = TablePath.of(DEFAULT_DB, "rust_union_read_" + scenario.replace('-', '_'));
@@ -151,7 +170,9 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
                         .column("id", DataTypes.INT())
                         .column("name", DataTypes.STRING())
                         .column("region", DataTypes.STRING());
-
+        if (primaryKey) {
+            schema.primaryKey("id", "region");
+        }
         long tableId =
                 createTable(
                         path,
@@ -180,7 +201,7 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
                 for (int id = 0; id < 16; id++) {
                     baseline.add(row(id, "lake-" + id, partition));
                 }
-                writeRows(path, baseline, true);
+                writeRows(path, baseline, !primaryKey);
             }
             Map<TableBucket, Long> seams = new HashMap<>();
             for (PartitionInfo partition : admin.listPartitionInfos(path).get()) {
@@ -208,11 +229,21 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
             // This partition remains in the pinned lake snapshot, with its original count.
             admin.dropPartition(path, partitionSpec("expired"), false).get();
             for (String partition : Arrays.asList("old", "new")) {
-
-                writeRows(
-                        path,
-                        Arrays.asList(row(16, "tail-16", partition), row(17, "tail-17", partition)),
-                        true);
+                if (primaryKey) {
+                    try (Table table = conn.getTable(path)) {
+                        UpsertWriter writer = table.newUpsert().createWriter();
+                        writer.upsert(row(0, "tail-update", partition)).get();
+                        writer.delete(row(1, "lake-1", partition)).get();
+                        writer.upsert(row(16, "tail-insert", partition)).get();
+                        writer.flush();
+                    }
+                } else {
+                    writeRows(
+                            path,
+                            Arrays.asList(
+                                    row(16, "tail-16", partition), row(17, "tail-17", partition)),
+                            true);
+                }
             }
             runRustVerifier(path, scenario);
         } finally {

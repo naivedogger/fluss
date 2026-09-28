@@ -121,7 +121,7 @@ jobs:
           import xml.etree.ElementTree as ET
           report = 'fluss-lake/fluss-lake-paimon/target/surefire-reports/TEST-org.apache.fluss.lake.paimon.flink.RustUnionReadITCase.xml'
           suite = ET.parse(report).getroot()
-          assert int(suite.attrib['tests']) == 3, suite.attrib
+          assert int(suite.attrib['tests']) == 6, suite.attrib
           assert all(int(suite.attrib[key]) == 0 for key in ('failures', 'errors', 'skipped')), suite.attrib
           PYTHON
       - name: Upload test reports and logs

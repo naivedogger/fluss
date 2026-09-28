@@ -14,7 +14,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plan-bound append and lake-only UnionRead over frozen source inputs.
+//! Engine-neutral bounded lake and log read kernel for Apache Fluss.
+//!
+//! Union read is a bounded batch query. Results are delivered lazily as a
+//! finite stream of Arrow record batches.
+//!
+//! Three integration levels share the same source contract:
+//! - [`FlussLakeScan::plan`] and [`FlussLakeReadPlan::new_reader`] provide the
+//!   complete default reader, including lake access and reconciliation.
+//! - [`FlussLakeScan::with_lake_source`] replaces lake planning/reading while
+//!   retaining the default Fluss log reader and current-view reconciliation.
+//! - [`FlussLakeTable::prepare`] returns a portable [`FlussLakeReadContext`]
+//!   without a lake backend. Engines can use their own lake planners, readers,
+//!   reconciliation operators, and schedulers against these frozen inputs.
+//!
+//! A context is table-wide and independent of scan predicates and projection.
+//! It is not a retention lease or a global transactional snapshot.
 
 #![doc = include_str!("../README.md")]
 
