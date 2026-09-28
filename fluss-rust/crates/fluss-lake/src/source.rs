@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lake-format extension points, following Java's FIP-6 LakeSource model.
+//! Lake-format extension points for bounded UnionRead.
 //!
 //! A source owns lake planning, payload encoding and lake reading, not Fluss
-//! log boundaries or scheduling. Unlike Java's mutable pushdown configuration,
-//! each call receives an immutable request. This lets concurrent plans share a
-//! source without leaking projection or filter state between queries.
+//! log boundaries or scheduling. Each call receives an immutable request.
+//! This lets concurrent plans share a source without leaking projection or
+//! filter state between queries.
 
 use crate::{FlussLakeError, FlussLakePartitionIdentity, RecordBatchStream, Result};
 use arrow::datatypes::SchemaRef;
@@ -121,7 +121,7 @@ pub struct LakeReaderContext<'a> {
     pub filter: &'a BoundPredicate,
 }
 
-/// A lake backend, corresponding to Java's LakeSource planner/reader pair.
+/// A lake backend that owns task planning and baseline reading.
 ///
 /// `plan` and `read` are asynchronous rather than returning stateless factory
 /// wrappers. Implementations must not store request-specific mutable state.

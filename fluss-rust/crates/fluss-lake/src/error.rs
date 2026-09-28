@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Public FIP-48 error surface.
+//! Errors returned by bounded UnionRead planning and execution.
 
 use thiserror::Error;
 
