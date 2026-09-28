@@ -18,11 +18,12 @@
 //! Table and scan APIs for bounded UnionRead.
 
 use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
-use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, Result};
+use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, RecordBatchStream, Result};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
 use fluss::predicate::Predicate;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -184,8 +185,8 @@ impl FlussLakeScan {
 
     /// Prepares source boundaries and builds the complete default read plan.
     ///
-    /// Lake tasks use the injected source or the feature-selected default.
-    /// The default UnionRead executor is introduced in the next layer.
+    /// Create the reader using `plan.new_reader()`. Lake planning and reading
+    /// use the injected source or the feature-selected default implementation.
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
         plan_union_read(self).await
     }
@@ -264,6 +265,10 @@ impl FlussLakeScan {
 
     pub(crate) fn filter(&self) -> Option<&Predicate> {
         self.filter.as_ref()
+    }
+
+    pub(crate) fn batch_size(&self) -> Option<usize> {
+        self.batch_size
     }
 
     pub(crate) fn lake_only(&self) -> bool {
@@ -345,10 +350,55 @@ fn table_client_error(action: &str, error: ClientError) -> FlussLakeError {
     }
 }
 
+/// Makes the first stream error terminal and immediately drops the source.
+///
+/// This is especially important for `read_splits`: dropping `select_all`
+/// cancels every sibling split as soon as one split invalidates the attempt.
+pub(crate) fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
+    Box::pin(futures::stream::unfold(Some(stream), |stream| async move {
+        let mut stream = stream?;
+        match stream.next().await {
+            Some(Ok(batch)) => Some((Ok(batch), Some(stream))),
+            Some(Err(error)) => Some((Err(error), None)),
+            None => None,
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int32Array};
     use fluss::metadata::{DataTypes, Schema};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn reader_is_send_and_sync() {
+        assert_send_sync::<crate::FlussLakeReader>();
+    }
+
+    #[test]
+    fn reader_stream_stops_after_the_first_error() {
+        let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )])
+        .unwrap();
+        let source: RecordBatchStream = Box::pin(futures::stream::iter(vec![
+            Ok(batch.clone()),
+            Err(FlussLakeError::DataUnavailable(
+                "planned range expired".to_string(),
+            )),
+            Ok(batch),
+        ]));
+
+        let items = futures::executor::block_on(stop_after_first_error(source).collect::<Vec<_>>());
+
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(matches!(items[1], Err(FlussLakeError::DataUnavailable(_))));
+    }
 
     #[test]
     fn preconfigured_lake_format_is_not_readable_until_enabled() {

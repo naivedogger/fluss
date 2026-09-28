@@ -14,12 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Source preparation and extensible lake planning for bounded UnionRead.
+//! Plan-bound append and lake-only UnionRead over frozen source inputs.
 
 #![doc = include_str!("../README.md")]
 
 mod bucket_pruning;
 mod error;
+mod executor;
 #[cfg(feature = "paimon")]
 mod paimon;
 mod partition;
@@ -36,7 +37,7 @@ mod table;
 pub use error::{FlussLakeError, Result};
 #[cfg(feature = "paimon")]
 pub use paimon::PaimonLakeSource;
-pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
+pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan, FlussLakeReader};
 pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
 pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
 pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;

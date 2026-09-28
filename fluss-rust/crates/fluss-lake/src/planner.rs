@@ -265,13 +265,13 @@ async fn plan_prepared(
             statistics,
         )?);
     }
-    let statistics = crate::FlussLakePlanStatistics::from_splits(&splits);
-    Ok(FlussLakeReadPlan::new(
+    FlussLakeReadPlan::new(
         context.clone(),
         output_schema,
+        scan.clone(),
+        lake_source,
         splits,
-        statistics,
-    ))
+    )
 }
 
 fn partition_sort_key(partition: &crate::FlussLakePartitionIdentity) -> &[(String, String)] {
