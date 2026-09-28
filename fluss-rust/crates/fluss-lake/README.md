@@ -16,49 +16,61 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Bounded UnionRead source context
+# UnionRead lake sources and planning
 
-This layer exposes source preparation without a lake backend. It captures the
-readable lake snapshot and table-wide, half-open Fluss log ranges before query
-pruning. A context is not a retention lease or a global transactional snapshot.
+This layer adds `scan.plan()` and `plan_with_context()` to the source contract.
+Plans expose a frozen context, output schema, logical partition/bucket tasks and
+best-effort statistics. Readers over complete UnionRead plans follow in the next
+PR; this layer has no `new_reader()` API or execution placeholders.
 
 ```rust,no_run
-use fluss_lake::{FlussLakeTable, FlussLakeReadContext, Result};
+use fluss_lake::{FlussLakeTable, Result};
 
-async fn capture(table: &FlussLakeTable) -> Result<()> {
+async fn plan(table: &FlussLakeTable) -> Result<()> {
     let context = table.prepare().await?;
-    let received = FlussLakeReadContext::from_json(&context.to_json()?)?;
-    for range in received.log_ranges() {
-        range.validate_available()?;
-    }
+    let plan = table.new_scan().with_projection(vec![0])
+        .plan_with_context(&context).await?;
+    assert_eq!(plan.read_context().to_json()?, context.to_json()?);
     Ok(())
 }
 ```
 
-Native engines must validate live table identity, use the exact captured lake
-snapshot, include selected lake-only partitions, and reject unavailable required
-logs. Without a baseline the required log start is zero, not the earliest retained
-offset. Retry the whole attempt on missing frozen inputs rather than mixing bounds.
+`scan.with_lake_source(Arc<dyn LakeSource>)` selects a backend. Like Java FIP-6,
+the source owns lake planning, task payloads and reading. Rust passes immutable
+`LakePlannerContext` and `LakeReaderContext` rather than mutable pushdown state.
+The source can be used directly to plan and read its lake baseline; it does not
+read the Fluss tail or perform UnionRead reconciliation in this layer.
 
-This commit has no default lake planner or UnionRead reader. Those capabilities
-follow in separate PRs; no public methods return unimplemented placeholders.
-The new lake crate declares Rust 1.91. Core and binding MSRV declarations stay
-unchanged. There is no Paimon dependency in this layer.
+Enable `paimon` for `PaimonLakeSource`. It plans the exact pinned snapshot and
+reads complete partition/bucket task groups, checks layout and deduplicate lake
+semantics, and imports Paimon Arrow 58 into workspace Arrow 59 through the C Data
+Interface. Parquet is the supported file format. Without `paimon`, a custom
+source can implement the same contract without pulling in Paimon dependencies.
 
-The V2 context carries each live partition's actual bucket count; the table
-count is only the default for new partitions. Preparation captures every bucket
-using its partition's range, including old and new layouts after a default
-change. Legacy metadata without a count uses the table default. Invalid counts
-and inconsistent or incomplete transported layouts fail validation. V1 contexts
-are rejected rather than interpreted with different semantics. Core metadata
-preserves routing counts and offset/fetch RPCs send the actual partition count.
+A primary-key baseline must contain at most one live row per full key after lake
+version/deletion resolution. It need not be sorted. Custom sources must own a
+versioned payload codec, reject unknown versions, and keep credentials out of
+payloads. These are Rust extension points, not a stable binary ABI or a universal
+file-list protocol. Tasks must preserve Fluss partition/bucket ownership.
 
-Run from the Rust workspace:
+Context JSON is V2; private logical split descriptors are V3; lake payloads have
+backend-owned versions. Source boundaries are not retention leases. Missing
+required inputs must fail rather than refresh the snapshot. Preparation does
+not apply a scan filter to its table-wide context. Default planning may prune
+selected buckets and includes lake-only partitions absent from live Fluss.
+
+Each live partition keeps its captured bucket count after a table-default
+change. Lake tasks carry their actual partition count, including expired
+lake-only partitions. The planner validates live/lake and sibling consistency,
+and uses one bucket pruner per distinct count. Paimon verifies payload counts
+against task envelopes rather than treating its current default as every
+partition's layout. Existing partitions are not redistributed.
+
+`fluss-lake` uses Rust 1.91 with or without the optional Paimon 0.3 backend.
+The core workspace MSRV is unchanged. Run from the Rust workspace:
 
 ```bash
 cargo +1.91.0 test -p fluss-lake --locked
-cargo +1.91.0 test -p fluss-lake --features integration_tests --test test_prepare --locked
+cargo +1.91.0 test -p fluss-lake --features paimon --locked
+cargo +1.91.0 clippy -p fluss-lake --all-features --all-targets --locked -- -D warnings
 ```
-
-The integration test uses the existing Docker Fluss cluster utilities and needs
-no shared warehouse mount or running tiering job.

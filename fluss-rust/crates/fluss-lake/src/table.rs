@@ -17,8 +17,8 @@
 
 //! Table and scan APIs for bounded UnionRead.
 
-use crate::planner::prepare_read_context;
-use crate::{FlussLakeError, FlussLakeReadContext, Result};
+use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
+use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, Result};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
@@ -94,6 +94,7 @@ impl FlussLakeTable {
             filter: None,
             batch_size: None,
             lake_only: false,
+            lake_source: None,
             catalog_property_overrides: self.catalog_property_overrides.clone(),
         }
     }
@@ -123,8 +124,8 @@ impl Debug for FlussLakeTable {
 
 /// Immutable configuration for one bounded UnionRead.
 ///
-/// This is the planner and reader input itself; it is not translated through a
-/// second request model before planning or execution.
+/// Planning freezes this configuration together with the source inputs.
+/// Create readers from the resulting plan, not from an independently configured scan.
 #[derive(Clone)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
@@ -133,11 +134,13 @@ pub struct FlussLakeScan {
     filter: Option<Predicate>,
     batch_size: Option<usize>,
     lake_only: bool,
+    pub(crate) lake_source: Option<Arc<dyn crate::LakeSource>>,
     catalog_property_overrides: HashMap<String, String>,
 }
 
 impl FlussLakeScan {
     /// Restricts output to table field indexes, in the requested order.
+    /// An empty projection preserves row counts in zero-column output batches.
     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
         self.projection = Some(FlussLakeProjection::Indices(projection));
         self
@@ -173,10 +176,39 @@ impl FlussLakeScan {
     /// Captures source boundaries for an engine-native or default execution.
     ///
     /// Projection and filter are validated but do not prune this table-wide
-    /// context. The host engine applies them when executing the frozen context.
+    /// context. They are applied by `plan_with_context` or by the host engine.
     /// No lake catalog or file reader is opened by this method.
     pub async fn prepare(&self) -> Result<FlussLakeReadContext> {
         prepare_read_context(self).await
+    }
+
+    /// Prepares source boundaries and builds the complete default read plan.
+    ///
+    /// Lake tasks use the injected source or the feature-selected default.
+    /// The default UnionRead executor is introduced in the next layer.
+    pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
+        plan_union_read(self).await
+    }
+
+    /// Builds a default plan without choosing new snapshots or log offsets.
+    ///
+    /// The context must refer to this table. Metadata drift is rejected.
+    /// Different scans may share a context without sharing predicates or
+    /// projection. Engines implementing their own UnionRead can instead
+    /// consume the public context directly and skip this default planner.
+    pub async fn plan_with_context(
+        &self,
+        context: &FlussLakeReadContext,
+    ) -> Result<FlussLakeReadPlan> {
+        plan_with_context(self, context).await
+    }
+
+    /// Use a lake backend instead of the feature-selected default implementation.
+    /// The source owns both task planning and reading; it may delegate either
+    /// operation to another compatible source. It must match the table format.
+    pub fn with_lake_source(mut self, source: Arc<dyn crate::LakeSource>) -> Self {
+        self.lake_source = Some(source);
+        self
     }
 
     pub(crate) fn connection(&self) -> &Arc<FlussConnection> {
@@ -232,6 +264,15 @@ impl FlussLakeScan {
 
     pub(crate) fn filter(&self) -> Option<&Predicate> {
         self.filter.as_ref()
+    }
+
+    pub(crate) fn lake_only(&self) -> bool {
+        self.lake_only
+    }
+
+    #[cfg(feature = "paimon")]
+    pub(crate) fn catalog_property_overrides(&self) -> &HashMap<String, String> {
+        &self.catalog_property_overrides
     }
 
     pub(crate) fn validate_configuration(&self) -> Result<()> {

@@ -14,15 +14,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Portable source preparation for bounded lake and log reads.
+//! Source preparation and extensible lake planning for bounded UnionRead.
+
 #![doc = include_str!("../README.md")]
+
+mod bucket_pruning;
 mod error;
+#[cfg(feature = "paimon")]
+mod paimon;
 mod partition;
+mod plan;
 mod planner;
 mod planning;
+mod pruning;
 mod read_context;
+mod source;
+mod split;
+mod split_descriptor;
 mod table;
+
 pub use error::{FlussLakeError, Result};
-pub use partition::FlussLakePartitionIdentity;
+#[cfg(feature = "paimon")]
+pub use paimon::PaimonLakeSource;
+pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
 pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
+pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
+pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;
+pub use split::{FlussLakePartitionIdentity, FlussLakeReadSplit};
 pub use table::{FlussLakeScan, FlussLakeTable};
+
+use arrow::record_batch::RecordBatch;
+use futures::Stream;
+use std::pin::Pin;
+
+/// A finite stream of Arrow record batches produced from bounded UnionRead splits.
+///
+/// Despite the `Stream` name, this represents a bounded batch result. The
+/// stream terminates after the immutable split boundary has been consumed.
+pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
