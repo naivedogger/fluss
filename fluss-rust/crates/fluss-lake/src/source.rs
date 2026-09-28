@@ -60,6 +60,8 @@ pub struct LakeSplit {
     pub snapshot_id: i64,
     pub partition: FlussLakePartitionIdentity,
     pub bucket_id: i32,
+    /// Actual bucket count of this lake partition, not the current table default.
+    pub bucket_count: i32,
     pub estimated_rows: Option<usize>,
     pub estimated_size: Option<usize>,
     pub payload_version: u32,
@@ -67,11 +69,12 @@ pub struct LakeSplit {
 }
 
 impl LakeSplit {
-    pub(crate) fn validate(&self, format: &str, snapshot_id: i64, num_buckets: i32) -> Result<()> {
+    pub(crate) fn validate(&self, format: &str, snapshot_id: i64) -> Result<()> {
         if self.format != format
             || self.snapshot_id != snapshot_id
             || self.bucket_id < 0
-            || self.bucket_id >= num_buckets
+            || self.bucket_count <= 0
+            || self.bucket_id >= self.bucket_count
             || self.payload_version == 0
             || self.payload.is_empty()
         {
@@ -90,6 +93,7 @@ impl Debug for LakeSplit {
             .field("snapshot_id", &self.snapshot_id)
             .field("partition", &self.partition)
             .field("bucket_id", &self.bucket_id)
+            .field("bucket_count", &self.bucket_count)
             .field("payload_version", &self.payload_version)
             .field("payload_size", &self.payload.len())
             .finish_non_exhaustive()
@@ -229,6 +233,7 @@ pub(crate) fn testing_split() -> LakeSplit {
         snapshot_id: 42,
         partition: FlussLakePartitionIdentity::Unpartitioned,
         bucket_id: 0,
+        bucket_count: 4,
         estimated_rows: Some(3),
         estimated_size: None,
         payload_version: 1,
@@ -272,11 +277,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<RecordBatchStream>> {
             Box::pin(async move {
                 for task in context.splits {
-                    task.validate(
-                        self.format(),
-                        context.snapshot_id,
-                        context.table_info.num_buckets,
-                    )?;
+                    task.validate(self.format(), context.snapshot_id)?;
                     if task.payload_version != 1 {
                         return Err(FlussLakeError::IncompatibleSplitVersion(
                             "testing source supports V1".into(),

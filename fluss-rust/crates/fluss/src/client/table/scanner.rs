@@ -2356,7 +2356,10 @@ impl LogFetcher {
                             bucket_id: bucket.bucket_id(),
                             fetch_offset: offset,
                             max_fetch_bytes: self.fetch_max_bytes_for_bucket,
-                            routing_bucket_count: None,
+                            routing_bucket_count: self
+                                .metadata
+                                .get_cluster()
+                                .get_routing_bucket_count(&bucket),
                         };
 
                         fetch_log_req_for_buckets
@@ -2854,6 +2857,54 @@ mod tests {
         assert_eq!(predicate.leaf.as_ref().expect("leaf").field_id, 0);
         // Both fields must travel together, and the id pins the field ids.
         assert_eq!(table_req.filter_schema_id, Some(table_info.get_schema_id()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_requests_carry_partition_routing_counts_not_the_table_default() -> Result<()> {
+        use crate::cluster::Cluster;
+        use crate::proto::{MetadataResponse, PbBucketMetadata, PbPartitionMetadata, PbServerNode};
+        let path = TablePath::new("db", "orders");
+        let info = build_table_info(path.clone(), 7, 4);
+        let origin = build_cluster_arc(&path, 7, 4);
+        let response = MetadataResponse {
+            tablet_servers: vec![PbServerNode {
+                node_id: 1,
+                host: "localhost".into(),
+                port: 9124,
+                ..Default::default()
+            }],
+            partition_metadata: [(9, 2), (10, 8)]
+                .into_iter()
+                .map(|(id, count)| PbPartitionMetadata {
+                    table_id: 7,
+                    partition_id: id,
+                    partition_name: format!("p{id}"),
+                    bucket_count: Some(count),
+                    bucket_metadata: vec![PbBucketMetadata {
+                        bucket_id: 0,
+                        leader_id: Some(1),
+                        ..Default::default()
+                    }],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let metadata = Arc::new(Metadata::new_for_test(Arc::new(
+            Cluster::from_metadata_response(response, Some(&origin))?,
+        )));
+        let status = Arc::new(LogScannerStatus::new());
+        for partition in [9, 10] {
+            status.assign_scan_bucket(TableBucket::new_with_partition(7, Some(partition), 0), 0);
+        }
+        let fetcher = filtering_fetcher(&info, &metadata, status, None)?;
+        let requests = fetcher.prepare_fetch_log_requests().await;
+        let actual: HashMap<_, _> = requests[&1].tables_req[0]
+            .buckets_req
+            .iter()
+            .map(|b| (b.partition_id.unwrap(), b.routing_bucket_count.unwrap()))
+            .collect();
+        assert_eq!(actual, HashMap::from([(9, 2), (10, 8)]));
         Ok(())
     }
 

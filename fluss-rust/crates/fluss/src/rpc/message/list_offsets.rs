@@ -90,6 +90,10 @@ impl ListOffsetsRequest {
             },
         }
     }
+    pub(crate) fn with_routing_bucket_count(mut self, count: Option<i32>) -> Self {
+        self.inner_request.routing_bucket_count = count;
+        self
+    }
 }
 
 impl RequestBody for ListOffsetsRequest {
@@ -135,6 +139,20 @@ impl ListOffsetsResponse {
 mod tests {
     use super::*;
     use crate::proto::{ListOffsetsResponse, PbListOffsetsRespForBucket};
+
+    #[test]
+    fn routing_count_is_encoded_without_changing_requested_buckets() {
+        for count in [None, Some(2), Some(8)] {
+            let request = ListOffsetsRequest::new(7, Some(9), vec![0, 1], OffsetSpec::Latest)
+                .with_routing_bucket_count(count);
+            let decoded =
+                proto::ListOffsetsRequest::decode(request.inner_request.encode_to_vec().as_slice())
+                    .unwrap();
+            assert_eq!(decoded.routing_bucket_count, count);
+            assert_eq!(decoded.bucket_id, vec![0, 1]);
+            assert_eq!(decoded.partition_id, Some(9));
+        }
+    }
 
     #[test]
     fn offsets_returns_api_error_on_error_code() {

@@ -98,7 +98,7 @@ async fn open_logical_stream(
             .ok_or_else(|| FlussLakeError::Internal("lake tasks need a snapshot".to_string()))?;
         let tasks = descriptor.lake_splits();
         for task in tasks {
-            task.validate(source.format(), snapshot_id, table_info.num_buckets)?;
+            task.validate(source.format(), snapshot_id)?;
             if task.bucket_id != descriptor.table_bucket().bucket_id()
                 || task.partition != partition
             {

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Exact split descriptor version supported by this reader.
-pub(crate) const CURRENT_FLUSS_LAKE_SPLIT_VERSION: u32 = 2;
+pub(crate) const CURRENT_FLUSS_LAKE_SPLIT_VERSION: u32 = 3;
 
 /// Estimated work attached to one logical split during planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -234,8 +234,8 @@ mod tests {
 
         match error {
             FlussLakeError::IncompatibleSplitVersion(message) => {
+                assert!(message.contains("version 4"));
                 assert!(message.contains("version 3"));
-                assert!(message.contains("version 2"));
             }
             other => panic!("expected incompatible split version, got {other}"),
         }
@@ -243,17 +243,19 @@ mod tests {
 
     #[test]
     fn old_descriptor_version_is_not_silently_reinterpreted() {
-        assert!(matches!(
-            FlussLakeReadSplit::try_new(
-                "orders/root/0".to_string(),
-                0,
-                FlussLakePartitionIdentity::Unpartitioned,
-                1,
-                descriptor(),
-                SplitStatistics::default(),
-            ),
-            Err(FlussLakeError::IncompatibleSplitVersion(_))
-        ));
+        for version in [1, 2] {
+            assert!(matches!(
+                FlussLakeReadSplit::try_new(
+                    "orders/root/0".to_string(),
+                    0,
+                    FlussLakePartitionIdentity::Unpartitioned,
+                    version,
+                    descriptor(),
+                    SplitStatistics::default(),
+                ),
+                Err(FlussLakeError::IncompatibleSplitVersion(_))
+            ));
+        }
     }
 
     #[test]
@@ -302,8 +304,8 @@ mod tests {
         let error = split.decode_execution_descriptor().unwrap_err();
         match error {
             FlussLakeError::IncompatibleSplitVersion(message) => {
+                assert!(message.contains("version 4"));
                 assert!(message.contains("version 3"));
-                assert!(message.contains("version 2"));
             }
             other => panic!("expected incompatible split version, got {other}"),
         }

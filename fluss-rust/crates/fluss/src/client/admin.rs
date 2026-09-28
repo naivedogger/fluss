@@ -470,7 +470,10 @@ impl FlussAdmin {
         let mut list_offsets_requests = HashMap::new();
         for (leader_id, bucket_ids) in node_for_bucket_list {
             let request =
-                ListOffsetsRequest::new(table_id, partition_id, bucket_ids, offset_spec.clone());
+                ListOffsetsRequest::new(table_id, partition_id, bucket_ids, offset_spec.clone())
+                    .with_routing_bucket_count(cluster.get_routing_bucket_count(
+                        &TableBucket::new_with_partition(table_id, partition_id, 0),
+                    ));
             list_offsets_requests.insert(leader_id, request);
         }
         Ok(list_offsets_requests)

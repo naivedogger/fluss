@@ -24,10 +24,14 @@ import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.lake.paimon.testutils.FlinkPaimonTieringTestBase;
+import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.FileUtils;
@@ -47,8 +51,11 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -129,7 +136,8 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
             if (primaryKey) {
                 triggerAndWaitSnapshot(tableId, 1);
             }
-            tierUntilReadable(tablePath, new TableBucket(tableId, 0), seam);
+            tierUntilReadable(
+                    tablePath, Collections.singletonMap(new TableBucket(tableId, 0), seam));
 
             // No tiering job remains: these rows must be read from the Fluss log.
             if (primaryKey) {
@@ -150,7 +158,104 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
         }
     }
 
-    private void tierUntilReadable(TablePath path, TableBucket bucket, long seam) throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"append-grow", "append-shrink", "pk-grow", "pk-shrink"})
+    void testRustUnionReadWithPartitionBucketCounts(String scenario) throws Exception {
+        boolean primaryKey = scenario.startsWith("pk");
+        int oldCount = scenario.endsWith("grow") ? 2 : 4;
+        int newCount = scenario.endsWith("grow") ? 4 : 2;
+        TablePath path = TablePath.of(DEFAULT_DB, "rust_union_read_" + scenario.replace('-', '_'));
+        Schema.Builder schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("region", DataTypes.STRING());
+        if (primaryKey) {
+            schema.primaryKey("id", "region");
+        }
+        long tableId =
+                createTable(
+                        path,
+                        TableDescriptor.builder()
+                                .schema(schema.build())
+                                .partitionedBy("region")
+                                .distributedBy(oldCount, "id")
+                                .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                                .property(
+                                        ConfigOptions.TABLE_DATALAKE_FRESHNESS,
+                                        Duration.ofSeconds(1))
+                                .customProperty("paimon.file.format", "parquet")
+                                .build());
+        try {
+            for (String partition : Arrays.asList("old", "expired", "new")) {
+                if (partition.equals("new")) {
+                    admin.alterTable(
+                                    path,
+                                    Collections.singletonList(
+                                            TableChange.modifyBucketCount(newCount)),
+                                    false)
+                            .get();
+                }
+                admin.createPartition(path, partitionSpec(partition), false).get();
+                List<InternalRow> baseline = new ArrayList<>();
+                for (int id = 0; id < 16; id++) {
+                    baseline.add(row(id, "lake-" + id, partition));
+                }
+                writeRows(path, baseline, !primaryKey);
+            }
+            Map<TableBucket, Long> seams = new HashMap<>();
+            for (PartitionInfo partition : admin.listPartitionInfos(path).get()) {
+                String value = partition.getResolvedPartitionSpec().getPartitionValues().get(0);
+                assertThat(partition.getBucketCount())
+                        .isEqualTo(value.equals("new") ? newCount : oldCount);
+                for (int bucket = 0; bucket < partition.getBucketCount(); bucket++) {
+                    long offset =
+                            admin.listOffsets(
+                                            path,
+                                            partition.getPartitionName(),
+                                            Collections.singletonList(bucket),
+                                            new OffsetSpec.LatestSpec())
+                                    .bucketResult(bucket)
+                                    .get(10, TimeUnit.SECONDS);
+                    if (offset > 0) {
+                        seams.put(
+                                new TableBucket(tableId, partition.getPartitionId(), bucket),
+                                offset);
+                    }
+                }
+            }
+            assertThat(seams).isNotEmpty();
+            tierUntilReadable(path, seams);
+            // This partition remains in the pinned lake snapshot, with its original count.
+            admin.dropPartition(path, partitionSpec("expired"), false).get();
+            for (String partition : Arrays.asList("old", "new")) {
+                if (primaryKey) {
+                    try (Table table = conn.getTable(path)) {
+                        UpsertWriter writer = table.newUpsert().createWriter();
+                        writer.upsert(row(0, "tail-update", partition)).get();
+                        writer.delete(row(1, "lake-1", partition)).get();
+                        writer.upsert(row(16, "tail-insert", partition)).get();
+                        writer.flush();
+                    }
+                } else {
+                    writeRows(
+                            path,
+                            Arrays.asList(
+                                    row(16, "tail-16", partition), row(17, "tail-17", partition)),
+                            true);
+                }
+            }
+            runRustVerifier(path, scenario);
+        } finally {
+            admin.dropTable(path, false).get();
+        }
+    }
+
+    private static PartitionSpec partitionSpec(String value) {
+        return new PartitionSpec(Collections.singletonMap("region", value));
+    }
+
+    private void tierUntilReadable(TablePath path, Map<TableBucket, Long> seams) throws Exception {
         MiniClusterWithClientResource miniCluster =
                 new MiniClusterWithClientResource(
                         new MiniClusterResourceConfiguration.Builder()
@@ -171,10 +276,15 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
                                         admin.getReadableLakeSnapshot(path)
                                                 .get(10, TimeUnit.SECONDS);
                                 return snapshot.getSnapshotId() >= 0
-                                        && Long.valueOf(seam)
-                                                .equals(
-                                                        snapshot.getTableBucketsOffset()
-                                                                .get(bucket));
+                                        && seams.entrySet().stream()
+                                                .allMatch(
+                                                        entry ->
+                                                                entry.getValue()
+                                                                        .equals(
+                                                                                snapshot.getTableBucketsOffset()
+                                                                                        .get(
+                                                                                                entry
+                                                                                                        .getKey())));
                             } catch (ExecutionException e) {
                                 if (e.getCause() instanceof LakeTableSnapshotNotExistException) {
                                     return false;
@@ -184,7 +294,7 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
                         },
                         Duration.ofMinutes(2),
                         Duration.ofMillis(200),
-                        "readable Paimon snapshot did not reach baseline offset " + seam);
+                        "readable Paimon snapshot did not reach baseline offsets " + seams);
             } finally {
                 job.cancel().get(30, TimeUnit.SECONDS);
             }

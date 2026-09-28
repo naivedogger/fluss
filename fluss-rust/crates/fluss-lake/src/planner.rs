@@ -112,18 +112,27 @@ async fn plan_prepared(
         context.partition_keys(),
         &filter,
     );
-    let bucket_pruner = BucketPruner::new(
-        context.table_schema().row_type(),
-        context.bucket_keys(),
-        context.num_buckets(),
-        table_info
-            .table_config
-            .get_datalake_format()
-            .map_err(|error| {
-                FlussLakeError::PlanningFailed(format!("invalid lake format: {error}"))
-            })?,
-        &filter,
-    );
+    let lake_format = table_info
+        .table_config
+        .get_datalake_format()
+        .map_err(|error| FlussLakeError::PlanningFailed(format!("invalid lake format: {error}")))?;
+    // Partitions retain their own hash modulus after a table-default change.
+    // Cache once per distinct layout, rather than re-encoding keys per bucket.
+    let mut bucket_pruners = std::collections::HashMap::new();
+    let mut bucket_may_match = |bucket_id, bucket_count| {
+        bucket_pruners
+            .entry(bucket_count)
+            .or_insert_with(|| {
+                BucketPruner::new(
+                    context.table_schema().row_type(),
+                    context.bucket_keys(),
+                    bucket_count,
+                    &lake_format,
+                    &filter,
+                )
+            })
+            .bucket_may_match(bucket_id)
+    };
     let is_primary_key = table_info.has_primary_key();
     if is_primary_key && !scan.lake_only() {
         validate_pk_union_merge_engine(table_info)?;
@@ -167,14 +176,20 @@ async fn plan_prepared(
                     filter: &safe_filter,
                 })
                 .await?;
-            group_lake_splits(tasks, source.format(), snapshot_id, table_info)?
+            group_lake_splits(
+                tasks,
+                source.format(),
+                snapshot_id,
+                table_info,
+                context.log_ranges(),
+            )?
         }
         _ => std::collections::HashMap::new(),
     };
     let mut splits = Vec::new();
     for bucket_range in context.log_ranges() {
         let bucket_id = bucket_range.table_bucket().bucket_id();
-        if !bucket_pruner.bucket_may_match(bucket_id)
+        if !bucket_may_match(bucket_id, bucket_range.bucket_count())
             || !partition_pruner.partition_identity_may_match(bucket_range.partition_identity())
         {
             continue;
@@ -209,15 +224,9 @@ async fn plan_prepared(
         },
     );
     for ((partition, bucket_id), planned_lake_bucket) in lake_only_buckets {
-        if bucket_id < 0 || bucket_id >= table_info.num_buckets {
-            return Err(FlussLakeError::PlanningFailed(format!(
-                "lake snapshot {} of {} contains bucket {bucket_id}, outside the configured range [0, {})",
-                snapshot_id.unwrap_or_default(),
-                scan.table_path(),
-                table_info.num_buckets
-            )));
-        }
-        if !bucket_pruner.bucket_may_match(bucket_id)
+        // Nonempty groups have a validated, uniform lake-partition layout.
+        let bucket_count = planned_lake_bucket.splits[0].bucket_count;
+        if !bucket_may_match(bucket_id, bucket_count)
             || !partition_pruner.partition_identity_may_match(&partition)
         {
             continue;
@@ -239,6 +248,7 @@ async fn plan_prepared(
         let lake_only_range = crate::planning::FrozenBucketRange::lake_only(
             table_info.table_id,
             bucket_id,
+            bucket_count,
             partition,
         );
         let statistics = SplitStatistics::new(
@@ -359,12 +369,30 @@ fn group_lake_splits(
     format: &str,
     snapshot_id: i64,
     info: &TableInfo,
+    log_ranges: &[crate::FlussLakeLogRange],
 ) -> Result<std::collections::HashMap<(crate::FlussLakePartitionIdentity, i32), PlannedLakeBucket>>
 {
     let mut grouped = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
+    let mut bucket_counts: std::collections::HashMap<_, _> = log_ranges
+        .iter()
+        .map(|range| (range.partition_identity(), range.bucket_count()))
+        .collect();
+    if info.partition_keys.is_empty() {
+        bucket_counts.insert(
+            &crate::FlussLakePartitionIdentity::Unpartitioned,
+            info.num_buckets,
+        );
+    }
     for task in &tasks {
-        task.validate(format, snapshot_id, info.num_buckets)?;
+        task.validate(format, snapshot_id)?;
+        if let Some(count) = bucket_counts.insert(&task.partition, task.bucket_count)
+            && count != task.bucket_count
+        {
+            return Err(FlussLakeError::PlanningFailed(
+                "lake partition bucket count conflicts with its frozen Fluss layout or another lake task".to_string()
+            ));
+        }
         if !seen.insert((
             &task.partition,
             task.bucket_id,
@@ -474,19 +502,67 @@ mod tests {
         let task = crate::source::testing_split();
         let mut second = task.clone();
         second.payload = b"another-task".to_vec();
-        let groups = group_lake_splits(vec![task.clone(), second], "paimon", 42, &info).unwrap();
+        let groups =
+            group_lake_splits(vec![task.clone(), second], "paimon", 42, &info, &[]).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups.values().next().unwrap().splits.len(), 2);
-        assert!(group_lake_splits(vec![task.clone(), task.clone()], "paimon", 42, &info).is_err());
-        assert!(group_lake_splits(vec![task.clone()], "iceberg", 42, &info).is_err());
-        assert!(group_lake_splits(vec![task.clone()], "paimon", 43, &info).is_err());
+        assert!(
+            group_lake_splits(vec![task.clone(), task.clone()], "paimon", 42, &info, &[]).is_err()
+        );
+        assert!(group_lake_splits(vec![task.clone()], "iceberg", 42, &info, &[]).is_err());
+        assert!(group_lake_splits(vec![task.clone()], "paimon", 43, &info, &[]).is_err());
         let mut invalid = task.clone();
         invalid.bucket_id = info.num_buckets;
-        assert!(group_lake_splits(vec![invalid], "paimon", 42, &info).is_err());
+        assert!(group_lake_splits(vec![invalid], "paimon", 42, &info, &[]).is_err());
         let mut invalid = task;
         invalid.partition =
             crate::FlussLakePartitionIdentity::KeyValues(vec![("unknown".into(), "v".into())]);
-        assert!(group_lake_splits(vec![invalid], "paimon", 42, &info).is_err());
+        assert!(group_lake_splits(vec![invalid], "paimon", 42, &info, &[]).is_err());
+    }
+
+    #[test]
+    fn lake_layout_uses_actual_live_and_expired_partition_counts() {
+        let info = pk_table_info(vec!["region".into()], HashMap::new());
+        let identity = |value: &str| {
+            crate::FlussLakePartitionIdentity::KeyValues(vec![("region".into(), value.into())])
+        };
+        // The table default is 4, but this old live partition retains 8 buckets.
+        let ranges = (0..8)
+            .map(|bucket| crate::FlussLakeLogRange {
+                table_bucket: fluss::metadata::TableBucket::new_with_partition(7, Some(9), bucket),
+                partition_identity: identity("old"),
+                bucket_count: 8,
+                start_offset: 0,
+                stop_offset: 1,
+                earliest_offset: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut live = crate::source::testing_split();
+        live.partition = identity("old");
+        live.bucket_count = 8;
+        live.bucket_id = 7;
+        let mut expired = live.clone();
+        expired.partition = identity("expired");
+        let groups = group_lake_splits(
+            vec![live.clone(), expired.clone()],
+            "paimon",
+            42,
+            &info,
+            &ranges,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2);
+        // Neither a valid id nor a query filter excuses a wrong live layout.
+        let mut wrong = live;
+        wrong.bucket_count = 4;
+        wrong.bucket_id = 0;
+        assert!(group_lake_splits(vec![wrong], "paimon", 42, &info, &ranges).is_err());
+        let mut conflicting = expired.clone();
+        conflicting.bucket_count = 4;
+        conflicting.bucket_id = 0;
+        assert!(
+            group_lake_splits(vec![expired, conflicting], "paimon", 42, &info, &ranges).is_err()
+        );
     }
 
     /// Catalog configuration belongs to the plan-bound reader and must not
