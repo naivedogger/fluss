@@ -2059,11 +2059,10 @@ impl LogFetcher {
                     return Ok(None);
                 }
                 FetchErrorAction::LogOffsetOutOfRange => {
-                    return Err(Error::UnexpectedError {
+                    return Err(Error::LogOffsetOutOfRange {
                         message: format!(
                             "The fetching offset {fetch_offset} is out of range: {error_message}"
                         ),
-                        source: None,
                     });
                 }
                 FetchErrorAction::Authorization => {
@@ -2357,7 +2356,10 @@ impl LogFetcher {
                             bucket_id: bucket.bucket_id(),
                             fetch_offset: offset,
                             max_fetch_bytes: self.fetch_max_bytes_for_bucket,
-                            routing_bucket_count: None,
+                            routing_bucket_count: self
+                                .metadata
+                                .get_cluster()
+                                .get_routing_bucket_count(&bucket),
                         };
 
                         fetch_log_req_for_buckets
@@ -2859,6 +2861,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_requests_carry_partition_routing_counts_not_the_table_default() -> Result<()> {
+        use crate::cluster::Cluster;
+        use crate::proto::{MetadataResponse, PbBucketMetadata, PbPartitionMetadata, PbServerNode};
+        let path = TablePath::new("db", "orders");
+        let info = build_table_info(path.clone(), 7, 4);
+        let origin = build_cluster_arc(&path, 7, 4);
+        let response = MetadataResponse {
+            tablet_servers: vec![PbServerNode {
+                node_id: 1,
+                host: "localhost".into(),
+                port: 9124,
+                ..Default::default()
+            }],
+            partition_metadata: [(9, 2), (10, 8)]
+                .into_iter()
+                .map(|(id, count)| PbPartitionMetadata {
+                    table_id: 7,
+                    partition_id: id,
+                    partition_name: format!("p{id}"),
+                    bucket_count: Some(count),
+                    bucket_metadata: vec![PbBucketMetadata {
+                        bucket_id: 0,
+                        leader_id: Some(1),
+                        ..Default::default()
+                    }],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let metadata = Arc::new(Metadata::new_for_test(Arc::new(
+            Cluster::from_metadata_response(response, Some(&origin))?,
+        )));
+        let status = Arc::new(LogScannerStatus::new());
+        for partition in [9, 10] {
+            status.assign_scan_bucket(TableBucket::new_with_partition(7, Some(partition), 0), 0);
+        }
+        let fetcher = filtering_fetcher(&info, &metadata, status, None)?;
+        let requests = fetcher.prepare_fetch_log_requests().await;
+        let actual: HashMap<_, _> = requests[&1].tables_req[0]
+            .buckets_req
+            .iter()
+            .map(|b| (b.partition_id.unwrap(), b.routing_bucket_count.unwrap()))
+            .collect();
+        assert_eq!(actual, HashMap::from([(9, 2), (10, 8)]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn prepare_fetch_log_requests_omits_an_absent_filter() -> Result<()> {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let table_info = build_table_info(table_path.clone(), 1, 1);
@@ -3018,6 +3068,30 @@ mod tests {
             metrics: Arc::clone(&fetcher.metrics),
             request_start_time: Instant::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_fetches_preserves_typed_offset_out_of_range() -> Result<()> {
+        let table_path = TablePath::new("db", "tbl");
+        let table_info = build_table_info(table_path.clone(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster_arc(&table_path, 1, 1)));
+        let status = Arc::new(LogScannerStatus::new());
+        let bucket = TableBucket::new(1, 0);
+        status.assign_scan_bucket(bucket.clone(), 5);
+        let fetcher = filtering_fetcher(&table_info, &metadata, status.clone(), None)?;
+        let mut response = filtered_response(None, None);
+        let bucket_response = &mut response.tables_resp[0].buckets_resp[0];
+        bucket_response.error_code = Some(FlussError::LogOffsetOutOfRangeException.code());
+        bucket_response.error_message = Some("retained prefix expired".to_string());
+        LogFetcher::handle_fetch_response(response, test_response_context(&fetcher, &metadata))
+            .await;
+
+        let error = fetcher.collect_fetches().await.err().expect("offset error");
+        assert!(matches!(error, Error::LogOffsetOutOfRange { .. }));
+        assert!(error.to_string().contains("offset 5"));
+        assert!(error.to_string().contains("retained prefix expired"));
+        assert_eq!(status.get_bucket_offset(&bucket), Some(5));
+        Ok(())
     }
 
     #[tokio::test]

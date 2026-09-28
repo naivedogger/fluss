@@ -268,6 +268,7 @@ impl Display for ResolvedPartitionSpec {
 pub struct PartitionInfo {
     partition_id: PartitionId,
     partition_spec: ResolvedPartitionSpec,
+    bucket_count: Option<i32>,
 }
 
 impl PartitionInfo {
@@ -275,12 +276,20 @@ impl PartitionInfo {
         Self {
             partition_id,
             partition_spec,
+            bucket_count: None,
         }
     }
 
     /// Get the partition id. The id is globally unique in the Fluss cluster.
     pub fn get_partition_id(&self) -> PartitionId {
         self.partition_id
+    }
+
+    /// Actual bucket count reported by the server, or `None` for legacy metadata.
+    ///
+    /// This may differ from the table default after a bucket-count change.
+    pub fn get_bucket_count(&self) -> Option<i32> {
+        self.bucket_count
     }
 
     /// Get the partition name.
@@ -301,7 +310,7 @@ impl PartitionInfo {
             partition_id: self.partition_id,
             partition_spec: self.partition_spec.to_pb(),
             remote_data_dir: None,
-            bucket_count: None,
+            bucket_count: self.bucket_count,
         }
     }
 
@@ -309,6 +318,7 @@ impl PartitionInfo {
         Self {
             partition_id: pb.partition_id,
             partition_spec: ResolvedPartitionSpec::from_pb(&pb.partition_spec),
+            bucket_count: pb.bucket_count,
         }
     }
 }
@@ -456,6 +466,22 @@ mod tests {
 
         assert_eq!(info.get_partition_id(), restored.get_partition_id());
         assert_eq!(info.get_partition_name(), restored.get_partition_name());
+    }
+
+    #[test]
+    fn partition_info_preserves_reported_and_legacy_bucket_counts() {
+        let spec =
+            ResolvedPartitionSpec::new(Arc::from(["region".to_string()]), vec!["US".to_string()])
+                .unwrap();
+        let legacy = PartitionInfo::new(42, spec);
+        assert_eq!(legacy.get_bucket_count(), None);
+        for bucket_count in [None, Some(1), Some(8)] {
+            let mut pb = legacy.to_pb();
+            pb.bucket_count = bucket_count;
+            let info = PartitionInfo::from_pb(&pb);
+            assert_eq!(info.get_bucket_count(), bucket_count);
+            assert_eq!(info.to_pb(), pb);
+        }
     }
 
     #[test]

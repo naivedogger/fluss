@@ -42,6 +42,7 @@ pub struct Cluster {
     table_info_by_path: HashMap<TablePath, TableInfo>,
     partitions_id_by_path: HashMap<Arc<PhysicalTablePath>, PartitionId>,
     partition_name_by_id: HashMap<PartitionId, String>,
+    partition_bucket_counts: HashMap<(TableId, PartitionId), i32>,
 }
 
 impl Cluster {
@@ -75,6 +76,7 @@ impl Cluster {
             table_info_by_path,
             partitions_id_by_path,
             partition_name_by_id,
+            partition_bucket_counts: HashMap::new(),
         }
     }
 
@@ -103,6 +105,7 @@ impl Cluster {
             self.table_info_by_path.clone(),
             self.partitions_id_by_path.clone(),
         )
+        .with_partition_bucket_counts(self.partition_bucket_counts.clone())
     }
 
     pub fn invalidate_physical_table_meta(
@@ -121,6 +124,7 @@ impl Cluster {
             self.table_info_by_path.clone(),
             self.partitions_id_by_path.clone(),
         )
+        .with_partition_bucket_counts(self.partition_bucket_counts.clone())
     }
 
     /// Returns a copy without `table_path`'s id, info, partitions and bucket
@@ -160,6 +164,7 @@ impl Cluster {
             table_info_by_path,
             partitions_id_by_path,
         )
+        .with_partition_bucket_counts(self.partition_bucket_counts.clone())
     }
 
     pub fn update(&mut self, cluster: Cluster) {
@@ -174,6 +179,7 @@ impl Cluster {
             table_info_by_path,
             partitions_id_by_path,
             partition_name_by_id,
+            partition_bucket_counts,
         } = cluster;
         self.coordinator_server = coordinator_server;
         self.alive_tablet_servers_by_id = alive_tablet_servers_by_id;
@@ -185,6 +191,7 @@ impl Cluster {
         self.table_info_by_path = table_info_by_path;
         self.partitions_id_by_path = partitions_id_by_path;
         self.partition_name_by_id = partition_name_by_id;
+        self.partition_bucket_counts = partition_bucket_counts;
     }
 
     fn filter_bucket_locations_by_path(
@@ -243,6 +250,9 @@ impl Cluster {
         metadata_response: MetadataResponse,
         origin_cluster: Option<&Cluster>,
     ) -> Result<Cluster> {
+        let mut partition_bucket_counts = origin_cluster
+            .map(|c| c.partition_bucket_counts.clone())
+            .unwrap_or_default();
         let mut servers = HashMap::with_capacity(metadata_response.tablet_servers.len());
         for pb_server in metadata_response.tablet_servers {
             let server_id = pb_server.node_id;
@@ -313,6 +323,17 @@ impl Cluster {
                 let partition_name = partition_metadata.partition_name;
                 let table_path = cluster.get_table_path_by_id(table_id).unwrap();
                 let partition_id = partition_metadata.partition_id;
+                let bucket_count = partition_metadata
+                    .bucket_count
+                    .unwrap_or(cluster.get_table(table_path)?.num_buckets);
+                if bucket_count <= 0 {
+                    return Err(Error::IllegalArgument {
+                        message: format!(
+                            "invalid bucket count {bucket_count} for partition {partition_id}"
+                        ),
+                    });
+                }
+                partition_bucket_counts.insert((table_id, partition_id), bucket_count);
 
                 let physical_table_path = Arc::new(PhysicalTablePath::of_partitioned(
                     Arc::new(table_path.clone()),
@@ -350,7 +371,8 @@ impl Cluster {
             table_id_by_path,
             table_info_by_path,
             partitions_id_by_path,
-        ))
+        )
+        .with_partition_bucket_counts(partition_bucket_counts))
     }
 
     pub fn get_coordinator_server(&self) -> Option<&ServerNode> {
@@ -390,6 +412,33 @@ impl Cluster {
             partition_id,
             bucket_id,
         ))
+    }
+
+    /// Actual routing count from partition metadata, or the nonpartitioned table count.
+    /// Missing partition metadata must not fall back to a newer table default.
+    pub(crate) fn get_routing_bucket_count(&self, bucket: &TableBucket) -> Option<i32> {
+        match bucket.partition_id() {
+            Some(partition) => self
+                .partition_bucket_counts
+                .get(&(bucket.table_id(), partition))
+                .copied(),
+            None => self
+                .get_table_path_by_id(bucket.table_id())
+                .and_then(|path| self.opt_get_table(path))
+                .map(|info| info.num_buckets),
+        }
+    }
+
+    fn with_partition_bucket_counts(
+        mut self,
+        mut counts: HashMap<(TableId, PartitionId), i32>,
+    ) -> Self {
+        counts.retain(|(table, partition), _| {
+            self.table_path_by_id.contains_key(table)
+                && self.partition_name_by_id.contains_key(partition)
+        });
+        self.partition_bucket_counts = counts;
+        self
     }
 
     pub fn get_partition_id(&self, physical_table_path: &PhysicalTablePath) -> Option<PartitionId> {
@@ -533,6 +582,65 @@ mod tests {
             ServerNode::new(2, "ts2-host".to_string(), 9125, ServerType::TabletServer),
         );
         servers
+    }
+
+    #[test]
+    fn partition_routing_counts_survive_refresh_invalidation_and_eviction() {
+        use crate::proto::PbPartitionMetadata;
+        let path = TablePath::new("db", "orders");
+        let origin = crate::test_utils::build_cluster(&path, 7, 4);
+        let response = |count| MetadataResponse {
+            partition_metadata: vec![PbPartitionMetadata {
+                table_id: 7,
+                partition_id: 9,
+                partition_name: "old".into(),
+                bucket_count: count,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bucket = TableBucket::new_with_partition(7, Some(9), 0);
+        for count in [None, Some(2), Some(8)] {
+            let cluster = Cluster::from_metadata_response(response(count), Some(&origin)).unwrap();
+            let expected = Some(count.unwrap_or(4));
+            assert_eq!(cluster.get_routing_bucket_count(&bucket), expected);
+            assert_eq!(
+                cluster.get_routing_bucket_count(&TableBucket::new(7, 0)),
+                Some(4)
+            );
+            assert_eq!(
+                cluster.get_routing_bucket_count(&TableBucket::new_with_partition(7, Some(99), 0)),
+                None
+            );
+            let refreshed =
+                Cluster::from_metadata_response(MetadataResponse::default(), Some(&cluster))
+                    .unwrap();
+            assert_eq!(refreshed.get_routing_bucket_count(&bucket), expected);
+            assert_eq!(
+                cluster
+                    .invalidate_server(&1, vec![7])
+                    .get_routing_bucket_count(&bucket),
+                expected
+            );
+            let physical =
+                PhysicalTablePath::of_partitioned(Arc::new(path.clone()), Some("old".into()));
+            assert_eq!(
+                cluster
+                    .invalidate_physical_table_meta(&HashSet::from([physical]))
+                    .get_routing_bucket_count(&bucket),
+                expected
+            );
+            let mut updated = Cluster::default();
+            updated.update(refreshed);
+            assert_eq!(updated.get_routing_bucket_count(&bucket), expected);
+            assert_eq!(
+                updated.evict_table(&path).get_routing_bucket_count(&bucket),
+                None
+            );
+        }
+        for count in [0, -1] {
+            assert!(Cluster::from_metadata_response(response(Some(count)), Some(&origin)).is_err());
+        }
     }
 
     #[test]

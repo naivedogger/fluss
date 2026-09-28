@@ -470,7 +470,10 @@ impl FlussAdmin {
         let mut list_offsets_requests = HashMap::new();
         for (leader_id, bucket_ids) in node_for_bucket_list {
             let request =
-                ListOffsetsRequest::new(table_id, partition_id, bucket_ids, offset_spec.clone());
+                ListOffsetsRequest::new(table_id, partition_id, bucket_ids, offset_spec.clone())
+                    .with_routing_bucket_count(cluster.get_routing_bucket_count(
+                        &TableBucket::new_with_partition(table_id, partition_id, 0),
+                    ));
             list_offsets_requests.insert(leader_id, request);
         }
         Ok(list_offsets_requests)
@@ -651,6 +654,14 @@ impl FlussAdmin {
             ))
             .await?;
         Ok(LakeSnapshotInfo::from_pb(&response))
+    }
+
+    /// Gets the latest lake snapshot that is safe to use as a Union Read baseline.
+    pub async fn get_readable_lake_snapshot(
+        &self,
+        table_path: &TablePath,
+    ) -> Result<LakeSnapshotInfo> {
+        self.get_lake_snapshot(table_path, None, Some(true)).await
     }
 
     /// Create ACLs. Returns one result per submitted ACL (success or per-ACL error).
