@@ -429,12 +429,20 @@ pub(crate) async fn plan_snapshot_splits(
     plan.splits()
         .iter()
         .map(|split| {
-            validate_split_bucket_count(split, expected_layout.num_buckets)?;
+            validate_split_bucket_count(
+                split,
+                if partition_keys.is_empty() {
+                    expected_layout.num_buckets
+                } else {
+                    split.total_buckets()
+                },
+            )?;
             let task = crate::LakeSplit {
                 format: "paimon".to_string(),
                 snapshot_id: split.snapshot_id(),
                 partition: split_partition_identity(split, &partition_keys)?,
                 bucket_id: split.bucket(),
+                bucket_count: split.total_buckets(),
                 estimated_rows: split
                     .merged_row_count()
                     .and_then(|v| usize::try_from(v).ok()),
@@ -444,16 +452,20 @@ pub(crate) async fn plan_snapshot_splits(
                 payload_version: 1,
                 payload: encode_portable_split(split, table.location())?.into_bytes(),
             };
-            task.validate("paimon", snapshot_id, expected_layout.num_buckets)?;
+            task.validate("paimon", snapshot_id)?;
             Ok(task)
         })
         .collect()
 }
 
 fn validate_split_bucket_count(split: &DataSplit, expected: i32) -> Result<()> {
-    if split.total_buckets() != expected {
+    if expected <= 0
+        || split.total_buckets() != expected
+        || split.bucket() < 0
+        || split.bucket() >= expected
+    {
         return Err(FlussLakeError::PlanningFailed(format!(
-            "Paimon split has {} buckets, but bounded UnionRead currently requires the table bucket count {expected}; per-partition bucket rescaling is not supported",
+            "Paimon split has {} buckets or an invalid bucket id; expected partition bucket count {expected}",
             split.total_buckets()
         )));
     }
@@ -488,7 +500,9 @@ fn validate_paimon_layout(
             bucket_keys, expected.bucket_keys
         )));
     }
-    if core_options.bucket() != expected.num_buckets {
+    if core_options.bucket() <= 0
+        || (expected.partition_keys.is_empty() && core_options.bucket() != expected.num_buckets)
+    {
         return Err(FlussLakeError::PlanningFailed(format!(
             "Paimon bucket count {} does not match Fluss bucket count {} for {table_path}",
             core_options.bucket(),
@@ -670,13 +684,17 @@ async fn read_snapshot_splits(
         .splits
         .iter()
         .map(|task| {
-            task.validate("paimon", snapshot_id, info.num_buckets)?;
+            task.validate("paimon", snapshot_id)?;
             if task.payload_version != 1 {
                 return Err(FlussLakeError::IncompatibleSplitVersion(
                     "Paimon requires V1 lake task payloads".to_string(),
                 ));
             }
-            if task.bucket_id != expected_bucket_id || task.partition != first.partition {
+            if task.bucket_id != expected_bucket_id
+                || task.partition != first.partition
+                || task.bucket_count != first.bucket_count
+                || (info.partition_keys.is_empty() && task.bucket_count != info.num_buckets)
+            {
                 return Err(FlussLakeError::PlanningFailed(
                     "Paimon read tasks must belong to one partition/bucket".to_string(),
                 ));
@@ -685,7 +703,7 @@ async fn read_snapshot_splits(
                 FlussLakeError::PlanningFailed("invalid Paimon split encoding".to_string())
             })?;
             let split = decode_portable_split(encoded, table.location())?;
-            validate_split_bucket_count(&split, info.num_buckets)?;
+            validate_split_bucket_count(&split, task.bucket_count)?;
             if split_partition_identity(&split, table.schema().partition_keys())? != task.partition
             {
                 return Err(FlussLakeError::PlanningFailed(
@@ -1222,7 +1240,7 @@ mod tests {
             (
                 primary_keys.clone(),
                 HashMap::from([
-                    ("bucket".to_string(), "2".to_string()),
+                    ("bucket".to_string(), "0".to_string()),
                     ("bucket-key".to_string(), "id".to_string()),
                 ]),
             ),
@@ -1262,6 +1280,29 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_paimon_default_does_not_override_existing_partition_layouts() {
+        let path = TablePath::new("fluss", "orders");
+        let partitions = vec!["region".into()];
+        let keys = vec!["id".into()];
+        let options = HashMap::from([
+            ("bucket".into(), "2".into()),
+            ("bucket-key".into(), "id".into()),
+        ]);
+        let expected = ExpectedPaimonLayout {
+            partition_keys: &partitions,
+            primary_keys: &[],
+            bucket_keys: &keys,
+            num_buckets: 4,
+        };
+        validate_paimon_layout(&path, &partitions, &[], keys.clone(), &options, &expected).unwrap();
+        let root = ExpectedPaimonLayout {
+            partition_keys: &[],
+            ..expected
+        };
+        assert!(validate_paimon_layout(&path, &[], &[], keys.clone(), &options, &root).is_err());
+    }
+
+    #[test]
     fn missing_snapshot_file_maps_to_data_unavailable() {
         let error = paimon::Error::DataInvalid {
             message: "snapshot file does not exist: snapshot-42".to_string(),
@@ -1275,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_rescaled_lake_tasks_even_when_bucket_id_is_in_range() {
+    fn validates_paimon_partition_count_against_task_envelope() {
         for total in [2, 4, 8] {
             let split = DataSplit::builder()
                 .with_snapshot(42)

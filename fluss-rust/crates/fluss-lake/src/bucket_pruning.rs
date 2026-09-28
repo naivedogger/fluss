@@ -42,7 +42,7 @@ impl BucketPruner {
         row_type: &RowType,
         bucket_keys: &[String],
         num_buckets: i32,
-        data_lake_format: Option<DataLakeFormat>,
+        data_lake_format: &Option<DataLakeFormat>,
         filter: &BoundPredicate,
     ) -> Self {
         if bucket_keys.is_empty() || num_buckets <= 0 {
@@ -167,16 +167,17 @@ fn compute_matching_buckets(
     row_type: &RowType,
     bucket_keys: &[String],
     num_buckets: i32,
-    data_lake_format: Option<DataLakeFormat>,
+    data_lake_format: &Option<DataLakeFormat>,
     constraints: &BucketConstraints,
 ) -> crate::Result<HashSet<i32>> {
     let mut encoder =
-        KeyEncoderFactory::of_bucket_key_encoder(row_type, bucket_keys, &data_lake_format)
-            .map_err(|error| {
+        KeyEncoderFactory::of_bucket_key_encoder(row_type, bucket_keys, data_lake_format).map_err(
+            |error| {
                 crate::FlussLakeError::PlanningFailed(format!(
                     "failed to create bucket-key encoder for pruning: {error}"
                 ))
-            })?;
+            },
+        )?;
     let bucketing = <dyn BucketingFunction>::of(data_lake_format.as_ref());
     let key_positions: Vec<usize> = bucket_keys
         .iter()
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn no_bucket_keys_keeps_every_bucket() {
-        let pruner = BucketPruner::new(&row_type(), &[], 4, None, &bound(col("id").eq(1_i32)));
+        let pruner = BucketPruner::new(&row_type(), &[], 4, &None, &bound(col("id").eq(1_i32)));
         assert!(pruner.bucket_may_match(0));
         assert!(pruner.bucket_may_match(3));
     }
@@ -242,7 +243,7 @@ mod tests {
             &row_type(),
             &["id".to_string()],
             4,
-            None,
+            &None,
             &bound(col("id").eq(1_i32)),
         );
         // Hash of 1 with Fluss bucketing lands in one specific bucket.
@@ -251,12 +252,39 @@ mod tests {
     }
 
     #[test]
+    fn pruning_recomputes_the_hash_modulus_for_each_partition_layout() {
+        let format = Some(DataLakeFormat::Paimon);
+        let keys = vec!["id".to_string()];
+        let ty = row_type();
+        let mut differs = false;
+        for key in 0..32_i32 {
+            let filter = bound(col("id").eq(key));
+            let small = BucketPruner::new(&ty, &keys, 2, &format, &filter);
+            let large = BucketPruner::new(&ty, &keys, 8, &format, &filter);
+            let small_ids = (0..2)
+                .filter(|id| small.bucket_may_match(*id))
+                .collect::<Vec<_>>();
+            let large_ids = (0..8)
+                .filter(|id| large.bucket_may_match(*id))
+                .collect::<Vec<_>>();
+            assert_eq!(small_ids.len(), 1);
+            assert_eq!(large_ids.len(), 1);
+            assert_eq!(large_ids[0] % 2, small_ids[0]);
+            differs |= small_ids[0] != large_ids[0];
+        }
+        assert!(
+            differs,
+            "the fixture must catch reuse of the table-default pruner"
+        );
+    }
+
+    #[test]
     fn missing_bucket_key_constraint_keeps_every_bucket() {
         let pruner = BucketPruner::new(
             &row_type(),
             &["id".to_string()],
             4,
-            None,
+            &None,
             &bound(col("region").eq("US")),
         );
         assert!(pruner.bucket_may_match(0));
@@ -269,7 +297,7 @@ mod tests {
             &row_type(),
             &["id".to_string()],
             4,
-            None,
+            &None,
             &bound(col("id").is_in([1_i32, 2_i32])),
         );
         let matching: Vec<i32> = (0..4).filter(|id| pruner.bucket_may_match(*id)).collect();

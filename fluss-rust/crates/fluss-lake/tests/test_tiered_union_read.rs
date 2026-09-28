@@ -98,7 +98,10 @@ async fn verify_tiered_union_read() {
 
 async fn verify() {
     let scenario = required_env("FLUSS_RUST_UNION_READ_SCENARIO");
-    assert!(matches!(scenario.as_str(), "append" | "pk"));
+    assert!(matches!(
+        scenario.as_str(),
+        "append" | "pk" | "append-grow" | "append-shrink" | "pk-grow" | "pk-shrink"
+    ));
     let connection = Arc::new(
         FlussConnection::new(Config {
             bootstrap_servers: required_env("FLUSS_RUST_UNION_READ_BOOTSTRAP_SERVERS"),
@@ -131,6 +134,10 @@ async fn verify() {
     let table = FlussLakeTable::open_with_properties(connection, &path, properties)
         .await
         .unwrap();
+    if scenario.contains('-') {
+        verify_partition_layouts(&table, &scenario).await;
+        return;
+    }
     let scan = table.new_scan().with_batch_size(1);
     let plan = scan.plan().await.unwrap();
     let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
@@ -279,5 +286,167 @@ async fn verify() {
             );
             assert!(batches.iter().all(|batch| batch.num_columns() == 1));
         }
+    }
+}
+
+fn partition_rows(batches: &[RecordBatch]) -> Vec<(i32, String, String)> {
+    let mut result = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let regions = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            result.push((ids.value(i), names.value(i).into(), regions.value(i).into()));
+        }
+    }
+    result.sort_unstable();
+    result
+}
+
+async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
+    let (old_count, new_count) = if scenario.ends_with("grow") {
+        (2, 4)
+    } else {
+        (4, 2)
+    };
+    let primary_key = scenario.starts_with("pk");
+    let plan = table.new_scan().plan().await.unwrap();
+    let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
+    assert_eq!(context.num_buckets(), new_count);
+    assert_eq!(context.log_ranges().len(), (old_count + new_count) as usize);
+    assert!(context.lake_snapshot_id().is_some());
+    let mut has_tail = false;
+    for range in context.log_ranges() {
+        let fluss_lake::FlussLakePartitionIdentity::KeyValues(values) = range.partition_identity()
+        else {
+            panic!("partitioned fixture")
+        };
+        let name = &values[0].1;
+        assert!(name == "old" || name == "new");
+        assert_eq!(
+            range.bucket_count(),
+            if name == "old" { old_count } else { new_count }
+        );
+        has_tail |= range.stop_offset() > range.start_offset();
+        range.validate_available().unwrap();
+    }
+    assert!(has_tail);
+    let mut baseline = Vec::new();
+    let mut expected = Vec::new();
+    for partition in ["old", "expired", "new"] {
+        for id in 0..16 {
+            baseline.push((id, format!("lake-{id}"), partition.to_string()));
+            if primary_key && partition != "expired" && id == 1 {
+                continue;
+            }
+            let value = if primary_key && partition != "expired" && id == 0 {
+                "tail-update".into()
+            } else {
+                format!("lake-{id}")
+            };
+            expected.push((id, value, partition.to_string()));
+        }
+        if partition != "expired" {
+            if primary_key {
+                expected.push((16, "tail-insert".into(), partition.into()));
+            } else {
+                for id in [16, 17] {
+                    expected.push((id, format!("tail-{id}"), partition.into()));
+                }
+            }
+        }
+    }
+    baseline.sort_unstable();
+    expected.sort_unstable();
+    let transported: Vec<FlussLakeReadSplit> =
+        serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
+    let read = |plan: fluss_lake::FlussLakeReadPlan| async move {
+        let batches = plan
+            .new_reader()
+            .read_splits(plan.splits())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        partition_rows(&batches)
+    };
+    let batches = plan
+        .new_reader()
+        .read_splits(&transported)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(partition_rows(&batches), expected);
+    assert_eq!(
+        read(
+            table
+                .new_scan()
+                .with_lake_only(true)
+                .plan_with_context(&context)
+                .await
+                .unwrap()
+        )
+        .await,
+        baseline
+    );
+    // Exercise hash pruning on all three layouts, including the lake-only partition.
+    for id in [0, 1, 7, 13, 16, 17] {
+        let filtered = table
+            .new_scan()
+            .with_filter(col("id").eq(id))
+            .plan_with_context(&context)
+            .await
+            .unwrap();
+        let wanted = expected
+            .iter()
+            .filter(|row| row.0 == id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(read(filtered).await, wanted, "bucket pruning id={id}");
+    }
+    for partition in ["old", "expired", "new"] {
+        let filtered = table
+            .new_scan()
+            .with_filter(col("region").eq(partition))
+            .plan_with_context(&context)
+            .await
+            .unwrap();
+        let wanted = expected
+            .iter()
+            .filter(|row| row.2 == partition)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read(filtered).await,
+            wanted,
+            "partition pruning {partition}"
+        );
+    }
+    if primary_key {
+        let filtered = table
+            .new_scan()
+            .with_filter(col("name").eq("lake-0"))
+            .plan_with_context(&context)
+            .await
+            .unwrap();
+        assert_eq!(
+            read(filtered).await,
+            vec![(0, "lake-0".into(), "expired".into())]
+        );
     }
 }

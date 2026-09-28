@@ -111,6 +111,9 @@ impl SplitDescriptor {
             if task.format.is_empty()
                 || Some(task.snapshot_id) != snapshot_id
                 || task.bucket_id != table_bucket.bucket_id()
+                || task.bucket_count <= 0
+                || task.bucket_id >= task.bucket_count
+                || task.bucket_count != lake_splits[0].bucket_count
                 || task.payload_version == 0
                 || task.payload.is_empty()
             {
@@ -266,6 +269,8 @@ mod tests {
         }
         for (field, invalid) in [
             ("bucket_id", json!(1)),
+            ("bucket_count", json!(0)),
+            ("bucket_count", json!(-1)),
             ("snapshot_id", json!(43)),
             ("payload", json!([])),
             ("payload_version", json!(0)),

@@ -132,15 +132,17 @@ pub(crate) async fn freeze_read_boundary_for_table(
     let snapshot_offsets =
         collect_snapshot_offsets(table_path, table_info.table_id, readable_snapshot.as_ref())?;
     let partitions = if table_info.partition_keys.is_empty() {
-        vec![(None, None, FlussLakePartitionIdentity::Unpartitioned)]
+        vec![(
+            None,
+            None,
+            FlussLakePartitionIdentity::Unpartitioned,
+            table_info.num_buckets,
+        )]
     } else {
         let mut partition_infos = admin
             .list_partition_infos(table_path)
             .await
             .map_err(|error| planning_client_error("list table partitions", error))?;
-        for partition in &partition_infos {
-            validate_partition_bucket_count(partition, table_info.num_buckets)?;
-        }
         partition_infos.sort_by(|left, right| {
             left.get_partition_name()
                 .cmp(&right.get_partition_name())
@@ -148,35 +150,42 @@ pub(crate) async fn freeze_read_boundary_for_table(
         });
         partition_infos
             .into_iter()
-            .map(partition_identity)
-            .collect()
+            .map(|partition| {
+                let count = partition_bucket_count(&partition)?;
+                let (id, name, identity) = partition_identity(partition);
+                Ok((id, name, identity, count))
+            })
+            .collect::<Result<Vec<_>>>()?
     };
 
-    let bucket_ids: Vec<i32> = (0..table_info.num_buckets).collect();
     // Bound metadata fan-out and preserve the canonical partition order.
-    let mut partitions =
-        futures::stream::iter(partitions.into_iter().map(|(id, name, identity)| {
-            let bucket_ids = &bucket_ids;
-            async move {
-                let offsets =
-                    load_server_offsets(admin, table_path, name.as_deref(), bucket_ids).await?;
-                Ok::<_, FlussLakeError>((id, identity, offsets))
-            }
-        }))
-        .buffered(8);
+    let mut partitions = futures::stream::iter(partitions.into_iter().map(
+        |(id, name, identity, count)| async move {
+            let bucket_ids: Vec<i32> = (0..count).collect();
+            let offsets =
+                load_server_offsets(admin, table_path, name.as_deref(), &bucket_ids).await?;
+            Ok::<_, FlussLakeError>((id, identity, count, offsets))
+        },
+    ))
+    .buffered(8);
     let mut bucket_ranges = Vec::new();
-    while let Some((partition_id, partition_identity, (earliest_offsets, latest_offsets))) =
-        partitions.try_next().await?
+    while let Some((
+        partition_id,
+        partition_identity,
+        bucket_count,
+        (earliest_offsets, latest_offsets),
+    )) = partitions.try_next().await?
     {
-        for bucket_id in &bucket_ids {
+        for bucket_id in 0..bucket_count {
             let table_bucket =
-                TableBucket::new_with_partition(table_info.table_id, partition_id, *bucket_id);
+                TableBucket::new_with_partition(table_info.table_id, partition_id, bucket_id);
             let earliest_offset = required_offset(&earliest_offsets, &table_bucket, "earliest")?;
             let stop_offset = required_offset(&latest_offsets, &table_bucket, "latest")?;
             let snapshot_offset = snapshot_offsets.get(&table_bucket).copied();
             bucket_ranges.push(freeze_bucket_range(
                 table_bucket,
                 partition_identity.clone(),
+                bucket_count,
                 snapshot_offset,
                 earliest_offset,
                 stop_offset,
@@ -190,21 +199,16 @@ pub(crate) async fn freeze_read_boundary_for_table(
     })
 }
 
-/// The current context and bucket pruner carry one table-wide bucket count.
-/// Reject rescaled layouts rather than omit buckets or prune with the wrong hash.
-fn validate_partition_bucket_count(
-    partition: &PartitionInfo,
-    table_bucket_count: i32,
-) -> Result<()> {
+/// Admin resolves legacy counts; never substitute the table default here.
+fn partition_bucket_count(partition: &PartitionInfo) -> Result<i32> {
     let count = partition.get_bucket_count();
-    if count != table_bucket_count
-    {
+    if count <= 0 {
         return Err(FlussLakeError::PlanningFailed(format!(
-            "partition {} has {count} buckets, but bounded UnionRead currently requires the table bucket count {table_bucket_count}; per-partition bucket rescaling is not supported",
+            "partition {} has invalid bucket count {count}",
             partition.get_partition_id()
         )));
     }
-    Ok(())
+    Ok(count)
 }
 
 fn partition_identity(
@@ -335,6 +339,7 @@ fn required_offset(
 fn freeze_bucket_range(
     table_bucket: TableBucket,
     partition_identity: FlussLakePartitionIdentity,
+    bucket_count: i32,
     snapshot_offset: Option<i64>,
     earliest_offset: i64,
     stop_offset: i64,
@@ -363,6 +368,7 @@ fn freeze_bucket_range(
     Ok(FrozenBucketRange {
         table_bucket,
         partition_identity,
+        bucket_count,
         start_offset,
         stop_offset,
         earliest_offset,
@@ -383,7 +389,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_rescaled_partition_layouts_before_capturing_ranges() {
+    fn uses_resolved_partition_bucket_counts_and_rejects_missing_counts() {
         use fluss::metadata::ResolvedPartitionSpec;
         use std::sync::Arc;
 
@@ -391,11 +397,13 @@ mod tests {
             ResolvedPartitionSpec::new(Arc::from(["region".to_string()]), vec!["US".to_string()])
                 .unwrap();
         let partition = PartitionInfo::new(42, spec);
-        for count in [None, Some(4), Some(2), Some(8), Some(0), Some(-1)] {
-            let mut pb = partition.to_pb();
-            pb.bucket_count = count;
-            let result = validate_partition_bucket_count(&PartitionInfo::from_pb(&pb), 4);
-            assert_eq!(result.is_ok(), count == Some(4));
+        assert!(partition_bucket_count(&partition).is_err());
+        for count in [4, 2, 8, 0, -1] {
+            let result = partition_bucket_count(&partition.clone().with_bucket_count(count));
+            assert_eq!(result.is_ok(), count > 0);
+            if count > 0 {
+                assert_eq!(result.unwrap(), count);
+            }
         }
     }
 
@@ -407,6 +415,7 @@ mod tests {
         freeze_bucket_range(
             TableBucket::new(5, 2),
             FlussLakePartitionIdentity::Unpartitioned,
+            4,
             snapshot_offset,
             earliest_offset,
             stop_offset,
@@ -466,6 +475,7 @@ mod tests {
                 "region".to_string(),
                 "US".to_string(),
             )]),
+            bucket_count: 4,
             start_offset: 12,
             stop_offset: 20,
             earliest_offset: 8,
@@ -502,6 +512,7 @@ mod tests {
         let range = FrozenBucketRange::lake_only(
             5,
             2,
+            4,
             FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())]),
         );
         let split = create_logical_split(
@@ -537,6 +548,7 @@ mod tests {
             let range = FrozenBucketRange::lake_only(
                 5,
                 0,
+                4,
                 FlussLakePartitionIdentity::KeyValues(vec![
                     ("a".into(), a.into()),
                     ("b".into(), b.into()),

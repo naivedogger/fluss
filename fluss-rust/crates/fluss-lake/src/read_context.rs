@@ -25,7 +25,7 @@ use fluss::metadata::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-const CONTEXT_VERSION: u32 = 1;
+const CONTEXT_VERSION: u32 = 2;
 
 /// One frozen, half-open Fluss log range, not an engine scheduling unit.
 ///
@@ -37,6 +37,7 @@ const CONTEXT_VERSION: u32 = 1;
 pub struct FlussLakeLogRange {
     pub(crate) table_bucket: TableBucket,
     pub(crate) partition_identity: FlussLakePartitionIdentity,
+    pub(crate) bucket_count: i32,
     pub(crate) start_offset: i64,
     pub(crate) stop_offset: i64,
     pub(crate) earliest_offset: i64,
@@ -51,6 +52,14 @@ impl FlussLakeLogRange {
     /// Logical partition values, in table partition-key order.
     pub fn partition_identity(&self) -> &FlussLakePartitionIdentity {
         &self.partition_identity
+    }
+
+    /// Actual bucket count of this captured partition, used for bucket pruning.
+    ///
+    /// This may differ from the table default. All ranges of the same partition
+    /// carry the same count and cover exactly `0..bucket_count`.
+    pub fn bucket_count(&self) -> i32 {
+        self.bucket_count
     }
 
     /// Inclusive seam offset, or zero when the bucket has no lake baseline.
@@ -99,11 +108,13 @@ impl FlussLakeLogRange {
     pub(crate) fn lake_only(
         table_id: i64,
         bucket_id: i32,
+        bucket_count: i32,
         partition_identity: FlussLakePartitionIdentity,
     ) -> Self {
         Self {
             table_bucket: TableBucket::new(table_id, bucket_id),
             partition_identity,
+            bucket_count,
             start_offset: 0,
             stop_offset: 0,
             earliest_offset: 0,
@@ -131,7 +142,7 @@ pub struct FlussLakeReadContext {
     schema: Schema,
 }
 
-/// V1 uses the public Fluss schema JSON, not Rust's internal Schema serde.
+/// V2 uses the public Fluss schema JSON, not Rust's internal Schema serde.
 /// No arbitrary catalog/table property map is allowed in this descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,7 +233,10 @@ impl FlussLakeReadContext {
         &self.descriptor.bucket_keys
     }
 
-    /// Number of source buckets per partition, not requested parallelism.
+    /// Frozen table default for new partitions, not execution parallelism.
+    ///
+    /// Use each log range's `bucket_count()` for live partitions and the lake
+    /// source's layout for lake-only partitions, not this default.
     pub fn num_buckets(&self) -> i32 {
         self.descriptor.num_buckets
     }
@@ -388,7 +402,8 @@ impl TryFrom<ContextDescriptor> for FlussLakeReadContext {
             let bucket = range.table_bucket();
             if bucket.table_id() != descriptor.table_id
                 || bucket.bucket_id() < 0
-                || bucket.bucket_id() >= descriptor.num_buckets
+                || range.bucket_count <= 0
+                || bucket.bucket_id() >= range.bucket_count
                 || bucket.partition_id().is_some_and(|id| id < 0)
                 || range.start_offset < 0
                 || range.earliest_offset < 0
@@ -400,7 +415,10 @@ impl TryFrom<ContextDescriptor> for FlussLakeReadContext {
             }
             match range.partition_identity() {
                 FlussLakePartitionIdentity::Unpartitioned => {
-                    if !descriptor.partition_keys.is_empty() || bucket.partition_id().is_some() {
+                    if !descriptor.partition_keys.is_empty()
+                        || bucket.partition_id().is_some()
+                        || range.bucket_count != descriptor.num_buckets
+                    {
                         return Err(invalid_context(
                             "unpartitioned range in a partitioned context",
                         ));
@@ -428,10 +446,13 @@ impl TryFrom<ContextDescriptor> for FlussLakeReadContext {
                     "partition id has conflicting logical identities",
                 ));
             }
-            let (partition_id, buckets) = groups
+            let (partition_id, bucket_count, buckets) = groups
                 .entry(range.partition_identity())
-                .or_insert_with(|| (bucket.partition_id(), HashSet::new()));
-            if *partition_id != bucket.partition_id() || !buckets.insert(bucket.bucket_id()) {
+                .or_insert_with(|| (bucket.partition_id(), range.bucket_count, HashSet::new()));
+            if *partition_id != bucket.partition_id()
+                || *bucket_count != range.bucket_count
+                || !buckets.insert(bucket.bucket_id())
+            {
                 return Err(invalid_context(
                     "duplicate or conflicting partition/bucket range",
                 ));
@@ -440,7 +461,7 @@ impl TryFrom<ContextDescriptor> for FlussLakeReadContext {
         if (descriptor.partition_keys.is_empty() && groups.len() != 1)
             || groups
                 .values()
-                .any(|(_, buckets)| buckets.len() != descriptor.num_buckets as usize)
+                .any(|(_, count, buckets)| buckets.len() != *count as usize)
         {
             return Err(invalid_context(
                 "context must cover every bucket of each captured live partition",
@@ -527,6 +548,7 @@ mod tests {
                             bucket,
                         ),
                         partition_identity: partition.clone(),
+                        bucket_count: 2,
                         start_offset: 12,
                         stop_offset: 20,
                         earliest_offset: 8,
@@ -571,9 +593,9 @@ mod tests {
     }
 
     #[test]
-    fn version_one_transport_shape_is_stable() {
+    fn version_two_transport_shape_is_stable() {
         let fixture = json!({
-            "context_version": 1,
+            "context_version": 2,
             "table_path": {"database": "fluss", "table": "orders"},
             "table_id": 7,
             "table_modified_time": 0,
@@ -598,17 +620,63 @@ mod tests {
                 {
                     "table_bucket": {"table_id": 7, "partition_id": 9, "bucket": 0},
                     "partition_identity": {"KeyValues": [["region", "US"]]},
-                    "start_offset": 12, "stop_offset": 20, "earliest_offset": 8
+                    "bucket_count": 2, "start_offset": 12, "stop_offset": 20, "earliest_offset": 8
                 },
                 {
                     "table_bucket": {"table_id": 7, "partition_id": 9, "bucket": 1},
                     "partition_identity": {"KeyValues": [["region", "US"]]},
-                    "start_offset": 12, "stop_offset": 20, "earliest_offset": 8
+                    "bucket_count": 2, "start_offset": 12, "stop_offset": 20, "earliest_offset": 8
                 }
             ]
         });
         assert_eq!(value(true), fixture);
         FlussLakeReadContext::from_json(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn mixed_partition_counts_round_trip_and_validate_complete_coverage() {
+        let mut original = value(true);
+        let mut ranges = original["log_ranges"].as_array().unwrap().clone();
+        for bucket in 0..4 {
+            let mut range = ranges[0].clone();
+            range["table_bucket"]["partition_id"] = json!(10);
+            range["table_bucket"]["bucket"] = json!(bucket);
+            range["partition_identity"] = json!({"KeyValues": [["region", "EU"]]});
+            range["bucket_count"] = json!(4);
+            ranges.push(range);
+        }
+        original["log_ranges"] = json!(ranges);
+        let decoded =
+            FlussLakeReadContext::from_json(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(decoded.num_buckets(), 2);
+        assert_eq!(
+            decoded
+                .log_ranges()
+                .iter()
+                .map(FlussLakeLogRange::bucket_count)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 4, 4, 4, 4]
+        );
+        assert_eq!(serde_json::to_value(decoded).unwrap(), original);
+        for count in [0, -1, 2, 5] {
+            let mut invalid = original.clone();
+            invalid["log_ranges"][2]["bucket_count"] = json!(count);
+            assert_invalid(invalid);
+        }
+        let mut missing = original.clone();
+        missing["log_ranges"].as_array_mut().unwrap().pop();
+        assert_invalid(missing);
+        let mut missing_count = original;
+        missing_count["log_ranges"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("bucket_count");
+        assert_invalid(missing_count);
+        let mut root = value(false);
+        for range in root["log_ranges"].as_array_mut().unwrap() {
+            range["bucket_count"] = json!(4);
+        }
+        assert_invalid(root);
     }
 
     #[test]
@@ -637,7 +705,7 @@ mod tests {
 
     #[test]
     fn incompatible_versions_are_explicit_errors() {
-        for version in [0, 2, u64::MAX] {
+        for version in [0, 1, 3, u64::MAX] {
             let mut value = value(false);
             value["context_version"] = json!(version);
             assert!(matches!(
