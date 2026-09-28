@@ -19,10 +19,12 @@
 //! Union read is a bounded batch query. Results are delivered lazily as a
 //! finite stream of Arrow record batches.
 //!
-//! Two integration levels share the same source contract:
-//! - [`FlussLakeScan::plan`] and [`FlussLakeReader`] provide the complete default
-//!   reader, including lake access and current-view reconciliation.
-//! - [`FlussLakeScan::prepare`] returns a portable [`FlussLakeReadContext`]
+//! Three integration levels share the same source contract:
+//! - [`FlussLakeScan::plan`] and [`FlussLakeReadPlan::new_reader`] provide the
+//!   complete default reader, including lake access and reconciliation.
+//! - [`FlussLakeScan::with_lake_source`] replaces lake planning/reading while
+//!   retaining the default Fluss log reader and current-view reconciliation.
+//! - [`FlussLakeTable::prepare`] returns a portable [`FlussLakeReadContext`]
 //!   without a lake backend. Engines can use their own lake planners, readers,
 //!   reconciliation operators, and schedulers against these frozen inputs.
 //!
@@ -42,16 +44,20 @@ mod planner;
 mod planning;
 mod pruning;
 mod read_context;
+mod source;
 mod split;
 mod split_descriptor;
 mod table;
 
 pub use error::{FlussLakeError, Result};
-pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
+#[cfg(feature = "paimon")]
+pub use paimon::PaimonLakeSource;
+pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan, FlussLakeReader};
 pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
+pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
 pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;
 pub use split::{FlussLakePartitionIdentity, FlussLakeReadSplit};
-pub use table::{FlussLakeReader, FlussLakeScan, FlussLakeTable};
+pub use table::{FlussLakeScan, FlussLakeTable};
 
 use arrow::record_batch::RecordBatch;
 use futures::Stream;

@@ -21,49 +21,17 @@ use arrow::array::{ArrayRef, Int32Array};
 use arrow::record_batch::RecordBatch;
 use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
 use fluss::predicate::col;
-use fluss::rpc::message::OffsetSpec;
 use fluss_lake::{FlussLakeReadContext, FlussLakeTable};
-use fluss_test_cluster::FlussTestingClusterBuilder;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+
+mod support;
 
 // Source preparation needs only Fluss: no lake reader, tiering job or S3 fixture.
 #[tokio::test]
 async fn prepare_freezes_table_wide_ranges_without_a_lake_backend() {
-    let properties = HashMap::from([
-        ("datalake.enabled".to_string(), "true".to_string()),
-        ("datalake.format".to_string(), "paimon".to_string()),
-        (
-            "datalake.paimon.metastore".to_string(),
-            "filesystem".to_string(),
-        ),
-        (
-            "datalake.paimon.warehouse".to_string(),
-            "/tmp/prepare-only-warehouse".to_string(),
-        ),
-    ]);
-    let cluster =
-        FlussTestingClusterBuilder::new_with_cluster_conf("rust-prepare-only", &properties)
-            .with_port(20_000 + (std::process::id() % 20_000) as u16)
-            .build()
-            .await;
+    let cluster = support::get_shared_cluster();
     let connection = Arc::new(cluster.get_fluss_connection().await);
     let admin = connection.get_admin().unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if admin.get_server_nodes().await.is_ok_and(|nodes| {
-                nodes
-                    .iter()
-                    .any(|node| *node.server_type() == fluss::ServerType::TabletServer)
-            }) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("tablet server readiness");
     let path = TablePath::new("fluss", "prepare_only");
     let descriptor = TableDescriptor::builder()
         .schema(
@@ -76,18 +44,7 @@ async fn prepare_freezes_table_wide_ranges_without_a_lake_backend() {
         .property("table.datalake.format", "paimon")
         .build()
         .unwrap();
-    admin.create_table(&path, &descriptor, false).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while admin
-            .list_offsets(&path, &[0], OffsetSpec::Latest)
-            .await
-            .is_err()
-        {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("bucket readiness");
+    support::create_table(&admin, &path, &descriptor).await;
     let source = connection.get_table(&path).await.unwrap();
     let writer = source.new_append().unwrap().create_writer().unwrap();
     let batch = |values| {

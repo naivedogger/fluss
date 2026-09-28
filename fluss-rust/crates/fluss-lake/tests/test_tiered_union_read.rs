@@ -25,14 +25,46 @@ use fluss::client::FlussConnection;
 use fluss::config::Config;
 use fluss::metadata::TablePath;
 use fluss::predicate::col;
-use fluss_lake::{FlussLakeReadContext, FlussLakeReadSplit, FlussLakeTable};
+use fluss_lake::{
+    FlussLakeReadContext, FlussLakeReadSplit, FlussLakeTable, LakePlannerContext,
+    LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource, RecordBatchStream,
+};
 use futures::TryStreamExt;
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("Java fixture must set {name}"))
+}
+
+// Exercises the public extension point, not private Paimon split decoding.
+struct DelegatingLakeSource {
+    inner: PaimonLakeSource,
+    plans: AtomicUsize,
+    reads: AtomicUsize,
+}
+
+impl LakeSource for DelegatingLakeSource {
+    fn format(&self) -> &str {
+        self.inner.format()
+    }
+    fn plan<'a>(
+        &'a self,
+        context: LakePlannerContext<'a>,
+    ) -> BoxFuture<'a, fluss_lake::Result<Vec<LakeSplit>>> {
+        self.plans.fetch_add(1, Ordering::Relaxed);
+        self.inner.plan(context)
+    }
+    fn read<'a>(
+        &'a self,
+        context: LakeReaderContext<'a>,
+    ) -> BoxFuture<'a, fluss_lake::Result<RecordBatchStream>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read(context)
+    }
 }
 
 fn rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
@@ -81,16 +113,24 @@ async fn verify() {
     );
     // Only storage configuration crosses the process boundary. Rust must discover
     // the snapshot, seam, stop offsets and physical lake files through public APIs.
-    let table = FlussLakeTable::open_with_properties(
-        connection,
-        &path,
-        HashMap::from([(
-            "table.datalake.paimon.warehouse".to_owned(),
-            required_env("FLUSS_RUST_UNION_READ_WAREHOUSE"),
-        )]),
-    )
-    .await
-    .unwrap();
+    let properties = HashMap::from([(
+        "table.datalake.paimon.warehouse".to_owned(),
+        required_env("FLUSS_RUST_UNION_READ_WAREHOUSE"),
+    )]);
+    let info = connection
+        .get_admin()
+        .unwrap()
+        .get_table_info(&path)
+        .await
+        .unwrap();
+    let custom_source = Arc::new(DelegatingLakeSource {
+        inner: PaimonLakeSource::new(&info, &properties).unwrap(),
+        plans: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+    });
+    let table = FlussLakeTable::open_with_properties(connection, &path, properties)
+        .await
+        .unwrap();
     let scan = table.new_scan().with_batch_size(1);
     let plan = scan.plan().await.unwrap();
     let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
@@ -123,7 +163,22 @@ async fn verify() {
     .into_iter()
     .map(|(id, name)| (id, name.to_owned()))
     .collect::<Vec<_>>();
-    let reader = scan.new_reader();
+    let reader = plan.new_reader();
+    let mut foreign = split.clone();
+    foreign.split_id.push_str("-foreign");
+    assert!(reader.read_split(&foreign).await.is_err());
+    assert!(
+        reader
+            .read_splits(&[split.clone(), split.clone()])
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .read_splits_with_concurrency(plan.splits(), 0)
+            .await
+            .is_err()
+    );
     for _ in 0..2 {
         let batches = reader
             .read_split(&split)
@@ -141,7 +196,7 @@ async fn verify() {
     }
     let lake_scan = table.new_scan().with_lake_only(true);
     let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
-    let baseline = lake_scan
+    let baseline = lake_plan
         .new_reader()
         .read_splits(lake_plan.splits())
         .await
@@ -157,6 +212,51 @@ async fn verify() {
             (3, "lake-keep".into())
         ]
     );
+    // Count scans must preserve rows even though the output has no columns.
+    for (lake_only, count) in [(false, expected.len()), (true, 3)] {
+        let count_plan = table
+            .new_scan()
+            .with_lake_only(lake_only)
+            .with_projection(vec![])
+            .with_batch_size(2)
+            .plan_with_context(&context)
+            .await
+            .unwrap();
+        let batches = count_plan
+            .new_reader()
+            .read_splits(count_plan.splits())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.num_columns() == 0 && b.num_rows() <= 2)
+        );
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            count
+        );
+    }
+    let custom_plan = table
+        .new_scan()
+        .with_lake_source(custom_source.clone())
+        .plan_with_context(&context)
+        .await
+        .unwrap();
+    let batches = custom_plan
+        .new_reader()
+        .read_splits(custom_plan.splits())
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows(&batches), expected);
+    assert_eq!(custom_source.plans.load(Ordering::Relaxed), 1);
+    assert_eq!(custom_source.reads.load(Ordering::Relaxed), 1);
     if scenario == "pk" {
         // Filtering before reconciliation would resurrect old/removed baseline rows.
         for (value, count) in [("lake-old", 0), ("lake-delete", 0), ("tail-new", 1)] {
@@ -165,7 +265,7 @@ async fn verify() {
                 .with_filter(col("name").eq(value))
                 .with_projection(vec![1]);
             let plan = filtered.plan_with_context(&context).await.unwrap();
-            let batches = filtered
+            let batches = plan
                 .new_reader()
                 .read_splits(plan.splits())
                 .await

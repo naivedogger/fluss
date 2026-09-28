@@ -21,7 +21,6 @@ use fluss::metadata::{TableDescriptor, TablePath};
 use fluss::rpc::message::OffsetSpec;
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -34,27 +33,8 @@ extern "C" fn cleanup_on_exit() {
 static CLUSTER_PORT: LazyLock<u16> =
     LazyLock::new(|| 20_000 + (std::process::id() % 20_000) as u16);
 
-static SHARED_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-    // Docker VMs may not share a worktree under /tmp. Allow the test data
-    // root to be placed in a directory shared with the Docker host.
-    let root = std::env::var_os("FLUSS_RUST_UNION_READ_TEST_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("target")
-        });
-    let data_dir = root.join(format!("fluss-rust-union-read-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&data_dir);
-    std::fs::create_dir_all(&data_dir)
-        .expect("Failed to create Paimon UnionRead shared data directory");
-    data_dir
-        .canonicalize()
-        .expect("Failed to canonicalize Paimon UnionRead shared data directory")
-});
-static PAIMON_WAREHOUSE_DIR: LazyLock<PathBuf> =
-    LazyLock::new(|| SHARED_DATA_DIR.join("paimon-warehouse"));
-
+// These tests read only the Fluss log; the warehouse stays inside Docker.
+// Real lake files are exercised by the Java-owned RustUnionReadITCase.
 static SHARED_CLUSTER: LazyLock<FlussTestingCluster> = LazyLock::new(|| {
     std::thread::spawn(|| {
         let runtime = tokio::runtime::Runtime::new()
@@ -69,14 +49,13 @@ static SHARED_CLUSTER: LazyLock<FlussTestingCluster> = LazyLock::new(|| {
                 ),
                 (
                     "datalake.paimon.warehouse".to_string(),
-                    PAIMON_WAREHOUSE_DIR.to_string_lossy().to_string(),
+                    "/tmp/union-read-warehouse".to_string(),
                 ),
             ]);
             let cluster = FlussTestingClusterBuilder::new_with_cluster_conf(
-                "rust-union-read-test",
+                format!("rust-union-read-{}", std::process::id()),
                 &cluster_conf,
             )
-            .with_remote_data_dir(SHARED_DATA_DIR.clone())
             .with_port(*CLUSTER_PORT)
             .build()
             .await;
