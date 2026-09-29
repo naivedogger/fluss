@@ -607,12 +607,24 @@ impl RecordAccumulator {
         nodes: &HashSet<ServerNode>,
         max_size: i32,
     ) -> Result<HashMap<i32, Vec<ReadyWriteBatch>>> {
+        self.drain_excluding_buckets(cluster, nodes, max_size, &HashSet::new())
+    }
+
+    /// Leaves buckets awaiting responses from their previous leader in the accumulator.
+    pub(crate) fn drain_excluding_buckets(
+        &self,
+        cluster: Arc<Cluster>,
+        nodes: &HashSet<ServerNode>,
+        max_size: i32,
+        excluded_buckets: &HashSet<TableBucket>,
+    ) -> Result<HashMap<i32, Vec<ReadyWriteBatch>>> {
         if nodes.is_empty() {
             return Ok(HashMap::new());
         }
         let mut batches = HashMap::new();
         for node in nodes {
-            let ready = self.drain_batches_for_one_node(&cluster, node, max_size)?;
+            let ready =
+                self.drain_batches_for_one_node(&cluster, node, max_size, excluded_buckets)?;
             if !ready.is_empty() {
                 batches.insert(node.id(), ready);
             }
@@ -746,6 +758,7 @@ impl RecordAccumulator {
         cluster: &Cluster,
         node: &ServerNode,
         max_size: i32,
+        excluded_buckets: &HashSet<TableBucket>,
     ) -> Result<Vec<ReadyWriteBatch>> {
         let mut size: usize = 0;
         let buckets = self.get_all_buckets_in_current_node(node, cluster);
@@ -820,7 +833,11 @@ impl RecordAccumulator {
 
                             // Improvement: `continue` instead of `break` to skip
                             // only this bucket, not all buckets for the node.
-                            if self.should_stop_drain_batches_for_bucket(first_batch, &table_bucket)
+                            if excluded_buckets.contains(&table_bucket)
+                                || self.should_stop_drain_batches_for_bucket(
+                                    first_batch,
+                                    &table_bucket,
+                                )
                             {
                                 if current_index == start {
                                     break;

@@ -35,7 +35,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{debug, warn};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,20 +52,78 @@ const RETRY_BACKOFF_MULTIPLIER: f64 = 2.0;
 const RETRY_BACKOFF_JITTER: f64 = 0.2;
 
 type SendFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type DispatchFuture<'a> =
+    Pin<Box<dyn Future<Output = (i32, Result<Option<SendFuture<'a>>>)> + Send + 'a>>;
 
-/// Result of a synchronous drain: send futures, optional delay, and unknown leader tables.
-type DrainResult<'a> = (
-    Vec<SendFuture<'a>>,
+/// Result of a synchronous drain: batches, optional delay, and unknown leader tables.
+type DrainResult = (
+    HashMap<i32, Vec<ReadyWriteBatch>>,
     Option<u64>,
     HashSet<Arc<PhysicalTablePath>>,
 );
+
+struct InFlightBucket {
+    destination: i32,
+    batch_ids: Vec<i64>,
+}
+
+/// At most one drained round per node, split into table requests. Further batches stay in
+/// the accumulator, retaining its memory budget and retry ordering. Only the queue head
+/// may acquire a connection or a write lock; responses never occupy a dispatch slot.
+#[derive(Default)]
+struct SendQueues {
+    nodes: HashMap<i32, VecDeque<Vec<ReadyWriteBatch>>>,
+    dispatching: HashSet<i32>,
+}
+
+impl SendQueues {
+    fn enqueue(&mut self, batches: HashMap<i32, Vec<ReadyWriteBatch>>) {
+        for (node, batches) in batches {
+            debug_assert!(!self.nodes.contains_key(&node));
+            let mut tables: HashMap<TableId, Vec<ReadyWriteBatch>> = HashMap::new();
+            for batch in batches {
+                tables
+                    .entry(batch.table_bucket.table_id())
+                    .or_default()
+                    .push(batch);
+            }
+            self.nodes.insert(node, tables.into_values().collect());
+        }
+    }
+
+    fn dispatch<'a>(&mut self, sender: &'a Sender, pending: &FuturesUnordered<DispatchFuture<'a>>) {
+        for (&node, queue) in &mut self.nodes {
+            if self.dispatching.contains(&node) {
+                continue;
+            }
+            if let Some(batches) = queue.pop_front() {
+                self.dispatching.insert(node);
+                pending.push(Box::pin(async move {
+                    (
+                        node,
+                        sender
+                            .dispatch_write_request(node, sender.ack, batches)
+                            .await,
+                    )
+                }));
+            }
+        }
+    }
+
+    fn complete_dispatch(&mut self, node: i32) {
+        self.dispatching.remove(&node);
+        if self.nodes.get(&node).is_some_and(VecDeque::is_empty) {
+            self.nodes.remove(&node);
+        }
+    }
+}
 
 #[allow(dead_code)]
 pub struct Sender {
     running: AtomicBool,
     metadata: Arc<Metadata>,
     accumulator: Arc<RecordAccumulator>,
-    in_flight_batches: Mutex<HashMap<TableBucket, Vec<i64>>>,
+    in_flight_batches: Mutex<HashMap<TableBucket, InFlightBucket>>,
     max_request_size: i32,
     ack: i16,
     max_request_timeout_ms: i32,
@@ -202,59 +260,56 @@ impl Sender {
         }
     }
 
-    /// Sequential init + drain + metadata refresh. Used by `run_once` (shutdown)
-    /// where blocking is acceptable.
-    async fn prepare_sends(&self) -> Result<(Vec<SendFuture<'_>>, Option<u64>)> {
-        if let Err(e) = self.maybe_wait_for_writer_id().await {
-            warn!("Failed to allocate writer ID after retries: {e}");
-            self.maybe_abort_batches(&e);
-            return Ok((vec![], None));
-        }
-        let (futures, delay, unknown_leaders) = self.drain_ready_sends()?;
-        if !unknown_leaders.is_empty() {
-            if let Err(e) = self.refresh_unknown_leaders(&unknown_leaders).await {
-                warn!("Metadata refresh for unknown leaders failed: {e}");
-            }
-        }
-        Ok((futures, delay))
-    }
-
-    /// Fully synchronous drain: `ready()` → `drain()` → build send futures.
+    /// Fully synchronous drain: `ready()` → `drain()` → enqueue ordered requests.
     /// No async work — safe to call on the hot path without starving
     /// `pending.next()`. Returns unknown leader tables so the caller can
     /// schedule a concurrent metadata refresh.
-    fn drain_ready_sends(&self) -> Result<DrainResult<'_>> {
+    fn drain_ready_sends(&self, queues: &SendQueues) -> Result<DrainResult> {
         let cluster = self.metadata.get_cluster();
-        let ready_check_result = self.accumulator.ready(&cluster)?;
+        let mut ready_check_result = self.accumulator.ready(&cluster)?;
+        ready_check_result
+            .ready_nodes
+            .retain(|node| !queues.nodes.contains_key(&node.id()));
 
         let unknown_leaders = ready_check_result.unknown_leader_tables;
 
         if ready_check_result.ready_nodes.is_empty() {
             return Ok((
-                vec![],
+                HashMap::new(),
                 Some(ready_check_result.next_ready_check_delay_ms as u64),
                 unknown_leaders,
             ));
         }
 
-        let batches = self.accumulator.drain(
+        // A new leader must not bypass attempts still owned by the previous leader.
+        // Once they complete or re-enqueue, the accumulator's sequence gate orders retries.
+        let excluded_buckets = self
+            .in_flight_batches
+            .lock()
+            .iter()
+            .filter(|(bucket, entry)| {
+                cluster
+                    .leader_for(bucket)
+                    .is_some_and(|node| node.id() != entry.destination)
+            })
+            .map(|(bucket, _)| bucket.clone())
+            .collect();
+        let batches = self.accumulator.drain_excluding_buckets(
             cluster.clone(),
             &ready_check_result.ready_nodes,
             self.max_request_size,
+            &excluded_buckets,
         )?;
 
-        let mut futures = Vec::new();
         if !batches.is_empty() {
             self.add_to_inflight_batches(&batches);
-            for (leader_id, leader_batches) in batches {
-                futures.push(
-                    Box::pin(self.send_write_request(leader_id, self.ack, leader_batches))
-                        as SendFuture<'_>,
-                );
-            }
         }
 
-        Ok((futures, None, unknown_leaders))
+        Ok((
+            batches,
+            Some(ready_check_result.next_ready_check_delay_ms as u64),
+            unknown_leaders,
+        ))
     }
 
     /// Refresh metadata for buckets with unknown leaders. Runs as a concurrent
@@ -291,39 +346,48 @@ impl Sender {
         Ok(())
     }
 
-    /// Blocking version of drain + send, used during shutdown drain.
-    async fn run_once(&self) -> Result<()> {
-        let (futures, delay) = self.prepare_sends().await?;
-        if let Some(ms) = delay {
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-            return Ok(());
-        }
-        for result in futures::future::join_all(futures).await {
-            result?;
-        }
-        Ok(())
-    }
-
     fn add_to_inflight_batches(&self, batches: &HashMap<i32, Vec<ReadyWriteBatch>>) {
         let mut in_flight = self.in_flight_batches.lock();
-        for batch_list in batches.values() {
+        for (&destination, batch_list) in batches {
             for batch in batch_list {
-                in_flight
+                let entry = in_flight
                     .entry(batch.table_bucket.clone())
-                    .or_default()
-                    .push(batch.write_batch.batch_id());
+                    .or_insert_with(|| InFlightBucket {
+                        destination,
+                        batch_ids: Vec::new(),
+                    });
+                debug_assert_eq!(entry.destination, destination);
+                entry.batch_ids.push(batch.write_batch.batch_id());
             }
         }
     }
 
+    #[cfg(test)]
     async fn send_write_request(
         &self,
         destination: i32,
         acks: i16,
         batches: Vec<ReadyWriteBatch>,
     ) -> Result<()> {
+        if let Some(response) = self
+            .dispatch_write_request(destination, acks, batches)
+            .await?
+        {
+            response.await?;
+        }
+        Ok(())
+    }
+
+    /// Dispatches one table request. The caller holds the node's dispatch slot until this
+    /// returns, but awaits the response separately so the next frame does not wait for ACK.
+    async fn dispatch_write_request(
+        &self,
+        destination: i32,
+        acks: i16,
+        batches: Vec<ReadyWriteBatch>,
+    ) -> Result<Option<SendFuture<'_>>> {
         if batches.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         // Record attempted-send per-batch metrics for the whole drained set
@@ -334,100 +398,119 @@ impl Sender {
         // send attempt.
         self.record_request_batch_metrics(&batches);
 
-        let mut records_by_bucket = HashMap::new();
-        let mut write_batch_by_table: HashMap<TableId, Vec<TableBucket>> = HashMap::new();
-
-        for batch in batches {
-            let table_bucket = batch.table_bucket.clone();
-            write_batch_by_table
-                .entry(table_bucket.table_id())
-                .or_default()
-                .push(table_bucket.clone());
-            records_by_bucket.insert(table_bucket, batch);
-        }
-
         let cluster = self.metadata.get_cluster();
-
         let destination_node = match cluster.get_tablet_server(destination) {
             Some(node) => node,
             None => {
                 self.handle_batches_with_error(
-                    records_by_bucket.into_values().collect(),
+                    batches,
                     FlussError::LeaderNotAvailableException,
                     format!("Destination node not found in metadata cache {destination}."),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         };
         let connection = match self.metadata.get_connection(destination_node).await {
             Ok(connection) => connection,
             Err(e) => {
                 self.handle_batches_with_error(
-                    records_by_bucket.into_values().collect(),
+                    batches,
                     FlussError::NetworkException,
                     format!("Failed to connect destination node {destination}: {e}"),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         };
 
-        for (table_id, table_buckets) in write_batch_by_table {
-            let mut request_batches: Vec<ReadyWriteBatch> = table_buckets
-                .iter()
-                .filter_map(|bucket| records_by_bucket.remove(bucket))
-                .collect();
-
-            if request_batches.is_empty() {
+        // Connection setup may have yielded to response processing or a metadata refresh.
+        // Never dispatch an old writer's queued batch or bypass a changed bucket leader.
+        let cluster = self.metadata.get_cluster();
+        let mut request_batches = Vec::new();
+        let mut moved_batches = Vec::new();
+        for batch in batches {
+            if batch.write_batch.is_done() {
+                self.remove_from_inflight_batches(&batch);
                 continue;
             }
-
-            let write_request = match Self::build_write_request(
-                table_id,
-                acks,
-                self.max_request_timeout_ms,
-                &mut request_batches,
-            ) {
-                Ok(req) => req,
-                Err(e) => {
-                    self.handle_batches_with_local_error(
-                        request_batches,
-                        format!("Failed to build write request: {e}"),
-                    )?;
-                    continue;
-                }
-            };
-
-            // Snapshot after connection setup and request construction, immediately before
-            // dispatch. Refresh on every attempt, including retries, so an old out-of-order
-            // response can be distinguished from one with no subsequent ACK progress.
-            // Put batches back into records_by_bucket for response handling.
-            for mut request_batch in request_batches {
-                if self.idempotence_manager.is_enabled()
-                    && request_batch.write_batch.has_batch_sequence()
-                {
-                    let last_acked = self
-                        .idempotence_manager
-                        .last_acked_sequence(&request_batch.table_bucket);
-                    request_batch
-                        .write_batch
-                        .set_last_acked_sequence_at_send(last_acked);
-                }
-                records_by_bucket.insert(request_batch.table_bucket.clone(), request_batch);
+            let writer_id = batch.write_batch.writer_id();
+            if self.idempotence_manager.is_enabled()
+                && writer_id != NO_WRITER_ID
+                && writer_id != self.idempotence_manager.writer_id()
+            {
+                self.fail_batch(
+                    batch,
+                    broadcast::Error::WriteFailed {
+                        code: FlussError::UnknownWriterIdException.code(),
+                        message: "Writer ID changed before the queued batch was dispatched".into(),
+                    },
+                    Some(FlussError::UnknownWriterIdException),
+                    false,
+                );
+            } else if cluster
+                .leader_for(&batch.table_bucket)
+                .map(|node| node.id())
+                != Some(destination)
+            {
+                moved_batches.push(batch);
+            } else {
+                request_batches.push(batch);
             }
-
-            self.send_and_handle_response(
-                &connection,
-                write_request,
-                table_id,
-                &table_buckets,
-                &mut records_by_bucket,
+        }
+        if !moved_batches.is_empty() {
+            // Put these back through the normal retry gate before releasing the node slot.
+            self.handle_batches_with_error(
+                moved_batches,
+                FlussError::NotLeaderOrFollower,
+                "Bucket leader changed before the queued batch was dispatched".into(),
             )
             .await?;
+            // Metadata refresh above may reset writer state through other response futures.
+            // Requeue remaining unsent batches rather than dispatch using a stale snapshot.
+            for batch in request_batches {
+                self.re_enqueue_checked_batch(batch);
+            }
+            return Ok(None);
         }
-
-        Ok(())
+        if request_batches.is_empty() {
+            return Ok(None);
+        }
+        let table_id = request_batches[0].table_bucket.table_id();
+        debug_assert!(
+            request_batches
+                .iter()
+                .all(|b| b.table_bucket.table_id() == table_id)
+        );
+        let write_request = match Self::build_write_request(
+            table_id,
+            acks,
+            self.max_request_timeout_ms,
+            &mut request_batches,
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                self.handle_batches_with_local_error(
+                    request_batches,
+                    format!("Failed to build write request: {e}"),
+                )?;
+                return Ok(None);
+            }
+        };
+        let mut records_by_bucket = HashMap::new();
+        for mut batch in request_batches {
+            if self.idempotence_manager.is_enabled() && batch.write_batch.has_batch_sequence() {
+                let last_acked = self
+                    .idempotence_manager
+                    .last_acked_sequence(&batch.table_bucket);
+                batch
+                    .write_batch
+                    .set_last_acked_sequence_at_send(last_acked);
+            }
+            records_by_bucket.insert(batch.table_bucket.clone(), batch);
+        }
+        self.dispatch_and_handle_response(&connection, write_request, table_id, records_by_bucket)
+            .await
     }
 
     fn build_write_request(
@@ -479,47 +562,61 @@ impl Sender {
         Ok(request)
     }
 
-    async fn send_and_handle_response(
+    async fn dispatch_and_handle_response(
         &self,
         connection: &ServerConnection,
         write_request: WriteRequest,
         table_id: TableId,
-        table_buckets: &[TableBucket],
-        records_by_bucket: &mut HashMap<TableBucket, ReadyWriteBatch>,
-    ) -> Result<()> {
+        mut records_by_bucket: HashMap<TableBucket, ReadyWriteBatch>,
+    ) -> Result<Option<SendFuture<'_>>> {
         macro_rules! send {
             ($request:expr) => {{
-                // Record send latency for the request round trip regardless of
-                // outcome, so it is captured before the success/error branch.
                 let send_start = Instant::now();
-                let response_result = connection.request($request).await;
-                self.metrics
-                    .record_send_latency_ms(send_start.elapsed().as_secs_f64() * 1000.0);
-                match response_result {
-                    Ok(response) => {
-                        self.handle_write_response(
-                            table_id,
-                            table_buckets,
-                            records_by_bucket,
-                            response,
-                        )
-                        .await
-                    }
+                // Preserve the read task until ACK even if the RPC cache evicts this
+                // connection after dispatch (the old request future held this Arc).
+                let connection = Arc::clone(connection);
+                match connection.dispatch_request($request).await {
+                    Ok(pending) => Ok(Some(Box::pin(async move {
+                        let _connection = connection;
+                        let response_result = pending.receive().await;
+                        self.metrics
+                            .record_send_latency_ms(send_start.elapsed().as_secs_f64() * 1000.0);
+                        match response_result {
+                            Ok(response) => {
+                                let table_buckets: Vec<_> =
+                                    records_by_bucket.keys().cloned().collect();
+                                self.handle_write_response(
+                                    table_id,
+                                    &table_buckets,
+                                    &mut records_by_bucket,
+                                    response,
+                                )
+                                .await
+                            }
+                            Err(e) => {
+                                self.handle_batches_with_error(
+                                    records_by_bucket.into_values().collect(),
+                                    FlussError::NetworkException,
+                                    format!("Failed to receive write response: {e}"),
+                                )
+                                .await
+                            }
+                        }
+                    }) as SendFuture<'_>)),
                     Err(e) => {
+                        self.metrics
+                            .record_send_latency_ms(send_start.elapsed().as_secs_f64() * 1000.0);
                         self.handle_batches_with_error(
-                            table_buckets
-                                .iter()
-                                .filter_map(|b| records_by_bucket.remove(b))
-                                .collect(),
+                            records_by_bucket.into_values().collect(),
                             FlussError::NetworkException,
                             format!("Failed to send write request: {e}"),
                         )
-                        .await
+                        .await?;
+                        Ok(None)
                     }
                 }
             }};
         }
-
         match write_request {
             WriteRequest::ProduceLog(req) => send!(req),
             WriteRequest::PutKv(req) => send!(req),
@@ -633,8 +730,10 @@ impl Sender {
     }
 
     fn finish_batch(&self, ready_write_batch: ReadyWriteBatch, result: broadcast::Result<()>) {
+        // Even an already-completed batch must release its physical attempt's
+        // old-leader drain gate.
+        self.remove_from_inflight_batches(&ready_write_batch);
         if ready_write_batch.write_batch.complete(result) {
-            self.remove_from_inflight_batches(&ready_write_batch);
             // remove from incomplete batches
             self.accumulator
                 .remove_incomplete_batches(ready_write_batch.write_batch.batch_id())
@@ -797,7 +896,7 @@ impl Sender {
     }
 
     /// Record per-batch writer throughput/queue metrics for a drained set of
-    /// batches. Invoked once at the start of `send_write_request`, before the
+    /// batches. Invoked once at the start of `dispatch_write_request`, before the
     /// leader lookup / connection / serialization steps, so every drained
     /// batch is counted exactly once per send attempt regardless of whether
     /// the send later succeeds. Because this runs before serialization,
@@ -850,8 +949,8 @@ impl Sender {
         let batch_id = ready_write_batch.write_batch.batch_id();
         let mut in_flight_guard = self.in_flight_batches.lock();
         if let Some(in_flight) = in_flight_guard.get_mut(&ready_write_batch.table_bucket) {
-            in_flight.retain(|id| *id != batch_id);
-            if in_flight.is_empty() {
+            in_flight.batch_ids.retain(|id| *id != batch_id);
+            if in_flight.batch_ids.is_empty() {
                 in_flight_guard.remove(&ready_write_batch.table_bucket);
             }
         }
@@ -1033,10 +1132,9 @@ impl Sender {
         )
     }
 
-    /// Event-loop sender: drain batches and fire RPCs into a `FuturesUnordered`,
-    /// then process responses as they arrive. This interleaves drain cycles with
-    /// response handling — when a fast leader responds, we immediately drain and
-    /// send more batches for its buckets while slow leaders are still in-flight.
+    /// Event-loop sender: enqueue batches synchronously, dispatch one request per node,
+    /// and process responses independently. A node slot is released after writing the
+    /// frame, not after receiving its ACK. Other nodes remain independent.
     ///
     /// Slow work (writer-ID init with retry backoff, metadata refresh for
     /// unknown leaders) runs as concurrent maintenance tasks so it never blocks
@@ -1052,19 +1150,33 @@ impl Sender {
     /// - Each iteration either performs a sync drain tick (if flagged) or blocks
     ///   in a single `tokio::select!`.
     /// - `accumulator.notified()` is always listened to (producer wakeups).
-    /// - The idle timer is only armed when truly idle (no futures in any pool).
+    /// - Undrained batches keep their linger/throttle timer even while another
+    ///   node is connecting or waiting for a response.
     /// - When writer_id isn't ready, a drain tick is a no-op but the loop stays
     ///   responsive (notified/init/meta can still wake it).
     pub async fn run_with_shutdown(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         let mut pending: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
+        let mut dispatches: FuturesUnordered<DispatchFuture<'_>> = FuturesUnordered::new();
+        let mut queues = SendQueues::default();
         let mut init_futs: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
         let mut meta_futs: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
         let mut pending_unknown: HashSet<Arc<PhysicalTablePath>> = HashSet::new();
 
         let mut need_drain = true; // drain on first iteration to pick up any pre-existing batches
         let mut next_delay_ms: u64 = 1;
+        let mut shutting_down = false;
 
         loop {
+            if shutting_down
+                && !self.accumulator.has_undrained()
+                && queues.nodes.is_empty()
+                && pending.is_empty()
+                && init_futs.is_empty()
+                && meta_futs.is_empty()
+                && pending_unknown.is_empty()
+            {
+                break;
+            }
             // Sample buffer-pool gauges once per loop iteration. Cheap (three
             // field reads) and naturally sampled. Java registers these as
             // lazy gauge suppliers on the accumulator; the push model means
@@ -1101,15 +1213,13 @@ impl Sender {
                 if !self.idempotence_manager.is_enabled()
                     || self.idempotence_manager.has_writer_id()
                 {
-                    match self.drain_ready_sends() {
-                        Ok((futures, delay, unknown_leaders)) => {
+                    match self.drain_ready_sends(&queues) {
+                        Ok((batches, delay, unknown_leaders)) => {
                             if let Some(d) = delay {
-                                next_delay_ms = d;
+                                next_delay_ms = d.max(1);
                             }
                             pending_unknown.extend(unknown_leaders);
-                            for f in futures {
-                                pending.push(f);
-                            }
+                            queues.enqueue(batches);
                         }
                         Err(e) => {
                             warn!("Error in drain cycle: {e}");
@@ -1118,15 +1228,31 @@ impl Sender {
                 }
             }
 
-            let truly_idle = pending.is_empty() && init_futs.is_empty() && meta_futs.is_empty();
+            queues.dispatch(self, &dispatches);
+            // A slow node or metadata refresh must not suppress another node's timer.
+            let waiting_to_drain = self.accumulator.has_undrained() && init_futs.is_empty();
             debug_assert!(next_delay_ms >= 1);
 
             // One select to rule them all.
             tokio::select! {
-                _ = shutdown_rx.recv() => break,
+                _ = shutdown_rx.recv(), if !shutting_down => {
+                    shutting_down = true;
+                    self.accumulator.close();
+                    need_drain = true;
+                }
 
                 // Always listen for producer wakeups.
                 _ = self.accumulator.notified() => {
+                    need_drain = true;
+                }
+
+                Some((node, result)) = dispatches.next(), if !dispatches.is_empty() => {
+                    queues.complete_dispatch(node);
+                    match result {
+                        Ok(Some(response)) => pending.push(response),
+                        Ok(None) => {},
+                        Err(e) => warn!("Uncaught error dispatching write request: {e}"),
+                    }
                     need_drain = true;
                 }
 
@@ -1158,24 +1284,14 @@ impl Sender {
                 }
 
                 // Idle timer: batch timeout / linger expiry.
-                _ = tokio::time::sleep(Duration::from_millis(next_delay_ms)), if truly_idle => {
+                _ = tokio::time::sleep(Duration::from_millis(next_delay_ms)), if waiting_to_drain => {
                     need_drain = true;
                 }
             }
         }
 
-        // Graceful shutdown: drain remaining batches, then wait for all
-        // in-flight sends to complete.
-        while self.accumulator.has_undrained() {
-            if let Err(e) = self.run_once().await {
-                warn!("Error during shutdown drain, continuing: {e}");
-            }
-        }
-        while let Some(result) = pending.next().await {
-            if let Err(e) = result {
-                warn!("Error in send during shutdown, continuing: {e}");
-            }
-        }
+        // Shutdown uses the same dispatch and response loop, including retries. Never
+        // await an accumulator drain separately from responses that release its quota.
         self.close();
         Ok(())
     }
@@ -1184,6 +1300,9 @@ impl Sender {
         self.running.store(false, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod ordering_tests;
 
 enum WriteRequest {
     ProduceLog(ProduceLogRequest),
