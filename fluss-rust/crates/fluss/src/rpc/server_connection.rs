@@ -1081,7 +1081,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_partial_dispatch_still_poisoned_on_write_failure() {
-        let (client, server) = tokio::io::duplex(8);
+        let (writer, server) = tokio::io::duplex(8);
+        // Keep the read side open on an independent transport: otherwise dropping
+        // the write peer can poison via read EOF and mask a broken write-error path.
+        let (reader, _read_peer) = tokio::io::duplex(8);
+        let client = tokio::io::join(reader, writer);
         let conn = ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"));
         *conn.api_versions.lock() = Some(server_api_versions(&[PbApiVersion {
             api_key: 1014,

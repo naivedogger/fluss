@@ -62,11 +62,6 @@ type DrainResult = (
     HashSet<Arc<PhysicalTablePath>>,
 );
 
-struct InFlightBucket {
-    destination: i32,
-    batch_ids: Vec<i64>,
-}
-
 /// At most one drained round per node, split into table requests. Further batches stay in
 /// the accumulator, retaining its memory budget and retry ordering. Only the queue head
 /// may acquire a connection or a write lock; responses never occupy a dispatch slot.
@@ -123,7 +118,7 @@ pub struct Sender {
     running: AtomicBool,
     metadata: Arc<Metadata>,
     accumulator: Arc<RecordAccumulator>,
-    in_flight_batches: Mutex<HashMap<TableBucket, InFlightBucket>>,
+    in_flight_batches: Mutex<HashMap<TableBucket, Vec<i64>>>,
     max_request_size: i32,
     ack: i16,
     max_request_timeout_ms: i32,
@@ -281,24 +276,10 @@ impl Sender {
             ));
         }
 
-        // A new leader must not bypass attempts still owned by the previous leader.
-        // Once they complete or re-enqueue, the accumulator's sequence gate orders retries.
-        let excluded_buckets = self
-            .in_flight_batches
-            .lock()
-            .iter()
-            .filter(|(bucket, entry)| {
-                cluster
-                    .leader_for(bucket)
-                    .is_some_and(|node| node.id() != entry.destination)
-            })
-            .map(|(bucket, _)| bucket.clone())
-            .collect();
-        let batches = self.accumulator.drain_excluding_buckets(
+        let batches = self.accumulator.drain(
             cluster.clone(),
             &ready_check_result.ready_nodes,
             self.max_request_size,
-            &excluded_buckets,
         )?;
 
         if !batches.is_empty() {
@@ -348,16 +329,12 @@ impl Sender {
 
     fn add_to_inflight_batches(&self, batches: &HashMap<i32, Vec<ReadyWriteBatch>>) {
         let mut in_flight = self.in_flight_batches.lock();
-        for (&destination, batch_list) in batches {
+        for batch_list in batches.values() {
             for batch in batch_list {
-                let entry = in_flight
+                in_flight
                     .entry(batch.table_bucket.clone())
-                    .or_insert_with(|| InFlightBucket {
-                        destination,
-                        batch_ids: Vec::new(),
-                    });
-                debug_assert_eq!(entry.destination, destination);
-                entry.batch_ids.push(batch.write_batch.batch_id());
+                    .or_default()
+                    .push(batch.write_batch.batch_id());
             }
         }
     }
@@ -424,11 +401,10 @@ impl Sender {
             }
         };
 
-        // Connection setup may have yielded to response processing or a metadata refresh.
-        // Never dispatch an old writer's queued batch or bypass a changed bucket leader.
-        let cluster = self.metadata.get_cluster();
+        // Connection setup may have yielded to response processing and a writer reset.
+        // Discard completed batches and fail batches whose writer state is no longer valid.
+        // A leader change is handled by the normal server-error and retry path.
         let mut request_batches = Vec::new();
-        let mut moved_batches = Vec::new();
         for batch in batches {
             if batch.write_batch.is_done() {
                 self.remove_from_inflight_batches(&batch);
@@ -448,30 +424,9 @@ impl Sender {
                     Some(FlussError::UnknownWriterIdException),
                     false,
                 );
-            } else if cluster
-                .leader_for(&batch.table_bucket)
-                .map(|node| node.id())
-                != Some(destination)
-            {
-                moved_batches.push(batch);
             } else {
                 request_batches.push(batch);
             }
-        }
-        if !moved_batches.is_empty() {
-            // Put these back through the normal retry gate before releasing the node slot.
-            self.handle_batches_with_error(
-                moved_batches,
-                FlussError::NotLeaderOrFollower,
-                "Bucket leader changed before the queued batch was dispatched".into(),
-            )
-            .await?;
-            // Metadata refresh above may reset writer state through other response futures.
-            // Requeue remaining unsent batches rather than dispatch using a stale snapshot.
-            for batch in request_batches {
-                self.re_enqueue_checked_batch(batch);
-            }
-            return Ok(None);
         }
         if request_batches.is_empty() {
             return Ok(None);
@@ -730,8 +685,7 @@ impl Sender {
     }
 
     fn finish_batch(&self, ready_write_batch: ReadyWriteBatch, result: broadcast::Result<()>) {
-        // Even an already-completed batch must release its physical attempt's
-        // old-leader drain gate.
+        // Always remove the attempt, even if the batch was completed while it was in flight.
         self.remove_from_inflight_batches(&ready_write_batch);
         if ready_write_batch.write_batch.complete(result) {
             // remove from incomplete batches
@@ -949,8 +903,8 @@ impl Sender {
         let batch_id = ready_write_batch.write_batch.batch_id();
         let mut in_flight_guard = self.in_flight_batches.lock();
         if let Some(in_flight) = in_flight_guard.get_mut(&ready_write_batch.table_bucket) {
-            in_flight.batch_ids.retain(|id| *id != batch_id);
-            if in_flight.batch_ids.is_empty() {
+            in_flight.retain(|id| *id != batch_id);
+            if in_flight.is_empty() {
                 in_flight_guard.remove(&ready_write_batch.table_bucket);
             }
         }

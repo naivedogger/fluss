@@ -20,8 +20,11 @@ use crate::client::write::write_format::WriteFormat;
 use crate::client::{ResultHandle, WriteRecord};
 use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
 use crate::config::Config;
-use crate::metadata::TableInfo;
-use crate::proto::{ApiVersionsResponse, PbApiVersion};
+use crate::metadata::{JsonSerde, TableInfo};
+use crate::proto::{
+    ApiVersionsResponse, MetadataResponse, PbApiVersion, PbBucketMetadata, PbServerNode,
+    PbTableMetadata, PbTablePath,
+};
 use crate::record::LogRecordBatch;
 use crate::record::kv::KvRecordBatch;
 use crate::row::{Datum, GenericRow};
@@ -177,6 +180,59 @@ impl Fixture {
             self.sender.accumulator.buffer_total_bytes()
         );
     }
+
+    async fn move_leader(&self, table: usize, leader: i32) {
+        let info = &self.tables[table];
+        let descriptor = info
+            .to_table_descriptor()
+            .unwrap()
+            .serialize_json()
+            .unwrap();
+        self.sender
+            .metadata
+            .update(MetadataResponse {
+                tablet_servers: self
+                    .cluster
+                    .get_server_nodes()
+                    .iter()
+                    .map(|node| PbServerNode {
+                        node_id: node.id(),
+                        host: node.host().to_string(),
+                        port: node.port() as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+                table_metadata: vec![PbTableMetadata {
+                    table_path: PbTablePath {
+                        database_name: info.table_path.database().to_string(),
+                        table_name: info.table_path.table().to_string(),
+                    },
+                    table_id: info.table_id,
+                    schema_id: info.schema_id,
+                    table_json: serde_json::to_vec(&descriptor).unwrap(),
+                    bucket_metadata: vec![PbBucketMetadata {
+                        bucket_id: 0,
+                        leader_id: Some(leader),
+                        ..Default::default()
+                    }],
+                    created_time: info.created_time,
+                    modified_time: info.modified_time,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            self.sender
+                .metadata
+                .get_cluster()
+                .leader_for(&TableBucket::new(info.table_id, 0))
+                .unwrap()
+                .id(),
+            leader
+        );
+    }
 }
 
 async fn bounded(future: impl Future<Output = ()>) {
@@ -299,37 +355,6 @@ async fn cold_connection_cannot_overtake_predecessor() {
         // pipelining, not serialize complete request/response round trips.
         assert!(first.wait().now_or_never().is_none());
         assert!(second.wait().now_or_never().is_none());
-        ack(&mut stream, id0, FlussError::None).await;
-        ack(&mut stream, id1, FlussError::None).await;
-        assert!(first.wait().await.unwrap().is_ok());
-        assert!(second.wait().await.unwrap().is_ok());
-        fixture
-            .sender
-            .accumulator
-            .await_flush_completion()
-            .await
-            .unwrap();
-        fixture.finish(tx, task).await;
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn cold_connection_preserves_order_without_waiting_for_ack() {
-    bounded(async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fixture = Fixture::new(&[listener.local_addr().unwrap().port()], &[0], 5);
-        let first = fixture.append(0);
-        let (tx, task) = fixture.start();
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let hello = read_frame(&mut stream).await;
-        // The first batch is waiting for its handshake, not a response.
-        let second = fixture.append(0);
-        handshake(&mut stream, &hello).await;
-        let (id0, table0, seq0) = read_produce(&mut stream).await;
-        let (id1, table1, seq1) = read_produce(&mut stream).await;
-        assert_eq!((table0, seq0, table1, seq1), (1, 0, 1, 1));
-        assert!(first.wait().now_or_never().is_none());
         assert!(
             listener.accept().now_or_never().is_none(),
             "only one connection should be opened"
@@ -339,6 +364,12 @@ async fn cold_connection_preserves_order_without_waiting_for_ack() {
         assert!(second.wait().await.unwrap().is_ok());
         ack(&mut stream, id0, FlussError::None).await;
         assert!(first.wait().await.unwrap().is_ok());
+        fixture
+            .sender
+            .accumulator
+            .await_flush_completion()
+            .await
+            .unwrap();
         fixture.finish(tx, task).await;
     })
     .await;
@@ -650,31 +681,67 @@ fn queued_node_is_not_drained_again_before_dispatch_completes() {
     );
 }
 
-#[test]
-fn leader_change_waits_for_old_attempts_before_draining() {
-    let fixture = Fixture::new(&[9092, 9093], &[1], 5);
-    let bucket = TableBucket::new(1, 0);
-    fixture.sender.in_flight_batches.lock().insert(
-        bucket.clone(),
-        InFlightBucket {
-            destination: 1,
-            batch_ids: vec![999],
-        },
-    );
-    fixture.append(0);
-    let queues = SendQueues::default();
-    assert!(
-        fixture
-            .sender
-            .drain_ready_sends(&queues)
-            .unwrap()
-            .0
-            .is_empty()
-    );
-    fixture.sender.in_flight_batches.lock().remove(&bucket);
-    let batches = fixture.sender.drain_ready_sends(&queues).unwrap().0;
-    assert_eq!(batches[&2].len(), 1);
-    assert_eq!(batches[&2][0].write_batch.batch_sequence(), 0);
+#[tokio::test]
+async fn leader_change_retries_out_of_order_batches_without_resetting_writer() {
+    bounded(async {
+        let old_leader = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_leader = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fixture = Fixture::new(
+            &[
+                old_leader.local_addr().unwrap().port(),
+                new_leader.local_addr().unwrap().port(),
+            ],
+            &[0],
+            5,
+        );
+        let first = fixture.append(0);
+        let (tx, task) = fixture.start();
+        let (mut old_stream, _) = old_leader.accept().await.unwrap();
+        let hello = read_frame(&mut old_stream).await;
+        fixture.move_leader(0, 2).await;
+        handshake(&mut old_stream, &hello).await;
+        // A leader change during connection setup must not synthesize a server error:
+        // the already-selected attempt is sent and resolved by its actual response.
+        let (first_id, _, sequence) = read_produce(&mut old_stream).await;
+        assert_eq!(sequence, 0);
+
+        let second = fixture.append(0);
+        // The old attempt is unresolved, but it must not gate dispatch to the new leader.
+        let (mut new_stream, _) = new_leader.accept().await.unwrap();
+        let hello = read_frame(&mut new_stream).await;
+        handshake(&mut new_stream, &hello).await;
+        let (second_id, _, sequence) = read_produce(&mut new_stream).await;
+        assert_eq!(sequence, 1);
+        assert!(first.wait().now_or_never().is_none());
+        ack(
+            &mut new_stream,
+            second_id,
+            FlussError::OutOfOrderSequenceException,
+        )
+        .await;
+        // Wait for the response handler to re-enqueue sequence 1. Its predecessor
+        // is still in flight, so the normal retry gate must keep it queued.
+        while !fixture.sender.accumulator.has_undrained() {
+            tokio::task::yield_now().await;
+        }
+        assert!(second.wait().now_or_never().is_none());
+        assert_eq!(fixture.sender.idempotence_manager.writer_id(), 42);
+
+        // A timed-out old attempt is retried on the new leader. The retry queue
+        // must restore 0, 1 ordering even though sequence 1's error arrived first.
+        ack(&mut old_stream, first_id, FlussError::RequestTimeOut).await;
+        let (retry0, _, sequence) = read_produce(&mut new_stream).await;
+        assert_eq!(sequence, 0);
+        ack(&mut new_stream, retry0, FlussError::None).await;
+        assert!(first.wait().await.unwrap().is_ok());
+        let (retry1, _, sequence) = read_produce(&mut new_stream).await;
+        assert_eq!(sequence, 1);
+        ack(&mut new_stream, retry1, FlussError::None).await;
+        assert!(second.wait().await.unwrap().is_ok());
+        assert_eq!(fixture.sender.idempotence_manager.writer_id(), 42);
+        fixture.finish(tx, task).await;
+    })
+    .await;
 }
 
 #[test]
