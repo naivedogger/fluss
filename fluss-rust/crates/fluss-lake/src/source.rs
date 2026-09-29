@@ -35,6 +35,8 @@ use std::fmt::{Debug, Formatter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LakeReadSemantics {
     /// Every selected append record, without introducing duplicates.
+    /// Each planned task must be independently readable; the executor may
+    /// schedule tasks from the same bucket concurrently.
     Append,
     /// A snapshot current view: at most one live row per full primary key.
     ///
@@ -110,12 +112,13 @@ pub struct LakePlannerContext<'a> {
     pub filter: &'a BoundPredicate,
 }
 
-/// Immutable input to a lake reader, created from a bound UnionRead plan.
+/// Immutable lake-reader input from frozen tasks and the execution-side scan settings.
 pub struct LakeReaderContext<'a> {
     pub table_info: &'a TableInfo,
     pub snapshot_id: i64,
     pub semantics: LakeReadSemantics,
-    /// All selected lake tasks for ONE logical partition/bucket.
+    /// Tasks for one partition/bucket. Append reads receive one independently
+    /// readable task; primary-key reads receive the entire selected group.
     pub splits: &'a [LakeSplit],
     /// Fluss field indexes, including hidden filter and primary-key columns.
     /// Return columns in exactly this order; indexes refer to the full table.

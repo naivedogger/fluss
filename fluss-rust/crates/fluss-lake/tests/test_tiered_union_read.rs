@@ -27,7 +27,8 @@ use fluss::metadata::TablePath;
 use fluss::predicate::col;
 use fluss_lake::{
     FlussLakeReadContext, FlussLakeReadSplit, FlussLakeTable, LakePlannerContext,
-    LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource, RecordBatchStream,
+    LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource,
+    RecordBatchStream,
 };
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
@@ -35,6 +36,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("Java fixture must set {name}"))
@@ -45,6 +47,8 @@ struct DelegatingLakeSource {
     inner: PaimonLakeSource,
     plans: AtomicUsize,
     reads: AtomicUsize,
+    lake_gate: Option<Arc<Semaphore>>,
+    read_only: bool,
 }
 
 impl LakeSource for DelegatingLakeSource {
@@ -55,6 +59,7 @@ impl LakeSource for DelegatingLakeSource {
         &'a self,
         context: LakePlannerContext<'a>,
     ) -> BoxFuture<'a, fluss_lake::Result<Vec<LakeSplit>>> {
+        assert!(!self.read_only, "worker must not invoke lake planning");
         self.plans.fetch_add(1, Ordering::Relaxed);
         self.inner.plan(context)
     }
@@ -63,7 +68,19 @@ impl LakeSource for DelegatingLakeSource {
         context: LakeReaderContext<'a>,
     ) -> BoxFuture<'a, fluss_lake::Result<RecordBatchStream>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.read(context)
+        if context.semantics == LakeReadSemantics::Append {
+            assert_eq!(
+                context.splits.len(),
+                1,
+                "append lake tasks must be independent"
+            );
+        }
+        Box::pin(async move {
+            if let Some(gate) = &self.lake_gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            self.inner.read(context).await
+        })
     }
 }
 
@@ -126,12 +143,15 @@ async fn verify() {
         .get_table_info(&path)
         .await
         .unwrap();
+    let lake_gate = (scenario == "append").then(|| Arc::new(Semaphore::new(0)));
     let custom_source = Arc::new(DelegatingLakeSource {
         inner: PaimonLakeSource::new(&info, &properties).unwrap(),
         plans: AtomicUsize::new(0),
         reads: AtomicUsize::new(0),
+        lake_gate: lake_gate.clone(),
+        read_only: false,
     });
-    let table = FlussLakeTable::open_with_properties(connection, &path, properties)
+    let table = FlussLakeTable::open_with_properties(connection, &path, properties.clone())
         .await
         .unwrap();
     if scenario.contains('-') {
@@ -153,9 +173,16 @@ async fn verify() {
         "log tail must not be empty"
     );
     range.validate_available().unwrap();
-    assert_eq!(plan.splits().len(), 1);
-    let split: FlussLakeReadSplit =
-        serde_json::from_slice(&serde_json::to_vec(&plan.splits()[0]).unwrap()).unwrap();
+    if scenario == "pk" {
+        assert_eq!(plan.splits().len(), 1);
+    } else {
+        assert!(
+            plan.splits().len() >= 2,
+            "lake and log must be separate tasks"
+        );
+    }
+    let splits: Vec<FlussLakeReadSplit> =
+        serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
     let expected = if scenario == "pk" {
         vec![(1, "tail-new"), (3, "lake-keep"), (4, "tail-insert")]
     } else {
@@ -171,12 +198,12 @@ async fn verify() {
     .map(|(id, name)| (id, name.to_owned()))
     .collect::<Vec<_>>();
     let reader = plan.new_reader();
-    let mut foreign = split.clone();
+    let mut foreign = splits[0].clone();
     foreign.split_id.push_str("-foreign");
     assert!(reader.read_split(&foreign).await.is_err());
     assert!(
         reader
-            .read_splits(&[split.clone(), split.clone()])
+            .read_splits(&[splits[0].clone(), splits[0].clone()])
             .await
             .is_err()
     );
@@ -186,9 +213,9 @@ async fn verify() {
             .await
             .is_err()
     );
-    for _ in 0..2 {
+    for concurrency in [1, 4] {
         let batches = reader
-            .read_split(&split)
+            .read_splits_with_concurrency(&splits, concurrency)
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -197,10 +224,49 @@ async fn verify() {
         assert_eq!(
             rows(&batches),
             expected,
-            "transport/retry must preserve the current view"
+            "serial and concurrent transported reads must preserve the current view"
         );
         assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
     }
+    drop(reader);
+    drop(plan);
+    drop(scan);
+    // Restore only the scan configuration and transported tasks on a fresh
+    // connection. The worker backend must read, never enumerate lake files.
+    let worker_source = Arc::new(DelegatingLakeSource {
+        inner: PaimonLakeSource::new(&info, &properties).unwrap(),
+        plans: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+        lake_gate: None,
+        read_only: true,
+    });
+    let worker_connection = Arc::new(
+        FlussConnection::new(Config {
+            bootstrap_servers: required_env("FLUSS_RUST_UNION_READ_BOOTSTRAP_SERVERS"),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    let worker_table = FlussLakeTable::open_with_properties(worker_connection, &path, properties)
+        .await
+        .unwrap();
+    let worker = worker_table
+        .new_scan()
+        .with_batch_size(1)
+        .with_lake_source(worker_source.clone())
+        .new_reader();
+    let batches = worker
+        .read_splits(&splits)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows(&batches), expected);
+    assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
+    assert_eq!(worker_source.plans.load(Ordering::Relaxed), 0);
+    assert!(worker_source.reads.load(Ordering::Relaxed) > 0);
     let lake_scan = table.new_scan().with_lake_only(true);
     let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
     let baseline = lake_plan
@@ -221,17 +287,18 @@ async fn verify() {
     );
     // Count scans must preserve rows even though the output has no columns.
     for (lake_only, count) in [(false, expected.len()), (true, 3)] {
-        let count_plan = table
+        let count_scan = table
             .new_scan()
             .with_lake_only(lake_only)
             .with_projection(vec![])
-            .with_batch_size(2)
-            .plan_with_context(&context)
-            .await
-            .unwrap();
-        let batches = count_plan
+            .with_batch_size(2);
+        let count_plan = count_scan.plan_with_context(&context).await.unwrap();
+        let count_splits: Vec<FlussLakeReadSplit> =
+            serde_json::from_slice(&serde_json::to_vec(count_plan.splits()).unwrap()).unwrap();
+        drop(count_plan);
+        let batches = count_scan
             .new_reader()
-            .read_splits(count_plan.splits())
+            .read_splits(&count_splits)
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -253,17 +320,39 @@ async fn verify() {
         .plan_with_context(&context)
         .await
         .unwrap();
-    let batches = custom_plan
+    let mut stream = custom_plan
         .new_reader()
-        .read_splits(custom_plan.splits())
-        .await
-        .unwrap()
-        .try_collect::<Vec<_>>()
+        .read_splits_with_concurrency(custom_plan.splits(), custom_plan.split_count())
         .await
         .unwrap();
+    let mut batches = Vec::new();
+    if let Some(gate) = lake_gate {
+        // Even a blocked lake reader must not delay the independent log task.
+        let first = tokio::time::timeout(Duration::from_secs(10), stream.try_next())
+            .await
+            .expect("append log task was blocked by the lake reader")
+            .unwrap()
+            .expect("append log tail must produce a batch");
+        assert!(first.num_rows() > 0);
+        assert!(
+            rows(std::slice::from_ref(&first))
+                .iter()
+                .all(|row| row.0 >= 4)
+        );
+        batches.push(first);
+        gate.add_permits(custom_plan.split_count());
+    }
+    batches.extend(stream.try_collect::<Vec<_>>().await.unwrap());
     assert_eq!(rows(&batches), expected);
     assert_eq!(custom_source.plans.load(Ordering::Relaxed), 1);
-    assert_eq!(custom_source.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        custom_source.reads.load(Ordering::Relaxed),
+        if scenario == "pk" {
+            1
+        } else {
+            custom_plan.split_count() - 1
+        }
+    );
     if scenario == "pk" {
         // Filtering before reconciliation would resurrect old/removed baseline rows.
         for (value, count) in [("lake-old", 0), ("lake-delete", 0), ("tail-new", 1)] {
@@ -272,9 +361,11 @@ async fn verify() {
                 .with_filter(col("name").eq(value))
                 .with_projection(vec![1]);
             let plan = filtered.plan_with_context(&context).await.unwrap();
-            let batches = plan
+            let filtered_splits = plan.splits().to_vec();
+            drop(plan);
+            let batches = filtered
                 .new_reader()
-                .read_splits(plan.splits())
+                .read_splits(&filtered_splits)
                 .await
                 .unwrap()
                 .try_collect::<Vec<_>>()
@@ -383,7 +474,9 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
             .unwrap();
         partition_rows(&batches)
     };
-    let batches = plan
+    drop(plan);
+    let batches = table
+        .new_scan()
         .new_reader()
         .read_splits(&transported)
         .await

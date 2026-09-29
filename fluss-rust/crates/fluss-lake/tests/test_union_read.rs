@@ -116,9 +116,35 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         reused_plan.read_context().to_json().unwrap(),
         context.to_json().unwrap()
     );
-    let ids_reader = reused_plan.new_reader();
+    let ids_splits: Vec<FlussLakeReadSplit> =
+        serde_json::from_slice(&serde_json::to_vec(reused_plan.splits()).unwrap()).unwrap();
+    drop(reused_plan);
+    // A worker has only the original tasks and matching scan settings. It must
+    // not replan and include the rows written after the frozen stop offset.
+    let ids_reader = lake_table.new_scan().with_projection(vec![0]).new_reader();
+    assert!(
+        ids_reader
+            .read_splits(&[ids_splits[0].clone(), ids_splits[0].clone()])
+            .await
+            .is_err()
+    );
+    let mut incompatible = ids_splits[0].clone();
+    incompatible.descriptor_version += 1;
+    assert!(matches!(
+        ids_reader.read_split(&incompatible).await,
+        Err(FlussLakeError::IncompatibleSplitVersion(_))
+    ));
+    assert!(
+        lake_table
+            .new_scan()
+            .with_batch_size(0)
+            .new_reader()
+            .read_splits(&[])
+            .await
+            .is_err()
+    );
     let mut ids: Vec<i32> = Vec::new();
-    for split in reused_plan.splits() {
+    for split in &ids_splits {
         let batches = tokio::time::timeout(
             Duration::from_secs(10),
             ids_reader
@@ -164,6 +190,14 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         other.new_scan().plan_with_context(&context).await,
         Err(FlussLakeError::InvalidReadContext(_))
     ));
+    assert!(matches!(
+        other
+            .new_scan()
+            .new_reader()
+            .read_split(&ids_splits[0])
+            .await,
+        Err(FlussLakeError::PlanningFailed(_))
+    ));
     // Inject captured retention evidence through public transport to verify
     // mode-specific planning. This does not simulate server-side truncation.
     let mut gap = serde_json::to_value(&context).unwrap();
@@ -184,7 +218,14 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             .is_empty()
     );
 
-    let read = plan.new_reader();
+    // The coordinator's plan and scan can be dropped before worker execution.
+    drop(plan);
+    drop(scan);
+    let read = lake_table
+        .new_scan()
+        .with_projection(vec![1])
+        .with_filter(col("id").eq(2_i32))
+        .new_reader();
     let stream = read
         .read_split(&transported_split)
         .await
@@ -304,23 +345,24 @@ async fn stale_schema_split_is_rejected_after_alter_table() {
 
     // `read_split` is asynchronous and lazy: schema drift is an environment
     // failure, so it surfaces as the first item of the returned stream.
-    let read = plan.new_reader();
-    let stream = read
-        .read_split(&stale_split)
-        .await
-        .expect("Opening a stale-schema split stream must not fail structurally");
-    let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-        .await
-        .expect("Timed out waiting for the stale-schema split to fail");
-    match result {
-        Err(FlussLakeError::SchemaIncompatible(message)) => {
-            assert!(
-                message.contains("schema id"),
-                "unexpected schema error: {message}"
-            );
+    for read in [plan.new_reader(), scan.new_reader()] {
+        let stream = read
+            .read_split(&stale_split)
+            .await
+            .expect("Opening a stale-schema split stream must not fail structurally");
+        let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
+            .await
+            .expect("Timed out waiting for the stale-schema split to fail");
+        match result {
+            Err(FlussLakeError::SchemaIncompatible(message)) => {
+                assert!(
+                    message.contains("schema id"),
+                    "unexpected schema error: {message}"
+                );
+            }
+            Err(other) => panic!("expected a schema-incompatible error, got: {other}"),
+            Ok(_) => panic!("stale-schema split must not execute after alter table"),
         }
-        Err(other) => panic!("expected a schema-incompatible error, got: {other}"),
-        Ok(_) => panic!("stale-schema split must not execute after alter table"),
     }
 
     drop(writer);

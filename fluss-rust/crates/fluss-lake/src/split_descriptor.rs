@@ -22,7 +22,7 @@ use std::collections::HashSet;
 
 /// Frozen execution state for one logical `(partition, bucket)` split.
 ///
-/// Projection, filtering and read mode belong to the owning immutable plan.
+/// Projection, filtering and read mode belong to the immutable reader configuration.
 /// Lake task payloads are encoded and interpreted only by their LakeSource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

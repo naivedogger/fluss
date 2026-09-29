@@ -43,12 +43,14 @@ impl SplitStatistics {
 
 pub use crate::partition::FlussLakePartitionIdentity;
 
-/// One logical `(partition, bucket)` bounded read unit.
+/// One bounded read task belonging to a `(partition, bucket)`.
 ///
-/// Physical lake splits remain private inside `execution_descriptor`.
+/// Append plans have separate tasks for each lake split and each nonempty log
+/// tail. Primary-key plans keep a bucket's lake baseline and tail together.
+/// Task payloads remain private inside `execution_descriptor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlussLakeReadSplit {
-    /// Opaque identifier for logging and diagnostics.
+    /// Opaque identifier unique within the owning plan, not across replanning.
     pub split_id: String,
     /// Fluss bucket represented by this logical split.
     pub bucket_id: i32,
