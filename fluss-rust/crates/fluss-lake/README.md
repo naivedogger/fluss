@@ -262,7 +262,14 @@ equivalent algorithm under the same semantics.
   batches are released; partially live batches can retain obsolete buffers.
   Survivor output is incremental, but survivor indexes also consume memory.
 - The optional backend uses Paimon 0.3 and supports Parquet. Its Arrow 58 batches
-  cross into workspace Arrow 59 through the Arrow C Data Interface.
+  cross into workspace Arrow 59 through the Arrow C Data Interface. The adapter
+  then reconciles nested Arrow field representations, fixed-length binary and
+  temporal units with the frozen physical schema. Invalid binary lengths,
+  temporal precision loss/overflow and unrelated type changes fail with
+  `SchemaIncompatible`; values are not silently truncated or replaced with null.
+- Bucket-key pruning has a bounded candidate/hashing budget and does not
+  materialize the Cartesian product of `IN` lists. When the budget is exceeded,
+  it keeps all buckets and leaves correctness to the final exact filter.
 - Context version 2, default split descriptor version 3 and backend payload
   versions are separate. This revision does not accept old V1 contexts or V1/V2 default splits.
   Unknown versions fail explicitly. Receive contexts from trusted coordinators;
@@ -293,6 +300,11 @@ cargo test -p fluss-lake --features integration_tests --test test_prepare --test
 The `lake-msrv` CI job checks default and all-feature targets on Rust 1.91.0
 and runs the Paimon library unit tests. Its all-feature check compiles, but
 does not execute, service-backed integration tests.
+
+Paimon library tests also write and read real local Parquet files for append and
+PK baselines, checking ARRAY, BINARY and TIMESTAMP adaptation with nulls and
+reordered/pruned projections. This backend regression runs without a Fluss
+cluster, Java or Docker; it does not replace the tiering interoperability suite.
 
 The `integration_tests` feature requires Docker for the Fluss log-only tests.
 Preparation and log-only cases share the existing cluster support; no shared

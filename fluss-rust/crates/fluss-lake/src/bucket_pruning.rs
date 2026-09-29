@@ -28,6 +28,10 @@ use fluss::row::GenericRow;
 use fluss::row::encode::KeyEncoderFactory;
 use std::collections::{HashMap, HashSet};
 
+// Pruning is optional: bound both candidate storage and the number of key
+// values hashed, falling back to the exact output filter for larger predicates.
+const MAX_BUCKET_PRUNING_WORK: usize = 4096;
+
 /// Decides which buckets may contain rows that satisfy the scan filter.
 pub(crate) struct BucketPruner {
     matching_buckets: Option<HashSet<i32>>,
@@ -59,6 +63,11 @@ impl BucketPruner {
                 };
             }
         };
+        let Some(combination_count) = constraints.combination_count() else {
+            return Self {
+                matching_buckets: None,
+            };
+        };
 
         match compute_matching_buckets(
             row_type,
@@ -66,10 +75,8 @@ impl BucketPruner {
             num_buckets,
             data_lake_format,
             &constraints,
+            combination_count,
         ) {
-            Ok(buckets) if buckets.is_empty() => Self {
-                matching_buckets: Some(buckets),
-            },
             Ok(buckets) => Self {
                 matching_buckets: Some(buckets),
             },
@@ -90,33 +97,30 @@ impl BucketPruner {
 
 /// Equality values extracted for each bucket-key column.
 #[derive(Debug, Clone)]
-struct BucketConstraints {
-    values: Vec<Vec<BoundLiteral>>,
+struct BucketConstraints<'a> {
+    values: Vec<Vec<&'a BoundLiteral>>,
 }
 
-impl BucketConstraints {
-    fn combinations(&self) -> Vec<Vec<BoundLiteral>> {
-        let mut combinations: Vec<Vec<BoundLiteral>> = vec![Vec::new()];
-        for column_values in &self.values {
-            let mut next = Vec::with_capacity(combinations.len() * column_values.len());
-            for combination in &combinations {
-                for value in column_values {
-                    let mut extended = combination.clone();
-                    extended.push(value.clone());
-                    next.push(extended);
-                }
-            }
-            combinations = next;
-        }
-        combinations
+impl BucketConstraints<'_> {
+    fn combination_count(&self) -> Option<usize> {
+        let count = self.values.iter().try_fold(1_usize, |count, values| {
+            count
+                .checked_mul(values.len())
+                .filter(|count| *count <= MAX_BUCKET_PRUNING_WORK)
+        })?;
+        (count.checked_mul(self.values.len())? <= MAX_BUCKET_PRUNING_WORK).then_some(count)
     }
 }
 
-fn extract_bucket_constraints(
-    filter: &BoundPredicate,
+fn extract_bucket_constraints<'a>(
+    filter: &'a BoundPredicate,
     bucket_keys: &[String],
-) -> Option<BucketConstraints> {
-    let mut per_column: HashMap<&str, Vec<BoundLiteral>> = HashMap::new();
+) -> Option<BucketConstraints<'a>> {
+    if bucket_keys.len() > MAX_BUCKET_PRUNING_WORK {
+        return None;
+    }
+    let mut per_column: HashMap<&str, Vec<&BoundLiteral>> = HashMap::new();
+    let mut value_count = 0_usize;
 
     // Collect equality constraints from the top-level AND structure.
     let mut worklist: Vec<&BoundPredicate> = vec![filter];
@@ -128,31 +132,24 @@ fn extract_bucket_constraints(
             } => worklist.extend(children),
             BoundPredicate::Leaf {
                 field_name,
-                function: LeafFunction::Equal,
+                function: LeafFunction::Equal | LeafFunction::In,
                 literals,
                 ..
             } if bucket_keys.contains(field_name) => {
+                value_count = value_count.checked_add(literals.len())?;
+                if value_count > MAX_BUCKET_PRUNING_WORK {
+                    return None;
+                }
                 per_column
                     .entry(field_name.as_str())
                     .or_default()
-                    .extend(literals.iter().cloned());
-            }
-            BoundPredicate::Leaf {
-                field_name,
-                function: LeafFunction::In,
-                literals,
-                ..
-            } if bucket_keys.contains(field_name) => {
-                per_column
-                    .entry(field_name.as_str())
-                    .or_default()
-                    .extend(literals.iter().cloned());
+                    .extend(literals);
             }
             _ => {}
         }
     }
 
-    let values: Vec<Vec<BoundLiteral>> = bucket_keys
+    let values: Vec<Vec<&BoundLiteral>> = bucket_keys
         .iter()
         .map(|key| per_column.remove(key.as_str()).unwrap_or_default())
         .collect();
@@ -168,7 +165,8 @@ fn compute_matching_buckets(
     bucket_keys: &[String],
     num_buckets: i32,
     data_lake_format: &Option<DataLakeFormat>,
-    constraints: &BucketConstraints,
+    constraints: &BucketConstraints<'_>,
+    combination_count: usize,
 ) -> crate::Result<HashSet<i32>> {
     let mut encoder =
         KeyEncoderFactory::of_bucket_key_encoder(row_type, bucket_keys, data_lake_format).map_err(
@@ -191,10 +189,13 @@ fn compute_matching_buckets(
         .collect();
 
     let mut buckets = HashSet::new();
-    for combination in constraints.combinations() {
+    // Enumerate one mixed-radix candidate at a time, never materializing the
+    // Cartesian product. The caller has already bounded total hashing work.
+    for mut index in 0..combination_count {
         let mut row = GenericRow::new(row_type.fields().len());
-        for (position, value) in key_positions.iter().zip(combination.iter()) {
-            row.set_field(*position, value.to_datum());
+        for (position, values) in key_positions.iter().zip(&constraints.values) {
+            row.set_field(*position, values[index % values.len()].to_datum());
+            index /= values.len();
         }
         let key_bytes = encoder.encode_key(&row).map_err(|error| {
             crate::FlussLakeError::PlanningFailed(format!(
@@ -209,6 +210,9 @@ fn compute_matching_buckets(
                 ))
             })?;
         buckets.insert(bucket_id);
+        if buckets.len() == num_buckets as usize {
+            break;
+        }
     }
     Ok(buckets)
 }
@@ -303,5 +307,71 @@ mod tests {
         let matching: Vec<i32> = (0..4).filter(|id| pruner.bucket_may_match(*id)).collect();
         assert!(!matching.is_empty());
         assert!(matching.len() <= 2);
+    }
+
+    #[test]
+    fn large_cartesian_product_keeps_all_buckets() {
+        let filter = bound(
+            col("id")
+                .is_in(0..100_i32)
+                .and(col("region").is_in((0..100).map(|i| i.to_string()))),
+        );
+        let keys = vec!["id".to_string(), "region".to_string()];
+        let constraints = extract_bucket_constraints(&filter, &keys).unwrap();
+        assert_eq!(constraints.combination_count(), None);
+        let pruner = BucketPruner::new(&row_type(), &keys, 128, &None, &filter);
+        assert!(pruner.matching_buckets.is_none());
+        assert!((0..128).all(|bucket| pruner.bucket_may_match(bucket)));
+    }
+
+    #[test]
+    fn oversized_single_in_list_skips_candidate_collection() {
+        let filter = bound(col("id").is_in(0..=MAX_BUCKET_PRUNING_WORK as i32));
+        let keys = vec!["id".to_string()];
+        assert!(extract_bucket_constraints(&filter, &keys).is_none());
+        let pruner = BucketPruner::new(&row_type(), &keys, 4, &None, &filter);
+        assert!(pruner.matching_buckets.is_none());
+    }
+
+    #[test]
+    fn combination_budget_includes_key_width_and_cannot_overflow() {
+        let filter = bound(col("id").eq(1_i32));
+        let keys = vec!["id".to_string()];
+        let constraints = extract_bucket_constraints(&filter, &keys).unwrap();
+        let value = constraints.values[0][0];
+        let at_limit = BucketConstraints {
+            values: vec![vec![value; 64], vec![value; 32]],
+        };
+        assert_eq!(at_limit.combination_count(), Some(2048));
+        let above_limit = BucketConstraints {
+            values: vec![vec![value; 64], vec![value; 33]],
+        };
+        assert_eq!(above_limit.combination_count(), None);
+        let overflow = BucketConstraints {
+            values: vec![vec![value; 2]; usize::BITS as usize],
+        };
+        assert_eq!(overflow.combination_count(), None);
+    }
+
+    #[test]
+    fn lazy_combinations_match_individually_pruned_keys() {
+        let keys = vec!["id".to_string(), "region".to_string()];
+        for format in [None, Some(DataLakeFormat::Paimon)] {
+            let filter = bound(
+                col("id")
+                    .is_in([1_i32, 2, 3])
+                    .and(col("region").is_in(["US", "EU"])),
+            );
+            let pruner = BucketPruner::new(&row_type(), &keys, 128, &format, &filter);
+            let mut expected = HashSet::new();
+            for id in [1_i32, 2, 3] {
+                for region in ["US", "EU"] {
+                    let single = bound(col("id").eq(id).and(col("region").eq(region)));
+                    let single = BucketPruner::new(&row_type(), &keys, 128, &format, &single);
+                    expected.extend(single.matching_buckets.unwrap());
+                }
+            }
+            assert_eq!(pruner.matching_buckets, Some(expected));
+        }
     }
 }
