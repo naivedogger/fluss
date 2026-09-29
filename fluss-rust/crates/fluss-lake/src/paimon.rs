@@ -43,6 +43,8 @@ use paimon::{CatalogFactory, DataSplit, DeletionFile, Options};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
+mod arrow_conversion;
+
 /// Default Paimon LakeSource. Planning and reading share the same catalog mapping.
 /// Credentials stay in this runtime object, never in the split payload.
 #[derive(Clone)]
@@ -753,10 +755,12 @@ async fn read_snapshot_splits(
         .to_arrow(&splits)
         .map_err(|error| paimon_error("read Paimon splits", error))?;
 
-    Ok(Box::pin(stream.map(|result| {
+    let schema = context.schema;
+    Ok(Box::pin(stream.map(move |result| {
         result
             .map_err(|error| paimon_error("read Paimon split batch", error))
             .and_then(upgrade_paimon_arrow_batch)
+            .and_then(|batch| arrow_conversion::normalize_batch(batch, schema.clone()))
     })))
 }
 
@@ -1031,6 +1035,225 @@ mod tests {
 
         assert_eq!(imported.schema().field(0).name(), "id");
         assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
+    }
+
+    #[tokio::test]
+    async fn parquet_reader_adapts_logical_types_for_append_and_primary_key_baselines() {
+        use crate::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource};
+        use arrow::array::{Array, AsArray};
+        use arrow_array_58::Array as _;
+        use futures::TryStreamExt;
+        use paimon::spec::{ArrayType, BinaryType, DataType as PaimonType, IntType, TimestampType};
+
+        // Use real local Parquet files, not mocked batches. The guard also
+        // removes the warehouse on assertion failure without an extra dependency.
+        struct Warehouse(std::path::PathBuf);
+        impl Drop for Warehouse {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("fluss-lake-types-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let warehouse = Warehouse(path);
+        let warehouse_path = warehouse.0.to_str().unwrap();
+        let mut options = Options::default();
+        options.set("warehouse", warehouse_path);
+        let catalog = CatalogFactory::create(options).await.unwrap();
+        catalog
+            .create_database("types", false, HashMap::new())
+            .await
+            .unwrap();
+        for primary_key in [false, true] {
+            let name = if primary_key { "pk" } else { "append" };
+            let identifier = Identifier::new("types", name);
+            let mut lake_schema = paimon::spec::Schema::builder()
+                .column("id", PaimonType::Int(IntType::new()))
+                .column(
+                    "items",
+                    PaimonType::Array(ArrayType::new(PaimonType::Int(IntType::new()))),
+                )
+                .column("bytes", PaimonType::Binary(BinaryType::new(4).unwrap()))
+                .column("ts", PaimonType::Timestamp(TimestampType::new(0).unwrap()))
+                .option("bucket", "1")
+                .option("bucket-key", "id")
+                .option("file.format", "parquet");
+            let mut fluss_schema = Schema::builder()
+                .column("id", DataTypes::int())
+                .column("items", DataTypes::array(DataTypes::int()))
+                .column("bytes", DataTypes::binary(4))
+                .column("ts", DataTypes::timestamp_with_precision(0));
+            if primary_key {
+                lake_schema = lake_schema.primary_key(["id"]);
+                fluss_schema = fluss_schema.primary_key(vec!["id"]).unwrap();
+            }
+            catalog
+                .create_table(&identifier, lake_schema.build().unwrap(), false)
+                .await
+                .unwrap();
+            let lake_table = catalog.get_table(&identifier).await.unwrap();
+            let schema58 =
+                paimon::arrow::build_target_arrow_schema(lake_table.schema().fields()).unwrap();
+            let list = arrow_array_58::ListArray::from_iter_primitive::<
+                arrow_array_58::types::Int32Type,
+                _,
+                _,
+            >(vec![Some(vec![Some(1), None]), None, Some(vec![])]);
+            // Use Paimon's actual list child field, rather than Arrow's default.
+            let list = arrow_array_58::make_array(
+                list.to_data()
+                    .into_builder()
+                    .data_type(schema58.field(1).data_type().clone())
+                    .build()
+                    .unwrap(),
+            );
+            let input = arrow_array_58::RecordBatch::try_new(
+                schema58,
+                vec![
+                    Arc::new(Int32Array58::from(vec![1, 2, 3])),
+                    list,
+                    Arc::new(arrow_array_58::BinaryArray::from(vec![
+                        Some(b"abcd".as_slice()),
+                        None,
+                        Some(b"\0\0\xff\0".as_slice()),
+                    ])),
+                    Arc::new(arrow_array_58::TimestampMillisecondArray::from(vec![
+                        Some(-2000),
+                        None,
+                        Some(3000),
+                    ])),
+                ],
+            )
+            .unwrap();
+            let write_builder = lake_table.new_write_builder();
+            let mut writer = write_builder.new_write().unwrap();
+            writer.write_arrow_batch(&input).await.unwrap();
+            let commits = writer.prepare_commit().await.unwrap();
+            assert!(
+                commits
+                    .iter()
+                    .flat_map(|commit| &commit.new_files)
+                    .all(|file| file.file_name.ends_with(".parquet"))
+            );
+            write_builder.new_commit().commit(commits).await.unwrap();
+            let snapshot_id = lake_table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap()
+                .unwrap();
+
+            let info = TableInfo::new(
+                TablePath::new("types", name),
+                7,
+                1,
+                fluss_schema.build().unwrap(),
+                vec!["id".to_string()],
+                Vec::<String>::new().into(),
+                1,
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                0,
+                0,
+            );
+            let source = PaimonLakeSource::new(
+                &info,
+                &HashMap::from([("warehouse".to_string(), warehouse_path.to_string())]),
+            )
+            .unwrap();
+            let semantics = if primary_key {
+                LakeReadSemantics::PrimaryKey
+            } else {
+                LakeReadSemantics::Append
+            };
+            let filter = BoundPredicate::AlwaysTrue;
+            let splits = source
+                .plan(LakePlannerContext {
+                    table_info: &info,
+                    snapshot_id,
+                    semantics,
+                    filter: &filter,
+                })
+                .await
+                .unwrap();
+            assert!(!splits.is_empty());
+            let full_schema = fluss::record::to_arrow_schema(info.row_type()).unwrap();
+            // Reordering and pruning must be adapted to the physical read
+            // schema, not to full-table column positions.
+            for projection in [vec![0, 1, 2, 3], vec![3, 2, 1, 0], vec![2, 0]] {
+                let schema = Arc::new(full_schema.project(&projection).unwrap());
+                let batches: Vec<RecordBatch> = source
+                    .read(LakeReaderContext {
+                        table_info: &info,
+                        snapshot_id,
+                        semantics,
+                        splits: &splits,
+                        projection: &projection,
+                        schema: schema.clone(),
+                        filter: &filter,
+                    })
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+                let mut ids = Vec::new();
+                for batch in &batches {
+                    assert_eq!(batch.schema(), schema);
+                    let id_position = projection.iter().position(|index| *index == 0).unwrap();
+                    for row in 0..batch.num_rows() {
+                        let id = batch
+                            .column(id_position)
+                            .as_primitive::<arrow::datatypes::Int32Type>()
+                            .value(row);
+                        ids.push(id);
+                        for (position, column) in projection.iter().enumerate() {
+                            let array = batch.column(position);
+                            if *column == 0 {
+                                continue;
+                            }
+                            assert_eq!(array.is_null(row), id == 2);
+                            if id == 2 {
+                                continue;
+                            }
+                            match column {
+                                1 => {
+                                    let values = array.as_list::<i32>().value(row);
+                                    let values = values
+                                        .as_primitive::<arrow::datatypes::Int32Type>()
+                                        .iter()
+                                        .collect::<Vec<_>>();
+                                    assert_eq!(
+                                        values,
+                                        if id == 1 { vec![Some(1), None] } else { vec![] }
+                                    );
+                                }
+                                2 => assert_eq!(
+                                    array.as_fixed_size_binary().value(row),
+                                    if id == 1 { b"abcd" } else { b"\0\0\xff\0" }
+                                ),
+                                3 => assert_eq!(
+                                    array
+                                        .as_primitive::<arrow::datatypes::TimestampSecondType>()
+                                        .value(row),
+                                    if id == 1 { -2 } else { 3 }
+                                ),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }
+                ids.sort_unstable();
+                assert_eq!(ids, vec![1, 2, 3]);
+            }
+        }
     }
 
     fn table_info(
