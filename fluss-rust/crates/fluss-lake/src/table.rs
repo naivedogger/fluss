@@ -18,7 +18,10 @@
 //! Table and scan APIs for bounded UnionRead.
 
 use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
-use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, RecordBatchStream, Result};
+use crate::{
+    FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReader, RecordBatchStream,
+    Result,
+};
 use fluss::client::FlussConnection;
 use fluss::error::Error as ClientError;
 use fluss::metadata::{RowType, TableInfo, TablePath};
@@ -126,7 +129,8 @@ impl Debug for FlussLakeTable {
 /// Immutable configuration for one bounded UnionRead.
 ///
 /// Planning freezes this configuration together with the source inputs.
-/// Create readers from the resulting plan, not from an independently configured scan.
+/// Local callers can create readers from the plan. Distributed workers can
+/// restore the same scan configuration and read transported splits directly.
 #[derive(Clone)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
@@ -189,6 +193,21 @@ impl FlussLakeScan {
     /// use the injected source or the feature-selected default implementation.
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
         plan_union_read(self).await
+    }
+
+    /// Creates a worker reader without planning or refreshing read boundaries.
+    ///
+    /// The caller must restore the planner's projection, filter, read mode and
+    /// batch size, plus a compatible lake backend and runtime catalog mapping. These are
+    /// not carried in splits or checked against a remote plan. Mismatches are
+    /// caller errors and can produce incomplete results or the wrong schema.
+    ///
+    /// Splits must come from a trusted coordinator. Version, table/schema,
+    /// layout and payload checks still apply, but do not authenticate a task.
+    /// Credentials stay local. Configuration and metadata validation is
+    /// deferred until reading; constructing this reader performs no I/O.
+    pub fn new_reader(&self) -> FlussLakeReader {
+        FlussLakeReader::from_scan(self.clone())
     }
 
     /// Builds a default plan without choosing new snapshots or log offsets.

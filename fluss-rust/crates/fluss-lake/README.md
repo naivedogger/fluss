@@ -87,8 +87,9 @@ async fn query(connection: Arc<FlussConnection>, path: &TablePath) -> Result<()>
 ```
 
 The plan binds the projection, filter, mode, lake source and frozen boundaries.
-Readers reject foreign, modified or duplicate tasks; changing another scan
-cannot reinterpret this plan. `read_splits(plan.splits())` reads an unordered
+Plan-created readers reject foreign or modified tasks; changing another scan
+cannot reinterpret this plan. Both reader entry points reject duplicate task
+IDs within one `read_splits` call. `read_splits(plan.splits())` reads an unordered
 stream with at most eight active logical tasks. Use
 `read_splits_with_concurrency(..., n)` to set a positive limit, or schedule
 `read_split` in the host engine. Dropping the stream cancels active reads; the
@@ -97,6 +98,54 @@ first error is terminal and drops sibling streams.
 `with_projection(vec![])` returns zero-column batches with correct row counts.
 The reader retains hidden key/filter columns until reconciliation and filtering
 are complete. This supports count scans but is not a metadata-only count.
+
+### Execute transported splits on a worker
+
+The coordinator distributes the original serialized splits. The engine supplies
+the same projection, filter, read mode and batch-size configuration to workers,
+along with a compatible backend and catalog mapping. Credentials stay local.
+
+```rust,no_run
+use fluss::client::FlussConnection;
+use fluss::metadata::TablePath;
+use fluss::predicate::col;
+use fluss_lake::{FlussLakeReadSplit, FlussLakeTable, Result};
+use futures::TryStreamExt;
+use std::sync::Arc;
+
+async fn worker(
+    connection: Arc<FlussConnection>,
+    path: &TablePath,
+    assigned_splits: Vec<FlussLakeReadSplit>,
+) -> Result<()> {
+    let table = FlussLakeTable::open(connection, path).await?;
+    // Restore the coordinator's scan configuration from the engine's own plan.
+    let reader = table.new_scan()
+        .with_filter(col("id").eq(42_i32))
+        .with_projection_by_names(vec!["name".to_string()])
+        .with_batch_size(4096)
+        .new_reader();
+    let mut stream = reader.read_splits(&assigned_splits).await?;
+    while let Some(batch) = stream.try_next().await? {
+        // Consume within a query attempt that can be discarded on error.
+        let _ = batch;
+    }
+    Ok(())
+}
+```
+
+`scan.new_reader()` performs no planning or I/O and captures immutable settings.
+It reads the snapshot and log bounds already in the split, without calling
+`prepare()`, `plan()` or `plan_with_context()`. The worker needs neither the
+coordinator's plan object nor its complete task list.
+
+Configuration consistency and task delivery are the engine's responsibility.
+Splits contain no projection/filter or configuration fingerprint; a mismatch
+may produce incomplete results or a wrong output schema. Workers still validate
+descriptor versions, table/schema identity, partition/key layout and backend
+payloads. Those checks do not authenticate tasks or compare remote scan settings:
+accept tasks only from a trusted coordinator. Plan-created readers additionally
+check task membership and the complete frozen read context's metadata.
 
 ### Replace lake reading without replacing UnionRead
 
@@ -107,8 +156,8 @@ PK reconciliation or final filtering.
 - `LakeSource::plan(LakePlannerContext)` receives the exact snapshot, table
   metadata, required baseline semantics and a safe predicate. It returns
   versioned `LakeSplit` envelopes; their payloads belong to the backend.
-- `LakeSource::read(LakeReaderContext)` receives all selected tasks for one
-  partition/bucket, physical projection, schema and safe predicate. It returns
+- `LakeSource::read(LakeReaderContext)` receives one append task or the selected
+  PK task group for a partition/bucket, physical projection, schema and safe predicate. It returns
   owned Arrow batches. It must not refresh the snapshot or silently skip inputs.
 - A wrapper can delegate planning to the public `PaimonLakeSource` and use its
   own reader. That reader must understand the **Paimon backend's payload
@@ -198,8 +247,11 @@ equivalent algorithm under the same semantics.
   even when a later scan selects only one. It avoids unsafe reuse of a pruned
   context. Partition metadata requests use bounded concurrency; scoped contexts
   would need an explicit coverage contract.
-- Default plans use one logical split per selected `(partition, bucket)`.
-  Native plans may use file/row-group tasks and engine-controlled parallelism.
+- Default append plans expose each lake split and each nonempty bucket log tail
+  as independent tasks, including lake-only partitions. Reading multiple tasks
+  does not guarantee output order. Default PK plans keep one logical split per
+  selected `(partition, bucket)` so baseline reconciliation and tail survivors
+  execute together. Native plans may choose their own task granularity.
 - Partitioned tables may retain different bucket counts after changing the table
   default. Preparation freezes each live partition's actual count, and pruning
   uses that partition's hash modulus. Lake tasks carry their partition count,
@@ -215,13 +267,15 @@ equivalent algorithm under the same semantics.
   versions are separate. This revision does not accept old V1 contexts or V1/V2 default splits.
   Unknown versions fail explicitly. Receive contexts from trusted coordinators;
   decoding validates structure, not authenticity or retention.
-- Default splits can round-trip for retries with their owning plan. They do not
-  carry the plan's filter, projection, runtime source or credentials, and are
-  not standalone distributed execution plans. No default plan transport or
-  worker-side plan reconstruction protocol is provided in this revision.
-- Source table modification time is checked conservatively along with schema
-  and layout. Runtime Fluss cluster and lake catalog/table mappings must remain
-  consistent; the context does not authenticate a catalog.
+- Default splits can round-trip for local retries or remote worker execution.
+  They carry frozen source work, not the scan's filter, projection, runtime
+  source or credentials. Engines restore those settings and use
+  `scan.new_reader()`; no full-plan transport or worker-side replanning is needed.
+- Context-based planning and plan-created readers conservatively check source
+  table modification time along with schema and layout. Worker readers check
+  the identity/layout recorded in the split, not the complete source context.
+  Runtime Fluss cluster and lake catalog/table mappings must remain consistent;
+  neither a context nor a split authenticates a catalog.
 - Snapshot selection is source-owned. There is no arbitrary historical
   `with_snapshot_id`, target-parallelism knob, or public memory-pool API.
 

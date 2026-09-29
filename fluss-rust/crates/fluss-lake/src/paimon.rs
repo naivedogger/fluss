@@ -648,11 +648,11 @@ fn encode_portable_split(split: &DataSplit, table_location: &str) -> Result<Stri
 
 /// Reads several frozen Paimon splits as one finite Arrow batch stream.
 ///
-/// All splits must come from the same pinned snapshot. Reading them through
-/// one Paimon reader matters for primary-key tables: since
-/// apache/paimon-rust#374 the reader deduplicates keys across the splits it
-/// is given, which is exactly the per-bucket exactly-once guarantee the
-/// primary-key merge presumes.
+/// All splits must come from the same pinned snapshot and partition/bucket.
+/// For primary-key reads, Paimon planning keeps key-overlapping files together
+/// so each split can apply lake version and deletion rules independently.
+/// The default UnionRead executor still supplies the whole bucket group to
+/// reconcile its baseline with the Fluss tail in one task.
 async fn read_snapshot_splits(
     catalog_options: &PaimonCatalogOptions,
     context: crate::LakeReaderContext<'_>,
