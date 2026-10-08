@@ -20,6 +20,7 @@
 # then fans out the Rust / Python / C++ / Elixir / Gateway integration suites against that
 # fluss:dev image (build-once-fan-out, à la Temporal/PyFlink). The image build is
 # cached on server/proto hashes, so client-only PRs reuse it instead of rebuilding.
+# UnionRead interoperability uses a Java-owned Fluss/Flink fixture instead of Docker.
 
 name: Client Integration
 
@@ -29,6 +30,7 @@ on:
       - main
     paths:
       - 'fluss-rpc/src/main/proto/**'
+      - 'fluss-client/**'
       - 'fluss-server/**'
       - 'fluss-common/**'
       - 'fluss-dist/**'
@@ -39,6 +41,10 @@ on:
       - 'fluss-rust/bindings/**'
       - 'fluss-rust/Cargo.toml'
       - 'fluss-rust/Cargo.lock'
+      - 'fluss-rust/rust-toolchain.toml'
+      - 'fluss-rust/.cargo/**'
+      - 'fluss-lake/fluss-lake-paimon/**'
+      - 'fluss-flink/fluss-flink-tiering/**'
       - 'fluss-gateway/**'
       - '.github/workflows/client-integration.yml'
   pull_request:
@@ -46,6 +52,7 @@ on:
       - main
     paths:
       - 'fluss-rpc/src/main/proto/**'
+      - 'fluss-client/**'
       - 'fluss-server/**'
       - 'fluss-common/**'
       - 'fluss-dist/**'
@@ -56,6 +63,10 @@ on:
       - 'fluss-rust/bindings/**'
       - 'fluss-rust/Cargo.toml'
       - 'fluss-rust/Cargo.lock'
+      - 'fluss-rust/rust-toolchain.toml'
+      - 'fluss-rust/.cargo/**'
+      - 'fluss-lake/fluss-lake-paimon/**'
+      - 'fluss-flink/fluss-flink-tiering/**'
       - 'fluss-gateway/**'
       - '.github/workflows/client-integration.yml'
   workflow_dispatch:
@@ -73,6 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      union_read: ${{ steps.filter.outputs.union_read }}
       python: ${{ steps.filter.outputs.python }}
       cpp: ${{ steps.filter.outputs.cpp }}
       elixir: ${{ steps.filter.outputs.elixir }}
@@ -93,17 +105,20 @@ jobs:
           has() { echo "$changed" | grep -qE "$1"; }
           # a change to this workflow itself should exercise every suite
           has '^\.github/workflows/client-integration\.yml' && all=true || true
-          protocol=false; core=false; py=false; cpp=false; ex=false; gateway=false
+          protocol=false; core=false; py=false; cpp=false; ex=false; gateway=false; union_read=false
           has '^(fluss-rpc/src/main/proto/|fluss-server/|fluss-common/|fluss-dist/|LICENSE-bin$|NOTICE-bin$|docker/fluss/)' && protocol=true || true
           has '^(fluss-rust/crates/|fluss-rust/Cargo\.)' && core=true || true
           has '^fluss-rust/bindings/python/' && py=true || true
           has '^fluss-rust/bindings/cpp/' && cpp=true || true
           has '^fluss-rust/bindings/elixir/' && ex=true || true
           has '^fluss-gateway/' && gateway=true || true
+          has '^(fluss-rust/(crates/(fluss-lake/|fluss/)|Cargo\.|rust-toolchain\.toml$|\.cargo/)|fluss-client/|fluss-lake/fluss-lake-paimon/|fluss-flink/fluss-flink-tiering/)' && union_read=true || true
+          if [ "$all" = true ] || [ "$protocol" = true ]; then union_read=true; fi
           # a suite runs if: non-PR (all) OR core crate OR server/proto OR its own sources changed
           gate() { if [ "$all" = true ] || [ "$core" = true ] || [ "$protocol" = true ] || [ "$1" = true ]; then echo true; else echo false; fi; }
           {
             echo "rust=$(gate false)"
+            echo "union_read=$union_read"
             echo "python=$(gate $py)"
             echo "cpp=$(gate $cpp)"
             echo "elixir=$(gate $ex)"
@@ -112,7 +127,7 @@ jobs:
 
   # Build the server image from THIS source tree once; cache it on server/proto
   # hashes so client-only PRs restore it instead of rebuilding. The saved image
-  # is uploaded as an artifact and loaded by every client integration job.
+  # is uploaded as an artifact and loaded by the Docker-backed integration jobs.
   build-server-image:
     needs: detect-changes
     if: needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.python == 'true' || needs.detect-changes.outputs.cpp == 'true' || needs.detect-changes.outputs.elixir == 'true' || needs.detect-changes.outputs.gateway == 'true'
@@ -184,6 +199,78 @@ jobs:
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
+
+  rust-union-read:
+    name: "Rust UnionRead"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.union_read == 'true'
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      MAVEN_OPTS: -Xmx2048m
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: temurin
+          cache: maven
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fluss-rust
+          key: union-read-1.91
+      - name: Build Java test dependencies
+        run: ./mvnw -B --no-transfer-progress -pl fluss-lake/fluss-lake-paimon -am -DskipTests install
+      - name: Precompile Rust verifier
+        working-directory: fluss-rust
+        run: |
+          mkdir -p target
+          cargo +1.91.0 test -p fluss-lake --locked --features paimon --test test_tiered_union_read --no-run --message-format=json > target/tiered-union-read-build.json
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path('target/tiered-union-read-build.json').read_text().splitlines()]
+          binaries = [a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact' and a['target']['name'] == 'test_tiered_union_read' and a.get('executable')]
+          assert len(binaries) == 1, binaries
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'FLUSS_RUST_UNION_READ_TEST_BIN={Path(binaries[0]).resolve()}\n')
+          PYTHON
+      - name: Test real tiering and Rust UnionRead
+        run: >-
+          ./mvnw -B --no-transfer-progress -pl fluss-lake/fluss-lake-paimon
+          -Dtest=RustUnionReadITCase -Dfluss.rust.union-read.enabled=true
+          -Dlog.dir=${{ runner.temp }}/fluss-union-read-logs
+          -Dlog4j.configurationFile=${{ github.workspace }}/tools/ci/log4j.properties test
+      - name: Verify the Java suite was executed
+        run: |
+          python3 - <<'PYTHON'
+          import xml.etree.ElementTree as ET
+          report = 'fluss-lake/fluss-lake-paimon/target/surefire-reports/TEST-org.apache.fluss.lake.paimon.flink.RustUnionReadITCase.xml'
+          suite = ET.parse(report).getroot()
+          assert int(suite.attrib['tests']) == 6, suite.attrib
+          assert all(int(suite.attrib[key]) == 0 for key in ('failures', 'errors', 'skipped')), suite.attrib
+          PYTHON
+      - name: Upload test reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-union-read-test-reports
+          path: |
+            fluss-lake/fluss-lake-paimon/target/surefire-reports/
+            fluss-rust/target/tiered-union-read-build.json
+            ${{ runner.temp }}/fluss-union-read-logs/
+          if-no-files-found: warn
 
   gateway-integration:
     needs: [detect-changes, build-server-image]

@@ -341,11 +341,7 @@ both when the lake returns rows and when the whole result is empty.
 The workflow requires all six scenarios to execute without skips.
 No Docker, S3 service, warehouse copying or production CLI is needed for this suite.
 
-The path-scoped `Rust UnionRead Integration` workflow builds both runtimes and
-runs this suite in one Linux job. It is triggered by relevant Rust code/build
-files, the Java driver and the workflow itself, not by every Java tiering/server
-change; run it manually when validating an upstream contract change. Fork PRs
-may require maintainer approval. The ordinary Java suite does not require Rust.
+The `rust-union-read` job in the existing `Client Integration` workflow builds both runtimes and runs this suite through the Java module's Maven test entry. PR change detection selects relevant core/lake Rust code, Java client/Paimon/tiering changes, server/protocol changes and workflow changes; main pushes and manual runs follow the workflow's existing all-suite policy. The job uses the Java-owned fixture and does not need the Docker server-image job. Fork PRs may require maintainer approval. The ordinary Java suite does not require Rust.
 
 To reproduce locally, from the repository root:
 
