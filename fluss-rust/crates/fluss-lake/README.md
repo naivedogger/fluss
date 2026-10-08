@@ -256,8 +256,12 @@ equivalent algorithm under the same semantics.
   default. Preparation freezes each live partition's actual count, and pruning
   uses that partition's hash modulus. Lake tasks carry their partition count,
   including expired lake-only partitions; conflicting live/lake layouts fail.
-  Legacy metadata without a count uses the table default. This supports changing
-  the default for new partitions, not redistributing existing partitions.
+  Core Admin resolves legacy metadata without a count using the table default
+  only while its bucket-count epoch is zero. Missing counts after a rescale
+  fail instead of silently using a different layout. UnionRead consumes these
+  resolved counts; routing and bounded-read validation use the core client.
+  This supports changing the default for new partitions, not redistributing
+  existing partitions.
 - The default PK overlay has no spill or hard memory cap. Fully superseded
   batches are released; partially live batches can retain obsolete buffers.
   Survivor output is incremental, but survivor indexes also consume memory.
@@ -320,6 +324,10 @@ zero-column count scans, injected lake sources and invalid task rejection.
 Four additional scenarios cover append/PK reads after increasing and decreasing
 the default bucket count. Each includes an old live partition, a new partition,
 an expired lake-only partition, a real log tail, and bucket/partition filters.
+Shrinking scenarios require a nonempty lake baseline and log tail in old
+buckets above the new table default, through both plan and worker readers.
+Append filters also check that a fully pruned log tail reaches its frozen stop,
+both when the lake returns rows and when the whole result is empty.
 The workflow requires all six scenarios to execute without skips.
 No Docker, S3 service, warehouse copying or production CLI is needed for this suite.
 

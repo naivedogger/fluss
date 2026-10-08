@@ -377,6 +377,29 @@ async fn verify() {
             );
             assert!(batches.iter().all(|batch| batch.num_columns() == 1));
         }
+    } else {
+        // A non-key predicate keeps the log task, but can filter away its
+        // entire tail. Reaching the frozen stop must still terminate the read.
+        for (value, wanted) in [
+            ("lake-keep", vec![(3, "lake-keep".to_string())]),
+            ("no-such-value", vec![]),
+        ] {
+            let scan = table.new_scan().with_filter(col("name").eq(value));
+            let plan = scan.plan_with_context(&context).await.unwrap();
+            assert!(!plan.splits().is_empty(), "must exercise a real log task");
+            assert!(context.log_ranges().iter().any(|range| !range.is_empty()));
+            let splits: Vec<FlussLakeReadSplit> =
+                serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
+            for reader in [plan.new_reader(), scan.new_reader()] {
+                let stream = reader.read_splits(&splits).await.unwrap();
+                let batches =
+                    tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
+                        .await
+                        .expect("filtered append tail did not reach its frozen stop")
+                        .unwrap();
+                assert_eq!(rows(&batches), wanted, "filter name={value}");
+            }
+        }
     }
 }
 
@@ -430,6 +453,12 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
             range.bucket_count(),
             if name == "old" { old_count } else { new_count }
         );
+        if name == "old" && range.table_bucket().bucket_id() >= new_count {
+            assert!(
+                range.start_offset() > 0 && !range.is_empty(),
+                "the shrinking fixture must exercise lake and nonempty tail in every old high bucket"
+            );
+        }
         has_tail |= range.stop_offset() > range.start_offset();
         range.validate_available().unwrap();
     }
@@ -450,12 +479,13 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
             expected.push((id, value, partition.to_string()));
         }
         if partition != "expired" {
-            if primary_key {
-                expected.push((16, "tail-insert".into(), partition.into()));
-            } else {
-                for id in [16, 17] {
-                    expected.push((id, format!("tail-{id}"), partition.into()));
-                }
+            for id in 16..32 {
+                let value = if primary_key {
+                    format!("tail-insert-{id}")
+                } else {
+                    format!("tail-{id}")
+                };
+                expected.push((id, value, partition.into()));
             }
         }
     }
@@ -474,7 +504,7 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
             .unwrap();
         partition_rows(&batches)
     };
-    drop(plan);
+    assert_eq!(read(plan).await, expected);
     let batches = table
         .new_scan()
         .new_reader()
@@ -498,7 +528,7 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
         baseline
     );
     // Exercise hash pruning on all three layouts, including the lake-only partition.
-    for id in [0, 1, 7, 13, 16, 17] {
+    for id in [0, 1, 7, 13, 16, 17, 23, 31] {
         let filtered = table
             .new_scan()
             .with_filter(col("id").eq(id))

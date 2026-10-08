@@ -234,15 +234,17 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
                         UpsertWriter writer = table.newUpsert().createWriter();
                         writer.upsert(row(0, "tail-update", partition)).get();
                         writer.delete(row(1, "lake-1", partition)).get();
-                        writer.upsert(row(16, "tail-insert", partition)).get();
+                        for (int id = 16; id < 32; id++) {
+                            writer.upsert(row(id, "tail-insert-" + id, partition)).get();
+                        }
                         writer.flush();
                     }
                 } else {
-                    writeRows(
-                            path,
-                            Arrays.asList(
-                                    row(16, "tail-16", partition), row(17, "tail-17", partition)),
-                            true);
+                    List<InternalRow> tail = new ArrayList<>();
+                    for (int id = 16; id < 32; id++) {
+                        tail.add(row(id, "tail-" + id, partition));
+                    }
+                    writeRows(path, tail, true);
                 }
             }
             runRustVerifier(path, scenario);
