@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod group_offsets_prototype;
 mod types;
+
+use group_offsets_prototype::{
+    PrototypeGroupClient, PrototypeMockGroupServer, new_prototype_group_client,
+    new_prototype_mock_group_server,
+};
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -42,6 +48,64 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 #[cxx::bridge(namespace = "fluss::ffi")]
 mod ffi {
+    // Experimental FIP-53 seam. These are local bridge types, not protobufs.
+    struct PrototypeBucket {
+        table_id: i64,
+        has_partition: bool,
+        partition_id: i64,
+        bucket_id: i32,
+    }
+
+    struct PrototypeOffset {
+        bucket: PrototypeBucket,
+        next_offset: i64,
+    }
+
+    enum PrototypeCommitStatus {
+        Success,
+        Unsupported,
+        NotCoordinator,
+        Rejected,
+        UnknownOutcome,
+        Fenced,
+    }
+
+    struct PrototypeCommitOutcome {
+        bucket: PrototypeBucket,
+        status: PrototypeCommitStatus,
+        message: String,
+    }
+
+    extern "Rust" {
+        type PrototypeGroupClient;
+        type PrototypeMockGroupServer;
+
+        // The default backend fails with Unsupported. The mock is explicit.
+        fn new_prototype_group_client(group_id: &str) -> Result<Box<PrototypeGroupClient>>;
+        fn new_prototype_mock_group_server() -> Box<PrototypeMockGroupServer>;
+        fn mock_client(
+            self: &PrototypeMockGroupServer,
+            group_id: &str,
+        ) -> Result<Box<PrototypeGroupClient>>;
+        fn mock_reject_next_bucket(
+            self: &PrototypeMockGroupServer,
+            bucket: PrototypeBucket,
+        ) -> Result<()>;
+        fn mock_lose_next_commit_ack(self: &PrototypeMockGroupServer) -> Result<()>;
+
+        fn prototype_restore(
+            self: &mut PrototypeGroupClient,
+            buckets: Vec<PrototypeBucket>,
+            earliest_if_missing: bool,
+        ) -> Result<Vec<PrototypeOffset>>;
+        fn prototype_commit_sync(
+            self: &mut PrototypeGroupClient,
+            offsets: Vec<PrototypeOffset>,
+        ) -> Result<Vec<PrototypeCommitOutcome>>;
+        fn prototype_confirmed(self: &PrototypeGroupClient) -> Vec<PrototypeOffset>;
+        fn prototype_close(self: &mut PrototypeGroupClient);
+    }
+
     struct HashMapValue {
         key: String,
         value: String,

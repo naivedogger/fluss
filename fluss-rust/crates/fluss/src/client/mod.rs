@@ -18,6 +18,7 @@
 mod admin;
 mod connection;
 mod credentials;
+pub mod group_offsets_prototype;
 pub mod lookup;
 mod metadata;
 mod schema_getter;
