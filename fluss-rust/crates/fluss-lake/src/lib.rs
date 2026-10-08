@@ -20,9 +20,9 @@
 //! finite stream of Arrow record batches.
 //!
 //! Three integration levels share the same source contract:
-//! - [`FlussLakeScan::plan`] and [`FlussLakeReadPlan::new_reader`] provide the
+//! - [`FlussLakeScan::plan`] and [`FlussLakeScan::new_reader`] provide the
 //!   complete default reader, including lake access and reconciliation.
-//!   Workers use [`FlussLakeScan::new_reader`] with matching scan settings to
+//!   Local callers and workers use matching scan settings to
 //!   execute transported splits without retaining or rebuilding the plan.
 //! - [`FlussLakeScan::with_lake_source`] replaces lake planning/reading while
 //!   retaining the default Fluss log reader and current-view reconciliation.

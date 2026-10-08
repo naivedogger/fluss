@@ -52,21 +52,31 @@ pub enum LakeReadSemantics {
 /// reader may consume these tasks only if it implements the same payload
 /// contract; the envelope is not a universal file-list format.
 ///
-/// The default executor requires tasks aligned with the Fluss partition/bucket
-/// layout. Bucket-less files or a different lake layout need an adapter that
-/// restores this ownership, or an engine-native reconciliation plan.
+/// Primary-key reconciliation requires Fluss-aligned partition/bucket tasks.
+/// Append lake tasks are independent of Fluss log buckets and may use their
+/// own fixed layout or the bucket-unaware pair `(-1, -1)`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LakeSplit {
+    /// Lake format identifier, matching [`LakeSource::format`].
     pub format: String,
+    /// Frozen lake snapshot from which this task was planned.
     pub snapshot_id: i64,
+    /// Logical Fluss partition identity, including lake-only expired partitions.
     pub partition: FlussLakePartitionIdentity,
+    /// Lake bucket identity, or -1 for a bucket-unaware append task.
     pub bucket_id: i32,
-    /// Actual bucket count of this lake partition, not the current table default.
+    /// Number of lake buckets in this partition, or -1 for a bucket-unaware task.
     pub bucket_count: i32,
+    /// Estimated input rows for this task; `None` means unknown.
+    /// This is not necessarily the number of rows in a PK current view.
     pub estimated_rows: Option<usize>,
+    /// Estimated input size in bytes; `None` means unknown, not zero.
     pub estimated_size: Option<usize>,
+    /// Nonzero, format-owned payload version, independent of kernel split versions.
     pub payload_version: u32,
+    /// Nonempty task description decoded only by a compatible lake source.
+    /// Must not contain storage credentials or other runtime secrets.
     pub payload: Vec<u8>,
 }
 
@@ -74,9 +84,7 @@ impl LakeSplit {
     pub(crate) fn validate(&self, format: &str, snapshot_id: i64) -> Result<()> {
         if self.format != format
             || self.snapshot_id != snapshot_id
-            || self.bucket_id < 0
-            || self.bucket_count <= 0
-            || self.bucket_id >= self.bucket_count
+            || !self.has_valid_bucket()
             || self.payload_version == 0
             || self.payload.is_empty()
         {
@@ -85,6 +93,11 @@ impl LakeSplit {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn has_valid_bucket(&self) -> bool {
+        (self.bucket_id == -1 && self.bucket_count == -1)
+            || (self.bucket_id >= 0 && self.bucket_count > self.bucket_id)
     }
 }
 
@@ -104,9 +117,15 @@ impl Debug for LakeSplit {
 
 /// Immutable input to lake planning. The snapshot must never be refreshed.
 pub struct LakePlannerContext<'a> {
+    /// Logical Fluss table metadata used to resolve the lake mapping and layout.
     pub table_info: &'a TableInfo,
+    /// Lake snapshot to plan; the source must not substitute a newer snapshot.
     pub snapshot_id: i64,
+    /// Required baseline semantics, independent of execution parallelism.
     pub semantics: LakeReadSemantics,
+    /// Whether the baseline must also support the default deduplicate tail
+    /// overlay. False for append and lake-only reads.
+    pub reconcile_primary_key: bool,
     /// Only predicates safe before UnionRead reconciliation are supplied.
     /// Backends may ignore them; the executor always evaluates the full filter.
     pub filter: &'a BoundPredicate,
@@ -114,15 +133,23 @@ pub struct LakePlannerContext<'a> {
 
 /// Immutable lake-reader input from frozen tasks and the execution-side scan settings.
 pub struct LakeReaderContext<'a> {
+    /// Logical Fluss table metadata compatible with the frozen tasks.
     pub table_info: &'a TableInfo,
+    /// Frozen lake snapshot shared by every supplied task.
     pub snapshot_id: i64,
+    /// Baseline semantics the source must preserve across the supplied tasks.
     pub semantics: LakeReadSemantics,
+    /// True only when the default executor reconciles a Fluss PK tail.
+    /// A lake-only PK baseline need not use the deduplicate merge engine.
+    pub reconcile_primary_key: bool,
     /// Tasks for one partition/bucket. Append reads receive one independently
     /// readable task; primary-key reads receive the entire selected group.
     pub splits: &'a [LakeSplit],
-    /// Fluss field indexes, including hidden filter and primary-key columns.
-    /// Return columns in exactly this order; indexes refer to the full table.
+    /// Zero-based column indexes in the full Fluss schema, not schema field IDs.
+    /// Includes hidden filter and primary-key columns. Return columns in this order.
     pub projection: &'a [usize],
+    /// Physical Arrow schema in `projection` order, to use for returned batches.
+    /// Includes hidden columns and may differ from the final scan output schema.
     pub schema: SchemaRef,
     /// A safe optional optimization, not permission to change the result.
     pub filter: &'a BoundPredicate,
@@ -323,6 +350,7 @@ mod tests {
                     table_info: &info,
                     snapshot_id: 42,
                     semantics: LakeReadSemantics::Append,
+                    reconcile_primary_key: false,
                     filter: &BoundPredicate::AlwaysTrue,
                 })
                 .await
@@ -335,6 +363,7 @@ mod tests {
                     table_info: &info,
                     snapshot_id: 42,
                     semantics: LakeReadSemantics::Append,
+                    reconcile_primary_key: false,
                     splits: tasks,
                     projection: &[0],
                     schema: schema.clone(),

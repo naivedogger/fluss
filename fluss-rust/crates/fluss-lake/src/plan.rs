@@ -20,18 +20,21 @@
 use crate::executor::execute_split;
 use crate::split::FlussLakeReadSplit;
 use crate::table::{FlussLakeScan, stop_after_first_error};
-use crate::{FlussLakeError, FlussLakeReadContext, LakeSource, RecordBatchStream, Result};
+use crate::{FlussLakeError, FlussLakeReadContext, RecordBatchStream, Result};
 use arrow::datatypes::SchemaRef;
-use fluss::predicate::BoundPredicate;
 use futures::StreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Aggregated statistics about a planned UnionRead job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlussLakePlanStatistics {
+    /// Number of logical tasks, not the engine's execution parallelism.
     pub split_count: usize,
+    /// Total estimated input rows; `None` means an estimate is missing or overflows.
+    /// This is not an exact PK result cardinality.
     pub estimated_rows: Option<usize>,
+    /// Total estimated input bytes; `None` means an estimate is missing or overflows.
     pub estimated_size: Option<usize>,
 }
 
@@ -45,22 +48,17 @@ impl FlussLakePlanStatistics {
     }
 }
 
-/// An immutable, scan-bound plan. Readers cannot adopt another scan's filter,
-/// projection, lake mapping or mode. Cloning a plan shares its execution state.
+/// Immutable frozen tasks, output schema and source context.
+/// Execution uses a reader created from the matching scan configuration.
 #[derive(Clone)]
 pub struct FlussLakeReadPlan {
     inner: Arc<ReadPlan>,
 }
 
-pub(crate) struct ReadPlan {
-    pub context: FlussLakeReadContext,
-    pub schema: SchemaRef,
-    pub scan: FlussLakeScan,
-    pub filter: BoundPredicate,
-    pub output_projection: Option<Vec<usize>>,
-    pub lake_source: Option<Arc<dyn LakeSource>>,
+struct ReadPlan {
+    context: FlussLakeReadContext,
+    schema: SchemaRef,
     splits: Vec<FlussLakeReadSplit>,
-    split_indexes: HashMap<String, usize>,
     statistics: FlussLakePlanStatistics,
 }
 
@@ -68,20 +66,11 @@ impl FlussLakeReadPlan {
     pub(crate) fn new(
         context: FlussLakeReadContext,
         schema: SchemaRef,
-        scan: FlussLakeScan,
-        lake_source: Option<Arc<dyn LakeSource>>,
         splits: Vec<FlussLakeReadSplit>,
     ) -> Result<Self> {
-        let row_type = context.table_schema().row_type();
-        let output_projection = scan.resolve_projection(row_type)?;
-        let filter = BoundPredicate::bind(scan.filter(), row_type)
-            .map_err(|e| FlussLakeError::PlanningFailed(e.to_string()))?;
-        let mut split_indexes = HashMap::with_capacity(splits.len());
-        for (index, split) in splits.iter().enumerate() {
-            if split_indexes
-                .insert(split.split_id.clone(), index)
-                .is_some()
-            {
+        let mut split_ids = HashSet::with_capacity(splits.len());
+        for split in &splits {
+            if !split_ids.insert(&split.split_id) {
                 return Err(FlussLakeError::PlanningFailed(
                     "duplicate logical split identity".to_string(),
                 ));
@@ -92,12 +81,7 @@ impl FlussLakeReadPlan {
             inner: Arc::new(ReadPlan {
                 context,
                 schema,
-                scan,
-                filter,
-                output_projection,
-                lake_source,
                 splits,
-                split_indexes,
                 statistics,
             }),
         })
@@ -127,37 +111,12 @@ impl FlussLakeReadPlan {
     pub fn statistics(&self) -> FlussLakePlanStatistics {
         self.inner.statistics
     }
-
-    /// Create a reader bound to this plan's validated configuration and inputs.
-    pub fn new_reader(&self) -> FlussLakeReader {
-        FlussLakeReader {
-            origin: ReaderOrigin::Plan(self.clone()),
-        }
-    }
-
-    pub(crate) fn execution(&self) -> &ReadPlan {
-        &self.inner
-    }
-
-    fn validate_split(&self, split: &FlussLakeReadSplit) -> Result<()> {
-        let expected = self
-            .inner
-            .split_indexes
-            .get(&split.split_id)
-            .map(|i| &self.inner.splits[*i]);
-        if expected != Some(split) {
-            return Err(FlussLakeError::PlanningFailed(
-                "split does not belong to this read plan".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl std::fmt::Debug for FlussLakeReadPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlussLakeReadPlan")
-            .field("scan", &self.inner.scan)
+            .field("table_path", self.inner.context.table_path())
             .field("statistics", &self.inner.statistics)
             .finish_non_exhaustive()
     }
@@ -165,53 +124,29 @@ impl std::fmt::Debug for FlussLakeReadPlan {
 
 /// Reusable reader with immutable scan configuration.
 ///
-/// A plan-created reader additionally checks task membership. A scan-created
-/// worker reader accepts transported tasks without a local plan; its caller
-/// must restore the planner's scan configuration and compatible lake backend.
+/// Local callers and distributed workers use the same scan-created reader.
+/// The caller must supply the original tasks and the planner's scan settings,
+/// including a compatible lake backend. No plan object is retained or rebuilt.
 #[derive(Clone, Debug)]
 pub struct FlussLakeReader {
-    origin: ReaderOrigin,
-}
-
-#[derive(Clone, Debug)]
-enum ReaderOrigin {
-    Plan(FlussLakeReadPlan),
-    Scan(Arc<FlussLakeScan>),
+    scan: Arc<FlussLakeScan>,
 }
 
 impl FlussLakeReader {
     pub(crate) fn from_scan(scan: FlussLakeScan) -> Self {
         Self {
-            origin: ReaderOrigin::Scan(Arc::new(scan)),
+            scan: Arc::new(scan),
         }
     }
 
     pub(crate) fn scan(&self) -> &FlussLakeScan {
-        match &self.origin {
-            ReaderOrigin::Plan(plan) => &plan.inner.scan,
-            ReaderOrigin::Scan(scan) => scan,
-        }
-    }
-
-    pub(crate) fn bound_plan(&self) -> Option<&FlussLakeReadPlan> {
-        match &self.origin {
-            ReaderOrigin::Plan(plan) => Some(plan),
-            ReaderOrigin::Scan(_) => None,
-        }
-    }
-
-    fn validate_split(&self, split: &FlussLakeReadSplit) -> Result<()> {
-        if let Some(plan) = self.bound_plan() {
-            plan.validate_split(split)?;
-        }
-        Ok(())
+        &self.scan
     }
 
     /// Read a frozen task, including a serialized round-trip from a coordinator.
     /// Opening is lazy; the first stream error is terminal. Drop cancels the read.
     pub async fn read_split(&self, split: &FlussLakeReadSplit) -> Result<RecordBatchStream> {
         self.scan().validate_configuration()?;
-        self.validate_split(split)?;
         execute_split(split, self).map(stop_after_first_error)
     }
 
@@ -237,7 +172,6 @@ impl FlussLakeReader {
         self.scan().validate_configuration()?;
         let mut seen = HashSet::with_capacity(splits.len());
         for split in splits {
-            self.validate_split(split)?;
             if !seen.insert(&split.split_id) {
                 return Err(FlussLakeError::PlanningFailed(
                     "duplicate read task".to_string(),

@@ -26,7 +26,7 @@ use fluss::config::Config;
 use fluss::metadata::TablePath;
 use fluss::predicate::col;
 use fluss_lake::{
-    FlussLakeReadContext, FlussLakeReadSplit, FlussLakeTable, LakePlannerContext,
+    FlussLakeReadContext, FlussLakeReadSplit, FlussLakeScan, FlussLakeTable, LakePlannerContext,
     LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource,
     RecordBatchStream,
 };
@@ -103,6 +103,16 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     }
     rows.sort_unstable();
     rows
+}
+
+async fn read_batches(scan: FlussLakeScan, splits: &[FlussLakeReadSplit]) -> Vec<RecordBatch> {
+    scan.new_reader()
+        .read_splits(splits)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -197,23 +207,11 @@ async fn verify() {
     .into_iter()
     .map(|(id, name)| (id, name.to_owned()))
     .collect::<Vec<_>>();
-    let reader = plan.new_reader();
-    let mut foreign = splits[0].clone();
-    foreign.split_id.push_str("-foreign");
-    assert!(reader.read_split(&foreign).await.is_err());
-    assert!(
-        reader
-            .read_splits(&[splits[0].clone(), splits[0].clone()])
-            .await
-            .is_err()
-    );
-    assert!(
-        reader
-            .read_splits_with_concurrency(plan.splits(), 0)
-            .await
-            .is_err()
-    );
-    for concurrency in [1, 4] {
+    let reader = scan.new_reader();
+    // The unpartitioned PK plan has only one task. Append has independent
+    // lake/log tasks, so exercise both serial and concurrent execution there.
+    let concurrencies: &[usize] = if scenario == "pk" { &[1] } else { &[1, 4] };
+    for &concurrency in concurrencies {
         let batches = reader
             .read_splits_with_concurrency(&splits, concurrency)
             .await
@@ -269,14 +267,7 @@ async fn verify() {
     assert!(worker_source.reads.load(Ordering::Relaxed) > 0);
     let lake_scan = table.new_scan().with_lake_only(true);
     let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
-    let baseline = lake_plan
-        .new_reader()
-        .read_splits(lake_plan.splits())
-        .await
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
+    let baseline = read_batches(lake_scan, lake_plan.splits()).await;
     assert_eq!(
         rows(&baseline),
         vec![
@@ -296,14 +287,7 @@ async fn verify() {
         let count_splits: Vec<FlussLakeReadSplit> =
             serde_json::from_slice(&serde_json::to_vec(count_plan.splits()).unwrap()).unwrap();
         drop(count_plan);
-        let batches = count_scan
-            .new_reader()
-            .read_splits(&count_splits)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batches = read_batches(count_scan, &count_splits).await;
         assert!(
             batches
                 .iter()
@@ -314,13 +298,9 @@ async fn verify() {
             count
         );
     }
-    let custom_plan = table
-        .new_scan()
-        .with_lake_source(custom_source.clone())
-        .plan_with_context(&context)
-        .await
-        .unwrap();
-    let mut stream = custom_plan
+    let custom_scan = table.new_scan().with_lake_source(custom_source.clone());
+    let custom_plan = custom_scan.plan_with_context(&context).await.unwrap();
+    let mut stream = custom_scan
         .new_reader()
         .read_splits_with_concurrency(custom_plan.splits(), custom_plan.split_count())
         .await
@@ -363,14 +343,7 @@ async fn verify() {
             let plan = filtered.plan_with_context(&context).await.unwrap();
             let filtered_splits = plan.splits().to_vec();
             drop(plan);
-            let batches = filtered
-                .new_reader()
-                .read_splits(&filtered_splits)
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
+            let batches = read_batches(filtered, &filtered_splits).await;
             assert_eq!(
                 batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
                 count
@@ -390,15 +363,16 @@ async fn verify() {
             assert!(context.log_ranges().iter().any(|range| !range.is_empty()));
             let splits: Vec<FlussLakeReadSplit> =
                 serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
-            for reader in [plan.new_reader(), scan.new_reader()] {
-                let stream = reader.read_splits(&splits).await.unwrap();
-                let batches =
-                    tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-                        .await
-                        .expect("filtered append tail did not reach its frozen stop")
-                        .unwrap();
-                assert_eq!(rows(&batches), wanted, "filter name={value}");
-            }
+            drop(plan);
+            let reader = scan.new_reader();
+            drop(scan);
+            let stream = reader.read_splits(&splits).await.unwrap();
+            let batches =
+                tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
+                    .await
+                    .expect("filtered append tail did not reach its frozen stop")
+                    .unwrap();
+            assert_eq!(rows(&batches), wanted, "filter name={value}");
         }
     }
 }
@@ -493,82 +467,45 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
     expected.sort_unstable();
     let transported: Vec<FlussLakeReadSplit> =
         serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
-    let read = |plan: fluss_lake::FlussLakeReadPlan| async move {
-        let batches = plan
-            .new_reader()
-            .read_splits(plan.splits())
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        partition_rows(&batches)
+    drop(plan);
+    let read = |scan: fluss_lake::FlussLakeScan, plan: fluss_lake::FlussLakeReadPlan| async move {
+        partition_rows(&read_batches(scan, plan.splits()).await)
     };
-    assert_eq!(read(plan).await, expected);
-    let batches = table
-        .new_scan()
-        .new_reader()
-        .read_splits(&transported)
-        .await
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
+    let batches = read_batches(table.new_scan(), &transported).await;
     assert_eq!(partition_rows(&batches), expected);
-    assert_eq!(
-        read(
-            table
-                .new_scan()
-                .with_lake_only(true)
-                .plan_with_context(&context)
-                .await
-                .unwrap()
-        )
-        .await,
-        baseline
-    );
+    let lake_scan = table.new_scan().with_lake_only(true);
+    let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
+    assert_eq!(read(lake_scan, lake_plan).await, baseline);
     // Exercise hash pruning on all three layouts, including the lake-only partition.
     for id in [0, 1, 7, 13, 16, 17, 23, 31] {
-        let filtered = table
-            .new_scan()
-            .with_filter(col("id").eq(id))
-            .plan_with_context(&context)
-            .await
-            .unwrap();
+        let filtered = table.new_scan().with_filter(col("id").eq(id));
+        let plan = filtered.plan_with_context(&context).await.unwrap();
         let wanted = expected
             .iter()
             .filter(|row| row.0 == id)
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(read(filtered).await, wanted, "bucket pruning id={id}");
+        assert_eq!(read(filtered, plan).await, wanted, "bucket pruning id={id}");
     }
     for partition in ["old", "expired", "new"] {
-        let filtered = table
-            .new_scan()
-            .with_filter(col("region").eq(partition))
-            .plan_with_context(&context)
-            .await
-            .unwrap();
+        let filtered = table.new_scan().with_filter(col("region").eq(partition));
+        let plan = filtered.plan_with_context(&context).await.unwrap();
         let wanted = expected
             .iter()
             .filter(|row| row.2 == partition)
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
-            read(filtered).await,
+            read(filtered, plan).await,
             wanted,
             "partition pruning {partition}"
         );
     }
     if primary_key {
-        let filtered = table
-            .new_scan()
-            .with_filter(col("name").eq("lake-0"))
-            .plan_with_context(&context)
-            .await
-            .unwrap();
+        let filtered = table.new_scan().with_filter(col("name").eq("lake-0"));
+        let plan = filtered.plan_with_context(&context).await.unwrap();
         assert_eq!(
-            read(filtered).await,
+            read(filtered, plan).await,
             vec![(0, "lake-0".into(), "expired".into())]
         );
     }

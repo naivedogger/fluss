@@ -17,6 +17,7 @@
 
 //! Table and scan APIs for bounded UnionRead.
 
+use crate::error::error_message;
 use crate::planner::{plan_union_read, plan_with_context, prepare_read_context};
 use crate::{
     FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReader, RecordBatchStream,
@@ -128,9 +129,8 @@ impl Debug for FlussLakeTable {
 
 /// Immutable configuration for one bounded UnionRead.
 ///
-/// Planning freezes this configuration together with the source inputs.
-/// Local callers can create readers from the plan. Distributed workers can
-/// restore the same scan configuration and read transported splits directly.
+/// Planning freezes source inputs into tasks. Both local readers and distributed
+/// workers must use the same scan configuration that produced those tasks.
 #[derive(Clone)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
@@ -189,18 +189,19 @@ impl FlussLakeScan {
 
     /// Prepares source boundaries and builds the complete default read plan.
     ///
-    /// Create the reader using `plan.new_reader()`. Lake planning and reading
+    /// Create the reader using this scan's `new_reader()`. Lake planning and reading
     /// use the injected source or the feature-selected default implementation.
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
         plan_union_read(self).await
     }
 
-    /// Creates a worker reader without planning or refreshing read boundaries.
+    /// Creates a reader without planning or refreshing read boundaries.
     ///
-    /// The caller must restore the planner's projection, filter, read mode and
-    /// batch size, plus a compatible lake backend and runtime catalog mapping. These are
-    /// not carried in splits or checked against a remote plan. Mismatches are
-    /// caller errors and can produce incomplete results or the wrong schema.
+    /// The caller must use the planner's projection, filter, read mode and batch
+    /// size, plus a compatible lake backend and runtime catalog mapping. Workers
+    /// restore these settings using the engine's own transport. They are not
+    /// carried in splits or checked against a plan. Mismatches are caller errors
+    /// and can produce incomplete results or the wrong schema.
     ///
     /// Splits must come from a trusted coordinator. Version, table/schema,
     /// layout and payload checks still apply, but do not authenticate a task.
@@ -331,6 +332,26 @@ impl Debug for FlussLakeScan {
     }
 }
 
+/// Resolve the physical lake name without changing the logical Fluss identity.
+pub(crate) fn resolve_lake_table_path(table_info: &TableInfo) -> Result<TablePath> {
+    let database = table_info
+        .properties
+        .get("table.datalake.database-name")
+        .map(String::as_str)
+        .unwrap_or(table_info.table_path.database());
+    let table = table_info
+        .properties
+        .get("table.datalake.table-name")
+        .map(String::as_str)
+        .unwrap_or(table_info.table_path.table());
+    if database.is_empty() || table.is_empty() {
+        return Err(FlussLakeError::PlanningFailed(
+            "lake database and table names must not be empty".to_string(),
+        ));
+    }
+    Ok(TablePath::new(database, table))
+}
+
 pub(crate) fn validate_lake_readable(table_info: &TableInfo) -> Result<()> {
     match table_info.table_config.is_datalake_enabled() {
         Ok(true) => {}
@@ -361,18 +382,17 @@ pub(crate) fn validate_lake_readable(table_info: &TableInfo) -> Result<()> {
 }
 
 fn table_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    let message = error_message(action, &error);
     match error {
-        ClientError::RpcError { .. } => {
-            FlussLakeError::ConnectionError(format!("failed to {action}: {error}"))
-        }
-        _ => FlussLakeError::PlanningFailed(format!("failed to {action}: {error}")),
+        ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
+        _ => FlussLakeError::PlanningFailed(message),
     }
 }
 
 /// Makes the first stream error terminal and immediately drops the source.
 ///
-/// This is especially important for `read_splits`: dropping `select_all`
-/// cancels every sibling split as soon as one split invalidates the attempt.
+/// For `read_splits`, dropping the merged stream also cancels every sibling
+/// split as soon as one split invalidates the attempt.
 pub(crate) fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
     Box::pin(futures::stream::unfold(Some(stream), |stream| async move {
         let mut stream = stream?;

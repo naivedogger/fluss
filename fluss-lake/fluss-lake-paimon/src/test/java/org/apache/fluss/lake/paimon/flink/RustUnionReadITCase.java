@@ -114,18 +114,22 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
         if (primaryKey) {
             schema.primaryKey("id");
         }
-        long tableId =
-                createTable(
-                        tablePath,
-                        TableDescriptor.builder()
-                                .schema(schema.build())
-                                .distributedBy(1, "id")
-                                .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                .property(
-                                        ConfigOptions.TABLE_DATALAKE_FRESHNESS,
-                                        Duration.ofSeconds(1))
-                                .customProperty("paimon.file.format", "parquet")
-                                .build());
+        TableDescriptor.Builder descriptor =
+                TableDescriptor.builder()
+                        .schema(schema.build())
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_TABLE_NAME,
+                                tablePath.getTableName() + "_lake")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofSeconds(1))
+                        .customProperty("paimon.file.format", "parquet");
+        if (primaryKey) {
+            descriptor.distributedBy(1, "id");
+        }
+        // Append deliberately uses Paimon's bucket-unaware layout. Both modes
+        // read a mapped physical table through the normal tiering path.
+        long tableId = createTable(tablePath, descriptor.build());
         try {
             writeRows(
                     tablePath,

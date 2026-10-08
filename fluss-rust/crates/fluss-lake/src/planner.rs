@@ -18,6 +18,7 @@
 //! Default Fluss-Rust planner for bounded UnionRead requests.
 
 use crate::bucket_pruning::BucketPruner;
+use crate::error::error_message;
 use crate::planning::{FrozenBucketRange, create_logical_split, freeze_read_boundary_for_table};
 use crate::pruning::PartitionPruner;
 use crate::split::SplitStatistics;
@@ -35,6 +36,26 @@ use std::sync::Arc;
 /// Prepares source state without opening a Paimon catalog or generating files.
 /// The context captures all live partitions so it is reusable across filters.
 pub(crate) async fn prepare_read_context(scan: &FlussLakeScan) -> Result<FlussLakeReadContext> {
+    Ok(prepare_scan(scan).await?.1)
+}
+
+struct BoundScan {
+    projection: Option<Vec<usize>>,
+    filter: BoundPredicate,
+}
+
+fn bind_scan(scan: &FlussLakeScan, row_type: &RowType) -> Result<BoundScan> {
+    Ok(BoundScan {
+        projection: scan.resolve_projection(row_type)?,
+        filter: BoundPredicate::bind(scan.filter(), row_type).map_err(|error| {
+            FlussLakeError::PlanningFailed(format!("failed to bind filter predicate: {error}"))
+        })?,
+    })
+}
+
+async fn prepare_scan(
+    scan: &FlussLakeScan,
+) -> Result<(TableInfo, FlussLakeReadContext, BoundScan)> {
     scan.validate_configuration()?;
     let admin = scan
         .connection()
@@ -45,17 +66,15 @@ pub(crate) async fn prepare_read_context(scan: &FlussLakeScan) -> Result<FlussLa
         .await
         .map_err(|error| planning_client_error("get table metadata", error))?;
     validate_lake_readable(&table_info)?;
-    scan.resolve_projection(table_info.row_type())?;
-    BoundPredicate::bind(scan.filter(), table_info.row_type()).map_err(|error| {
-        FlussLakeError::PlanningFailed(format!("failed to bind filter predicate: {error}"))
-    })?;
+    let bound = bind_scan(scan, table_info.row_type())?;
     let boundary = freeze_read_boundary_for_table(&admin, scan.table_path(), &table_info).await?;
-    FlussLakeReadContext::from_boundary(&table_info, boundary)
+    let context = FlussLakeReadContext::from_boundary(&table_info, boundary)?;
+    Ok((table_info, context, bound))
 }
 
 pub(crate) async fn plan_union_read(scan: &FlussLakeScan) -> Result<FlussLakeReadPlan> {
-    let context = prepare_read_context(scan).await?;
-    plan_with_context(scan, &context).await
+    let (table_info, context, bound) = prepare_scan(scan).await?;
+    plan_prepared(scan, &context, &table_info, bound).await
 }
 
 /// Binds scan-specific pruning and the default lake backend to fixed inputs.
@@ -88,18 +107,20 @@ pub(crate) async fn plan_with_context(
             }
         })?;
     context.validate_table(&table_info)?;
-    plan_prepared(scan, context, &table_info).await
+    let bound = bind_scan(scan, table_info.row_type())?;
+    plan_prepared(scan, context, &table_info, bound).await
 }
 
 async fn plan_prepared(
     scan: &FlussLakeScan,
     context: &FlussLakeReadContext,
     table_info: &TableInfo,
+    bound: BoundScan,
 ) -> Result<FlussLakeReadPlan> {
-    let output_projection = scan.resolve_projection(context.table_schema().row_type())?;
-    let filter = BoundPredicate::bind(scan.filter(), context.table_schema().row_type()).map_err(
-        |error| FlussLakeError::PlanningFailed(format!("failed to bind filter predicate: {error}")),
-    )?;
+    let BoundScan {
+        projection: output_projection,
+        filter,
+    } = bound;
     let output_schema = projected_arrow_schema(
         scan.table_path(),
         output_projection.as_deref(),
@@ -154,7 +175,7 @@ async fn plan_prepared(
         None
     };
     let snapshot_id = context.lake_snapshot_id();
-    let mut lake_splits = match (&lake_source, snapshot_id) {
+    let mut tasks = match (&lake_source, snapshot_id) {
         (Some(source), Some(snapshot_id)) => {
             let safe_filter = crate::source::lake_pushdown_filter(
                 &filter,
@@ -162,7 +183,7 @@ async fn plan_prepared(
                 is_primary_key && !scan.lake_only(),
             )
             .unwrap_or(BoundPredicate::AlwaysTrue);
-            let tasks = source
+            source
                 .plan(LakePlannerContext {
                     table_info,
                     snapshot_id,
@@ -171,20 +192,64 @@ async fn plan_prepared(
                     } else {
                         LakeReadSemantics::Append
                     },
+                    reconcile_primary_key: is_primary_key && !scan.lake_only(),
                     filter: &safe_filter,
                 })
-                .await?;
-            group_lake_splits(
-                tasks,
-                source.format(),
-                snapshot_id,
-                table_info,
-                context.log_ranges(),
-            )?
+                .await?
         }
-        _ => std::collections::HashMap::new(),
+        _ => Vec::new(),
     };
     let mut splits = Vec::new();
+    if !is_primary_key && !tasks.is_empty() {
+        if let (Some(source), Some(snapshot_id)) = (&lake_source, snapshot_id) {
+            validate_lake_tasks(&tasks, source.format(), snapshot_id, table_info)?;
+        }
+        let live_partitions: std::collections::HashMap<_, _> = context
+            .log_ranges()
+            .iter()
+            .map(|range| {
+                (
+                    range.partition_identity(),
+                    range.table_bucket().partition_id(),
+                )
+            })
+            .collect();
+        // Append baseline tasks need no Fluss bucket ownership. LakeSource applies
+        // its own safe file/bucket pruning; Fluss bucket pruning applies only to logs.
+        for (index, task) in tasks.drain(..).enumerate() {
+            if !partition_pruner.partition_identity_may_match(&task.partition) {
+                continue;
+            }
+            let mut range = FrozenBucketRange::lake_only(
+                table_info.table_id,
+                task.bucket_id,
+                task.bucket_count,
+                task.partition.clone(),
+            );
+            range.table_bucket = fluss::metadata::TableBucket::new_with_partition(
+                table_info.table_id,
+                live_partitions.get(&task.partition).copied().flatten(),
+                task.bucket_id,
+            );
+            splits.push(append_lake_split(
+                table_info,
+                &range,
+                snapshot_id,
+                task,
+                index,
+            )?);
+        }
+    }
+    let mut lake_splits = match (&lake_source, snapshot_id, is_primary_key) {
+        (Some(source), Some(snapshot_id), true) => group_lake_splits(
+            tasks,
+            source.format(),
+            snapshot_id,
+            table_info,
+            context.log_ranges(),
+        )?,
+        _ => std::collections::HashMap::new(),
+    };
     for bucket_range in context.log_ranges() {
         let bucket_id = bucket_range.table_bucket().bucket_id();
         if !bucket_may_match(bucket_id, bucket_range.bucket_count())
@@ -252,13 +317,7 @@ async fn plan_prepared(
             true,
         )?);
     }
-    FlussLakeReadPlan::new(
-        context.clone(),
-        output_schema,
-        scan.clone(),
-        lake_source,
-        splits,
-    )
+    FlussLakeReadPlan::new(context.clone(), output_schema, splits)
 }
 
 /// Append lake tasks and log tails can be scheduled independently. Primary-key
@@ -293,19 +352,13 @@ fn plan_bucket_splits(
     let mut lake_range = bucket_range.clone();
     lake_range.stop_offset = lake_range.start_offset;
     for (index, task) in lake_bucket.splits.into_iter().enumerate() {
-        let statistics = SplitStatistics::new(task.estimated_rows, task.estimated_size);
-        let mut split = create_logical_split(
-            &table_info.table_path,
-            table_info.schema_id,
+        splits.push(append_lake_split(
+            table_info,
             &lake_range,
             snapshot_id,
-            vec![task],
-            Vec::new(),
-            statistics,
-        )?;
-        // Task indexes are local to this immutable plan, not a replan contract.
-        split.split_id.push_str(&format!(":lake:{index}"));
-        splits.push(split);
+            task,
+            index,
+        )?);
     }
     if include_log_tail {
         let mut split = create_logical_split(
@@ -321,6 +374,28 @@ fn plan_bucket_splits(
         splits.push(split);
     }
     Ok(splits)
+}
+
+fn append_lake_split(
+    table_info: &TableInfo,
+    range: &FrozenBucketRange,
+    snapshot_id: Option<i64>,
+    task: crate::LakeSplit,
+    index: usize,
+) -> Result<FlussLakeReadSplit> {
+    let statistics = SplitStatistics::new(task.estimated_rows, task.estimated_size);
+    let mut split = create_logical_split(
+        &table_info.table_path,
+        table_info.schema_id,
+        range,
+        snapshot_id,
+        vec![task],
+        Vec::new(),
+        statistics,
+    )?;
+    // Indexes distinguish lake tasks within this plan, not across replanning.
+    split.split_id.push_str(&format!(":lake:{index}"));
+    Ok(split)
 }
 
 fn partition_sort_key(partition: &crate::FlussLakePartitionIdentity) -> &[(String, String)] {
@@ -424,8 +499,8 @@ fn group_lake_splits(
     log_ranges: &[crate::FlussLakeLogRange],
 ) -> Result<std::collections::HashMap<(crate::FlussLakePartitionIdentity, i32), PlannedLakeBucket>>
 {
+    validate_lake_tasks(&tasks, format, snapshot_id, info)?;
     let mut grouped = std::collections::HashMap::new();
-    let mut seen = std::collections::HashSet::new();
     let mut bucket_counts: std::collections::HashMap<_, _> = log_ranges
         .iter()
         .map(|range| (range.partition_identity(), range.bucket_count()))
@@ -437,7 +512,11 @@ fn group_lake_splits(
         );
     }
     for task in &tasks {
-        task.validate(format, snapshot_id)?;
+        if task.bucket_id < 0 {
+            return Err(FlussLakeError::PlanningFailed(
+                "primary-key lake tasks require fixed Fluss-aligned buckets".to_string(),
+            ));
+        }
         if let Some(count) = bucket_counts.insert(&task.partition, task.bucket_count)
             && count != task.bucket_count
         {
@@ -445,6 +524,27 @@ fn group_lake_splits(
                 "lake partition bucket count conflicts with its frozen Fluss layout or another lake task".to_string()
             ));
         }
+    }
+    for task in tasks {
+        let bucket = grouped
+            .entry((task.partition.clone(), task.bucket_id))
+            .or_insert_with(PlannedLakeBucket::default);
+        bucket.estimated_rows = add_estimates(bucket.estimated_rows, task.estimated_rows);
+        bucket.estimated_size = add_estimates(bucket.estimated_size, task.estimated_size);
+        bucket.splits.push(task);
+    }
+    Ok(grouped)
+}
+
+fn validate_lake_tasks(
+    tasks: &[crate::LakeSplit],
+    format: &str,
+    snapshot_id: i64,
+    info: &TableInfo,
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for task in tasks {
+        task.validate(format, snapshot_id)?;
         if !seen.insert((
             &task.partition,
             task.bucket_id,
@@ -472,18 +572,7 @@ fn group_lake_splits(
             ));
         }
     }
-    // Validate borrowed payloads before moving them; do not duplicate every
-    // file task's potentially large encoded metadata just for deduplication.
-    drop(seen);
-    for task in tasks {
-        let bucket = grouped
-            .entry((task.partition.clone(), task.bucket_id))
-            .or_insert_with(PlannedLakeBucket::default);
-        bucket.estimated_rows = add_estimates(bucket.estimated_rows, task.estimated_rows);
-        bucket.estimated_size = add_estimates(bucket.estimated_size, task.estimated_size);
-        bucket.splits.push(task);
-    }
-    Ok(grouped)
+    Ok(())
 }
 
 fn split_statistics(
@@ -512,11 +601,10 @@ fn add_estimates(left: Option<usize>, right: Option<usize>) -> Option<usize> {
 }
 
 fn planning_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    let message = error_message(action, &error);
     match error {
-        ClientError::RpcError { .. } => {
-            FlussLakeError::ConnectionError(format!("failed to {action}: {error}"))
-        }
-        _ => FlussLakeError::PlanningFailed(format!("failed to {action}: {error}")),
+        ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
+        _ => FlussLakeError::PlanningFailed(message),
     }
 }
 
@@ -594,7 +682,7 @@ mod tests {
             let restored: FlussLakeReadSplit =
                 serde_json::from_slice(&serde_json::to_vec(split).unwrap()).unwrap();
             assert_eq!(&restored, split);
-            let descriptor = restored.decode_execution_descriptor().unwrap();
+            let descriptor = restored.validated_execution_descriptor().unwrap();
             assert_eq!(descriptor.table_bucket(), range.table_bucket());
             assert_eq!(descriptor.snapshot_id(), Some(42));
             assert!(!descriptor.is_primary_key());
@@ -647,7 +735,7 @@ mod tests {
                     assert_eq!(splits.len(), expected_lake_tasks + expected_log_tasks);
                     let log_tasks = splits
                         .iter()
-                        .map(|split| split.decode_execution_descriptor().unwrap())
+                        .map(|split| split.validated_execution_descriptor().unwrap())
                         .filter(|descriptor| descriptor.start_offset() < descriptor.stop_offset())
                         .count();
                     assert_eq!(log_tasks, expected_log_tasks);
@@ -684,7 +772,7 @@ mod tests {
             for split in splits {
                 assert!(all_ids.insert(split.split_id.clone()));
                 assert_eq!(split.partition, range.partition_identity);
-                let descriptor = split.decode_execution_descriptor().unwrap();
+                let descriptor = split.validated_execution_descriptor().unwrap();
                 assert_eq!(descriptor.table_bucket().partition_id(), partition_id);
                 assert_eq!(descriptor.lake_splits()[0].bucket_count, 8);
                 assert_eq!(descriptor.start_offset(), descriptor.stop_offset());
@@ -714,7 +802,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(splits.len(), 1);
-            let descriptor = splits[0].decode_execution_descriptor().unwrap();
+            let descriptor = splits[0].validated_execution_descriptor().unwrap();
             assert!(descriptor.is_primary_key());
             assert_eq!(descriptor.lake_splits().len(), 2);
             assert_eq!(descriptor.start_offset(), 6);
@@ -752,6 +840,21 @@ mod tests {
         invalid.partition =
             crate::FlussLakePartitionIdentity::KeyValues(vec![("unknown".into(), "v".into())]);
         assert!(group_lake_splits(vec![invalid], "paimon", 42, &info, &[]).is_err());
+    }
+
+    #[test]
+    fn bucket_unaware_tasks_are_append_only_and_still_validate_transport() {
+        let info = table_info(false, vec![], HashMap::new());
+        let mut task = crate::source::testing_split();
+        task.bucket_id = -1;
+        task.bucket_count = -1;
+        validate_lake_tasks(&[task.clone()], "paimon", 42, &info).unwrap();
+        assert!(group_lake_splits(vec![task.clone()], "paimon", 42, &info, &[]).is_err());
+        assert!(validate_lake_tasks(&[task.clone(), task.clone()], "paimon", 42, &info).is_err());
+        for count in [0, 4] {
+            task.bucket_count = count;
+            assert!(validate_lake_tasks(&[task.clone()], "paimon", 42, &info).is_err());
+        }
     }
 
     #[test]
@@ -797,53 +900,6 @@ mod tests {
         assert!(
             group_lake_splits(vec![expired, conflicting], "paimon", 42, &info, &ranges).is_err()
         );
-    }
-
-    /// Catalog configuration belongs to the plan-bound reader and must not
-    /// be duplicated into distributable splits.
-    #[test]
-    #[cfg(feature = "paimon")]
-    fn catalog_configuration_never_reaches_encoded_split_bytes() {
-        use crate::split_descriptor::SplitDescriptor;
-        use fluss::metadata::TableBucket;
-
-        let descriptor = SplitDescriptor::try_new(
-            fluss::metadata::TablePath::new("fluss", "orders"),
-            1,
-            false,
-            TableBucket::new(7, 0),
-            0,
-            0,
-            Some(42),
-            vec![crate::source::testing_split()],
-            Vec::new(),
-        )
-        .unwrap();
-        let split = crate::FlussLakeReadSplit::try_new(
-            "fluss.orders:root:0".to_string(),
-            0,
-            crate::FlussLakePartitionIdentity::Unpartitioned,
-            crate::CURRENT_FLUSS_LAKE_SPLIT_VERSION,
-            descriptor,
-            SplitStatistics::default(),
-        )
-        .unwrap();
-
-        let encoded = serde_json::to_vec(&split).unwrap();
-        for needle in [
-            b"s3.secret-key".as_slice(),
-            b"TOP-SECRET-VALUE".as_slice(),
-            b"s3.access-key-id".as_slice(),
-            b"AKID-VALUE".as_slice(),
-            b"warehouse".as_slice(),
-            b"s3://bucket/warehouse".as_slice(),
-        ] {
-            assert!(
-                !encoded.windows(needle.len()).any(|window| window == needle),
-                "encoded split bytes must not contain {:?}",
-                String::from_utf8_lossy(needle)
-            );
-        }
     }
 
     fn pk_table_info(

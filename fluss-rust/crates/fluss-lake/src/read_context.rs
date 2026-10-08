@@ -25,7 +25,7 @@ use fluss::metadata::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-const CONTEXT_VERSION: u32 = 2;
+const CONTEXT_VERSION: u32 = 3;
 
 /// One frozen, half-open Fluss log range, not an engine scheduling unit.
 ///
@@ -142,13 +142,14 @@ pub struct FlussLakeReadContext {
     schema: Schema,
 }
 
-/// V2 uses the public Fluss schema JSON, not Rust's internal Schema serde.
+/// Uses the public Fluss schema JSON, not Rust's internal Schema serde.
 /// No arbitrary catalog/table property map is allowed in this descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContextDescriptor {
     context_version: u32,
     table_path: TablePath,
+    lake_table_path: TablePath,
     table_id: i64,
     table_modified_time: i64,
     schema_id: i32,
@@ -167,6 +168,7 @@ impl FlussLakeReadContext {
         ContextDescriptor {
             context_version: CONTEXT_VERSION,
             table_path: table.table_path.clone(),
+            lake_table_path: crate::table::resolve_lake_table_path(table)?,
             table_id: table.table_id,
             table_modified_time: table.modified_time,
             schema_id: table.schema_id,
@@ -200,6 +202,12 @@ impl FlussLakeReadContext {
         &self.descriptor.table_path
     }
 
+    /// Physical lake database/table name frozen with the snapshot identity.
+    /// Catalog credentials and runtime catalog mapping are supplied separately.
+    pub fn lake_table_path(&self) -> &TablePath {
+        &self.descriptor.lake_table_path
+    }
+
     /// Server-assigned identity, used to reject a dropped/recreated table.
     pub fn table_id(&self) -> i64 {
         self.descriptor.table_id
@@ -207,8 +215,8 @@ impl FlussLakeReadContext {
 
     /// Source metadata modification time, not a query snapshot timestamp.
     ///
-    /// Used conservatively to reject table-property changes without including
-    /// arbitrary properties or credentials in the context.
+    /// Informational only: unrelated property or comment changes do not
+    /// invalidate the frozen read identity.
     pub fn table_modified_time(&self) -> i64 {
         self.descriptor.table_modified_time
     }
@@ -304,12 +312,12 @@ impl FlussLakeReadContext {
             .map(|value| value.to_ascii_lowercase());
         if self.table_path() != &table.table_path
             || self.table_id() != table.table_id
-            || self.table_modified_time() != table.modified_time
+            || self.lake_table_path() != &crate::table::resolve_lake_table_path(table)?
             || self.schema_id() != table.schema_id
             || self.descriptor.schema != table.schema.serialize_json().map_err(invalid_context)?
             || self.partition_keys() != table.partition_keys.as_ref()
             || self.bucket_keys() != table.bucket_keys
-            || self.num_buckets() != table.num_buckets
+            || (self.partition_keys().is_empty() && self.num_buckets() != table.num_buckets)
             || Some(self.lake_format()) != format.as_deref()
             || self.merge_engine() != merge.as_deref()
         {
@@ -337,6 +345,8 @@ impl TryFrom<ContextDescriptor> for FlussLakeReadContext {
         validate_version(u64::from(descriptor.context_version))?;
         if descriptor.table_path.database().is_empty()
             || descriptor.table_path.table().is_empty()
+            || descriptor.lake_table_path.database().is_empty()
+            || descriptor.lake_table_path.table().is_empty()
             || descriptor.table_id < 0
             || descriptor.table_modified_time < 0
             || descriptor.schema_id < 0
@@ -593,10 +603,11 @@ mod tests {
     }
 
     #[test]
-    fn version_two_transport_shape_is_stable() {
+    fn version_three_transport_shape_is_stable() {
         let fixture = json!({
-            "context_version": 2,
+            "context_version": 3,
             "table_path": {"database": "fluss", "table": "orders"},
+            "lake_table_path": {"database": "fluss", "table": "orders"},
             "table_id": 7,
             "table_modified_time": 0,
             "schema_id": 2,
@@ -705,7 +716,7 @@ mod tests {
 
     #[test]
     fn incompatible_versions_are_explicit_errors() {
-        for version in [0, 1, 3, u64::MAX] {
+        for version in [0, 1, 2, 4, u64::MAX] {
             let mut value = value(false);
             value["context_version"] = json!(version);
             assert!(matches!(
@@ -833,19 +844,56 @@ mod tests {
         recreated.table_id += 1;
         let mut evolved = table(true);
         evolved.schema_id += 1;
-        let mut rebucketed = table(true);
+        let mut rebucketed = table(false);
         rebucketed.num_buckets += 1;
         let mut moved = table(true);
         moved.table_path = TablePath::new("fluss", "another");
-        let mut changed_properties = table(true);
-        changed_properties.modified_time += 1;
-        for table in [recreated, evolved, rebucketed, moved, changed_properties] {
+        for table in [recreated, evolved, moved] {
             assert!(matches!(
                 context.validate_table(&table),
                 Err(FlussLakeError::SchemaIncompatible(_))
             ));
         }
+        assert!(self::context(false).validate_table(&rebucketed).is_err());
         assert_eq!(context.lake_snapshot_id(), Some(42));
         assert_eq!(context.log_ranges()[0].stop_offset(), 20);
+    }
+
+    #[test]
+    fn unrelated_metadata_and_new_partition_defaults_preserve_frozen_bounds() {
+        let context = context(true);
+        let mut changed = table(true);
+        changed.modified_time += 1;
+        changed.comment = Some("new description".into());
+        changed.num_buckets = 4;
+        changed
+            .properties
+            .insert("unrelated".into(), "value".into());
+        context.validate_table(&changed).unwrap();
+        assert_eq!(context.num_buckets(), 2);
+        assert!(
+            context
+                .log_ranges()
+                .iter()
+                .all(|range| range.bucket_count() == 2)
+        );
+        assert_eq!(context.log_ranges()[0].stop_offset(), 20);
+    }
+
+    #[test]
+    fn physical_lake_mapping_is_frozen_and_not_a_runtime_catalog() {
+        let context = context(true);
+        let mut changed = table(true);
+        for key in ["table.datalake.database-name", "table.datalake.table-name"] {
+            changed.properties.insert(key.into(), "physical".into());
+            assert!(matches!(
+                context.validate_table(&changed),
+                Err(FlussLakeError::SchemaIncompatible(_))
+            ));
+            changed.properties.remove(key);
+        }
+        let mut malformed = value(true);
+        malformed["lake_table_path"]["table"] = json!("");
+        assert_invalid(malformed);
     }
 }

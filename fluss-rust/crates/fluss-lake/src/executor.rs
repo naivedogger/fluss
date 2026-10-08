@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::FlussLakeReader;
+use crate::error::error_message;
 use crate::planner::{
     physical_primary_key_indexes, resolve_lake_source, validate_pk_union_merge_engine,
 };
@@ -29,7 +30,6 @@ use fluss::metadata::{RowType, TableInfo};
 use fluss::predicate::{BoundPredicate, Predicate};
 use fluss::record::ChangeType;
 use futures::{StreamExt, TryStreamExt};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -45,7 +45,8 @@ pub(crate) fn execute_split(
     split: &FlussLakeReadSplit,
     reader: &FlussLakeReader,
 ) -> Result<RecordBatchStream> {
-    let descriptor = split.decode_execution_descriptor()?;
+    // Validation borrows the payload; ownership is needed only for the lazy stream.
+    let descriptor = split.validated_execution_descriptor()?.clone();
     if descriptor.table_path() != reader.scan().table_path() {
         return Err(FlussLakeError::PlanningFailed(
             "split and reader refer to different tables".to_string(),
@@ -73,27 +74,15 @@ async fn open_logical_stream(
         .await
         .map_err(|error| execution_client_error("open Fluss table", error))?;
     let table_info = table.get_table_info();
-    let execution = reader.bound_plan().map(|plan| plan.execution());
-    if let Some(execution) = execution {
-        execution.context.validate_table(table_info)?;
-    }
     crate::table::validate_lake_readable(table_info)?;
     validate_frozen_identity(table_info, &descriptor, &partition)?;
     if descriptor.is_primary_key() && !scan.lake_only() {
         validate_pk_union_merge_engine(table_info)?;
     }
-    let bound_filter = match execution {
-        Some(execution) => Cow::Borrowed(&execution.filter),
-        None => Cow::Owned(
-            BoundPredicate::bind(scan.filter(), table_info.row_type())
-                .map_err(|error| FlussLakeError::PlanningFailed(error.to_string()))?,
-        ),
-    };
-    let filter = bound_filter.as_ref();
-    let output_projection = match execution {
-        Some(execution) => Cow::Borrowed(&execution.output_projection),
-        None => Cow::Owned(scan.resolve_projection(table_info.row_type())?),
-    };
+    let bound_filter = BoundPredicate::bind(scan.filter(), table_info.row_type())
+        .map_err(|error| FlussLakeError::PlanningFailed(error.to_string()))?;
+    let filter = &bound_filter;
+    let output_projection = scan.resolve_projection(table_info.row_type())?;
     let physical = PhysicalProjection::resolve(
         table_info.row_type(),
         output_projection.as_deref(),
@@ -104,12 +93,7 @@ async fn open_logical_stream(
     let lake_stream = if descriptor.lake_splits().is_empty() {
         Box::pin(futures::stream::empty()) as RecordBatchStream
     } else {
-        let source = match execution {
-            Some(execution) => execution.lake_source.clone().ok_or_else(|| {
-                FlussLakeError::Internal("plan has lake tasks but no LakeSource".to_string())
-            })?,
-            None => resolve_lake_source(scan, table_info)?,
-        };
+        let source = resolve_lake_source(scan, table_info)?;
         let snapshot_id = descriptor
             .snapshot_id()
             .ok_or_else(|| FlussLakeError::Internal("lake tasks need a snapshot".to_string()))?;
@@ -139,6 +123,7 @@ async fn open_logical_stream(
                 } else {
                     crate::LakeReadSemantics::Append
                 },
+                reconcile_primary_key: descriptor.is_primary_key() && !scan.lake_only(),
                 splits: tasks,
                 projection: &physical.field_indexes,
                 schema: physical_schema.clone(),
@@ -490,7 +475,8 @@ fn validate_frozen_identity(
     let partition_matches = match partition {
         crate::FlussLakePartitionIdentity::Unpartitioned => {
             table_info.partition_keys.is_empty()
-                && descriptor.table_bucket().bucket_id() < table_info.num_buckets
+                && (descriptor.is_append_lake()
+                    || descriptor.table_bucket().bucket_id() < table_info.num_buckets)
         }
         crate::FlussLakePartitionIdentity::KeyValues(values) => {
             !table_info.partition_keys.is_empty()
@@ -596,12 +582,14 @@ fn reconciled_stream(
 }
 
 fn reconciliation_error(error: ClientError) -> FlussLakeError {
-    FlussLakeError::Internal(format!(
-        "failed to reconcile the primary-key current view: {error}"
+    FlussLakeError::Internal(error_message(
+        "reconcile the primary-key current view",
+        &error,
     ))
 }
 
 fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    let message = error_message(action, &error);
     if matches!(
         error.api_error(),
         Some(
@@ -612,16 +600,12 @@ fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
                 | fluss::error::FlussError::KvSnapshotNotExist
         )
     ) {
-        return FlussLakeError::DataUnavailable(format!("failed to {action}: {error}"));
+        return FlussLakeError::DataUnavailable(message);
     }
     match error {
-        ClientError::LogOffsetOutOfRange { .. } => {
-            FlussLakeError::DataUnavailable(format!("failed to {action}: {error}"))
-        }
-        ClientError::RpcError { .. } => {
-            FlussLakeError::ConnectionError(format!("failed to {action}: {error}"))
-        }
-        _ => FlussLakeError::Internal(format!("failed to {action}: {error}")),
+        ClientError::LogOffsetOutOfRange { .. } => FlussLakeError::DataUnavailable(message),
+        ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
+        _ => FlussLakeError::Internal(message),
     }
 }
 
@@ -774,18 +758,17 @@ fn resize_batches(stream: RecordBatchStream, batch_size: usize) -> RecordBatchSt
 fn predicate_evaluation_error(error: ClientError) -> FlussLakeError {
     match error {
         ClientError::IllegalArgument { message } => FlussLakeError::SchemaIncompatible(message),
-        error => {
-            FlussLakeError::Internal(format!("failed to evaluate UnionRead predicate: {error}"))
-        }
+        error => FlussLakeError::Internal(error_message("evaluate UnionRead predicate", &error)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int32Array};
     use fluss::metadata::{DataField, DataTypes, Schema, TableBucket, TablePath};
     use fluss::predicate::{Predicate, col};
-    use futures::StreamExt;
+    use futures::{StreamExt, stream};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn table_info(partitioned: bool) -> TableInfo {
@@ -912,6 +895,14 @@ mod tests {
         BoundPredicate::bind(Some(&predicate), &pk_row_type()).unwrap()
     }
 
+    fn id_batch(ids: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(ids)) as ArrayRef)]).unwrap()
+    }
+
+    fn collect_batches(stream: RecordBatchStream) -> Result<Vec<RecordBatch>> {
+        futures::executor::block_on(stream.try_collect())
+    }
+
     #[test]
     fn empty_output_projection_preserves_filtered_row_counts() {
         let filter = bound(col("amount").gt(10_i64));
@@ -933,7 +924,7 @@ mod tests {
             Some(0),
             Some(1),
         );
-        let batches = futures::executor::block_on(stream.try_collect::<Vec<_>>()).unwrap();
+        let batches = collect_batches(stream).unwrap();
         assert_eq!(batches.len(), 2);
         assert!(
             batches
@@ -995,80 +986,37 @@ mod tests {
 
     #[test]
     fn take_rows_avoids_copying_a_run_covering_the_whole_batch() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef],
-        )
-        .unwrap();
-
+        let batch = id_batch(vec![1, 2, 3]);
         let whole = take_rows(&batch, &[0, 1, 2]).unwrap();
         let subset = take_rows(&batch, &[2, 0]).unwrap();
 
-        assert_eq!(whole.num_rows(), 3);
-        assert_eq!(subset.num_rows(), 2);
-        let ids = subset
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(ids.values(), &[3, 1]);
+        assert!(Arc::ptr_eq(whole.column(0), batch.column(0)));
+        assert_eq!(subset, id_batch(vec![3, 1]));
     }
 
     #[test]
-    fn apply_filter_removes_non_matching_rows_from_stream() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use futures::stream;
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow::array::ArrayRef],
-        )
-        .unwrap();
-        let source: RecordBatchStream =
-            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
-        let filtered = apply_filter_and_projection(source, &bound(col("id").gt(2_i32)), None);
-
-        let batches: Vec<RecordBatch> =
-            futures::executor::block_on(filtered.try_collect()).unwrap();
-        assert_eq!(batches.len(), 1);
-        let ids = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(ids.values(), &[3, 4]);
-    }
-
-    #[test]
-    fn apply_filter_drops_batch_with_no_matching_rows() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use futures::stream;
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef],
-        )
-        .unwrap();
-        let source: RecordBatchStream =
-            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
-        let filtered = apply_filter_and_projection(source, &bound(col("id").gt(5_i32)), None);
-
-        let batches: Vec<RecordBatch> =
-            futures::executor::block_on(filtered.try_collect()).unwrap();
-        assert!(batches.is_empty());
+    fn apply_filter_emits_only_nonempty_matching_batches() {
+        for (threshold, expected) in [(0, vec![1, 2, 3, 4]), (2, vec![3, 4]), (5, vec![])] {
+            let source = Box::pin(stream::iter([Ok(id_batch(vec![1, 2, 3, 4]))]));
+            let filtered =
+                apply_filter_and_projection(source, &bound(col("id").gt(threshold)), None);
+            let expected = if expected.is_empty() {
+                vec![]
+            } else {
+                vec![id_batch(expected)]
+            };
+            assert_eq!(
+                collect_batches(filtered).unwrap(),
+                expected,
+                "id > {threshold}"
+            );
+        }
     }
 
     #[test]
     fn exact_filter_runs_before_hidden_columns_are_stripped() {
         use arrow::array::{Int32Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use futures::stream;
-
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("name", DataType::Utf8, false),
@@ -1084,8 +1032,7 @@ mod tests {
             Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
         let filtered = apply_filter_and_projection(source, &bound(col("id").eq(2_i32)), Some(1));
 
-        let batches: Vec<RecordBatch> =
-            futures::executor::block_on(filtered.try_collect()).unwrap();
+        let batches = collect_batches(filtered).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_columns(), 1);
@@ -1101,8 +1048,6 @@ mod tests {
     #[test]
     fn exact_filter_never_passes_through_a_missing_column() {
         use arrow::array::StringArray;
-        use futures::stream;
-
         let batch = RecordBatch::try_from_iter(vec![(
             "name",
             Arc::new(StringArray::from(vec!["one"])) as arrow::array::ArrayRef,
@@ -1112,9 +1057,10 @@ mod tests {
             Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
         let filtered = apply_filter_and_projection(source, &bound(col("id").eq(1_i32)), None);
 
-        let result = futures::executor::block_on(filtered.try_collect::<Vec<RecordBatch>>());
-
-        assert!(matches!(result, Err(FlussLakeError::SchemaIncompatible(_))));
+        assert!(matches!(
+            collect_batches(filtered),
+            Err(FlussLakeError::SchemaIncompatible(_))
+        ));
     }
 
     #[test]
@@ -1154,71 +1100,22 @@ mod tests {
 
     #[test]
     fn output_batch_size_slices_oversized_batches_after_filtering() {
-        use arrow::array::Int32Array;
-        use futures::stream;
-
-        let batch = RecordBatch::try_from_iter(vec![(
-            "id",
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as arrow::array::ArrayRef,
-        )])
-        .unwrap();
-        let source: RecordBatchStream =
-            Box::pin(stream::iter(vec![Ok::<_, FlussLakeError>(batch)]));
+        let source = Box::pin(stream::iter([Ok(id_batch(vec![1, 2, 3, 4, 5]))]));
         let resized = apply_output_processing(source, &bound(col("id").gt(1_i32)), None, Some(3));
 
-        let batches: Vec<RecordBatch> = futures::executor::block_on(resized.try_collect()).unwrap();
-
         assert_eq!(
-            batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .collect::<Vec<_>>(),
-            vec![3, 1]
+            collect_batches(resized).unwrap(),
+            vec![id_batch(vec![2, 3, 4]), id_batch(vec![5])]
         );
-        let first = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let second = batches[1]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(first.values(), &[2, 3, 4]);
-        assert_eq!(second.values(), &[5]);
     }
 
     #[test]
     fn output_batch_size_does_not_coalesce_small_batches() {
-        use arrow::array::Int32Array;
-        use futures::stream;
-
-        let first = RecordBatch::try_from_iter(vec![(
-            "id",
-            Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef,
-        )])
-        .unwrap();
-        let second = RecordBatch::try_from_iter(vec![(
-            "id",
-            Arc::new(Int32Array::from(vec![3])) as arrow::array::ArrayRef,
-        )])
-        .unwrap();
-        let source: RecordBatchStream = Box::pin(stream::iter(vec![
-            Ok::<_, FlussLakeError>(first),
-            Ok::<_, FlussLakeError>(second),
-        ]));
+        let expected = vec![id_batch(vec![1, 2]), id_batch(vec![3])];
+        let source = Box::pin(stream::iter(expected.clone().into_iter().map(Ok)));
         let resized = resize_batches(source, 3);
 
-        let batches: Vec<RecordBatch> = futures::executor::block_on(resized.try_collect()).unwrap();
-
-        assert_eq!(
-            batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .collect::<Vec<_>>(),
-            vec![2, 1]
-        );
+        assert_eq!(collect_batches(resized).unwrap(), expected);
     }
 
     #[test]

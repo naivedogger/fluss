@@ -33,12 +33,12 @@ are unchanged.
 ## Choose an integration level
 
 ```text
-FlussLakeTable -> FlussLakeScan -> plan() -> FlussLakeReadPlan
-                       |                         |
-                 with_lake_source()         new_reader()
-                       |                         |
-              LakeSource::plan/read       FlussLakeReader
-              (default: Paimon)            -> final Arrow batches
+FlussLakeTable -> FlussLakeScan -> plan() -> Plan -> Splits
+                       |                            |
+                       +-> new_reader() -> Reader <-+
+                       |                   -> final Arrow batches
+                       +-> with_lake_source()
+                           LakeSource::plan/read (default: Paimon)
 
 Advanced: table.prepare() -> FlussLakeReadContext
                               |                 |
@@ -47,8 +47,8 @@ Advanced: table.prepare() -> FlussLakeReadContext
                                            scheduling / memory policy
 ```
 
-The main flow is **Table → Scan → Plan → Reader**. Source-boundary preparation
-is internal to `scan.plan()`; most callers need no separate `prepare()` step.
+The scan creates both the plan and the reader; the reader consumes its splits.
+Source-boundary preparation is internal to `scan.plan()`; most callers need no separate `prepare()` step.
 Like Java's FIP-6, a `LakeSource` owns lake planning, split payloads and reading.
 Rust passes immutable request contexts rather than mutating shared pushdown
 settings or introducing stateless planner/reader factory wrappers.
@@ -74,7 +74,7 @@ async fn query(connection: Arc<FlussConnection>, path: &TablePath) -> Result<()>
         .with_projection_by_names(vec!["name".to_string()])
         .with_batch_size(4096);
     let plan = scan.plan().await?;
-    let reader = plan.new_reader();
+    let reader = scan.new_reader();
     for split in plan.splits() {
         let mut stream = reader.read_split(split).await?;
         while let Some(batch) = stream.try_next().await? {
@@ -86,9 +86,10 @@ async fn query(connection: Arc<FlussConnection>, path: &TablePath) -> Result<()>
 }
 ```
 
-The plan binds the projection, filter, mode, lake source and frozen boundaries.
-Plan-created readers reject foreign or modified tasks; changing another scan
-cannot reinterpret this plan. Both reader entry points reject duplicate task
+The plan freezes source boundaries and logical tasks, while the reader captures
+scan settings. Callers must use the same projection, filter, mode, batch size
+and compatible lake backend for planning and execution. The reader does not
+retain a plan or check task membership. It rejects duplicate task
 IDs within one `read_splits` call. `read_splits(plan.splits())` reads an unordered
 stream with at most eight active logical tasks. Use
 `read_splits_with_concurrency(..., n)` to set a positive limit, or schedule
@@ -144,8 +145,8 @@ Splits contain no projection/filter or configuration fingerprint; a mismatch
 may produce incomplete results or a wrong output schema. Workers still validate
 descriptor versions, table/schema identity, partition/key layout and backend
 payloads. Those checks do not authenticate tasks or compare remote scan settings:
-accept tasks only from a trusted coordinator. Plan-created readers additionally
-check task membership and the complete frozen read context's metadata.
+accept tasks only from a trusted coordinator. These obligations apply to local
+callers as well as distributed workers.
 
 ### Replace lake reading without replacing UnionRead
 
@@ -170,9 +171,14 @@ PK reconciliation or final filtering.
 
 The optional `paimon` feature provides the only production backend in this
 crate. Custom sources also work without this feature. This is an evolving Rust
-API, not a stable cross-language ABI or universal file-list protocol. Tasks
-must follow the Fluss partition/bucket layout; a bucket-less or differently
-partitioned lake needs an adapter restoring that ownership or a native plan.
+API, not a stable cross-language ABI or universal file-list protocol. PK tasks
+must follow the Fluss partition/bucket layout for tail reconciliation. Append
+lake tasks are independent of log buckets and may use a different fixed layout
+or the bucket-unaware pair `bucket_id = bucket_count = -1`. Their source owns
+lake bucket pruning; Fluss bucket pruning applies to log tasks.
+Both modes preserve the table's logical partition identities.
+`reconcile_primary_key` in lake request contexts distinguishes a PK baseline
+from a baseline that must also support the default deduplicate overlay.
 
 ### Reuse one boundary across table references
 
@@ -196,7 +202,7 @@ async fn plan_references(table: &FlussLakeTable) -> Result<()> {
         left_plan.read_context().to_json()?,
         right_plan.read_context().to_json()?
     );
-    // Execute each plan with its own plan.new_reader().
+    // Execute left_plan with left.new_reader(), right_plan with right.new_reader().
     Ok(())
 }
 ```
@@ -205,7 +211,7 @@ async fn plan_references(table: &FlussLakeTable) -> Result<()> {
 
 `prepare()` and context transport do not open a lake catalog and do not require
 the `paimon` feature. A native adapter consumes the full Fluss schema, table
-identity, pinned lake snapshot ID, partition/bucket layout, and half-open log
+identity, resolved `lake_table_path()`, pinned lake snapshot ID, partition/bucket layout, and half-open log
 ranges. Engine expressions, physical file tasks, runtime handles, credentials,
 and memory pools stay outside this context.
 This is an advanced Rust boundary-sharing helper, not a Java API counterpart.
@@ -254,8 +260,8 @@ equivalent algorithm under the same semantics.
   execute together. Native plans may choose their own task granularity.
 - Partitioned tables may retain different bucket counts after changing the table
   default. Preparation freezes each live partition's actual count, and pruning
-  uses that partition's hash modulus. Lake tasks carry their partition count,
-  including expired lake-only partitions; conflicting live/lake layouts fail.
+  uses that partition's hash modulus. PK lake tasks carry their partition count,
+  including expired lake-only partitions; conflicting PK live/lake layouts fail.
   Core Admin resolves legacy metadata without a count using the table default
   only while its bucket-count epoch is zero. Missing counts after a rescale
   fail instead of silently using a different layout. UnionRead consumes these
@@ -274,17 +280,20 @@ equivalent algorithm under the same semantics.
 - Bucket-key pruning has a bounded candidate/hashing budget and does not
   materialize the Cartesian product of `IN` lists. When the budget is exceeded,
   it keeps all buckets and leaves correctness to the final exact filter.
-- Context version 2, default split descriptor version 3 and backend payload
-  versions are separate. This revision does not accept old V1 contexts or V1/V2 default splits.
+- Context version 3, default split descriptor version 4 and backend payload
+  versions are separate. Older contexts and default splits are not accepted.
   Unknown versions fail explicitly. Receive contexts from trusted coordinators;
   decoding validates structure, not authenticity or retention.
 - Default splits can round-trip for local retries or remote worker execution.
   They carry frozen source work, not the scan's filter, projection, runtime
   source or credentials. Engines restore those settings and use
   `scan.new_reader()`; no full-plan transport or worker-side replanning is needed.
-- Context-based planning and plan-created readers conservatively check source
-  table modification time along with schema and layout. Worker readers check
-  the identity/layout recorded in the split, not the complete source context.
+- Context-based planning checks schema, keys, merge semantics and the resolved
+  physical lake table path, not modification time or unrelated properties.
+  A partitioned table's new-partition default does not invalidate its captured
+  partitions and their actual bucket counts. All readers check the identity/layout
+  recorded in the split,
+  not the complete source context or membership in a plan's task list.
   Runtime Fluss cluster and lake catalog/table mappings must remain consistent;
   neither a context nor a split authenticates a catalog.
 - Snapshot selection is source-owned. There is no arbitrary historical
@@ -325,7 +334,8 @@ Four additional scenarios cover append/PK reads after increasing and decreasing
 the default bucket count. Each includes an old live partition, a new partition,
 an expired lake-only partition, a real log tail, and bucket/partition filters.
 Shrinking scenarios require a nonempty lake baseline and log tail in old
-buckets above the new table default, through both plan and worker readers.
+buckets above the new table default, through local and transported execution
+using the same scan-created reader.
 Append filters also check that a fully pruned log tail reaches its frozen stop,
 both when the lake returns rows and when the whole result is empty.
 The workflow requires all six scenarios to execute without skips.

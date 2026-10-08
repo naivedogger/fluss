@@ -17,16 +17,19 @@
 
 //! Paimon lake snapshot planning and reading.
 //!
-//! A Fluss table tiered to Paimon is mirrored one-to-one: the Paimon
-//! identifier is the Fluss `database.table`, and the catalog is configured by
-//! the table's `table.datalake.paimon.*` properties. Planning resolves a
-//! readable lake snapshot into immutable Paimon splits; execution reads a
-//! partition/bucket group back as a finite Arrow batch stream.
+//! The physical lake database and table use `table.datalake.database-name`
+//! and `table.datalake.table-name`, falling back to the logical Fluss names.
+//! Catalog settings come from `table.datalake.paimon.*` properties and runtime
+//! overrides. Planning pins a readable snapshot into immutable lake tasks.
+//! Append tasks are independently readable, including bucket-unaware layouts.
+//! Primary-key tasks are read as a partition/bucket group so Paimon can apply
+//! its merge and deletion rules before Fluss tail reconciliation.
 //!
 //! Only Parquet data files are supported: the pinned paimon-rust build has ORC
 //! reads disabled, so an ORC table fails at read time with an explicit
 //! unsupported-format error.
 
+use crate::error::error_message;
 use crate::{FlussLakeError, FlussLakePartitionIdentity, RecordBatchStream, Result};
 use arrow::array::StructArray;
 use arrow::record_batch::RecordBatch;
@@ -44,6 +47,8 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
 mod arrow_conversion;
+#[cfg(test)]
+mod reader_tests;
 
 /// Default Paimon LakeSource. Planning and reading share the same catalog mapping.
 /// Credentials stay in this runtime object, never in the split payload.
@@ -74,8 +79,9 @@ impl crate::LakeSource for PaimonLakeSource {
     ) -> futures::future::BoxFuture<'a, Result<Vec<crate::LakeSplit>>> {
         Box::pin(async move {
             let info = context.table_info;
+            let lake_path = crate::table::resolve_lake_table_path(info)?;
             plan_snapshot_splits(
-                &info.table_path,
+                &lake_path,
                 &self.catalog_options,
                 context.snapshot_id,
                 ExpectedPaimonLayout {
@@ -84,7 +90,7 @@ impl crate::LakeSource for PaimonLakeSource {
                     bucket_keys: &info.bucket_keys,
                     num_buckets: info.num_buckets,
                 },
-                context.semantics == crate::LakeReadSemantics::PrimaryKey,
+                context.reconcile_primary_key,
                 Some(context.filter),
             )
             .await
@@ -433,7 +439,7 @@ pub(crate) async fn plan_snapshot_splits(
         .map(|split| {
             validate_split_bucket_count(
                 split,
-                if partition_keys.is_empty() {
+                if partition_keys.is_empty() && !expected_layout.primary_keys.is_empty() {
                     expected_layout.num_buckets
                 } else {
                     split.total_buckets()
@@ -443,7 +449,7 @@ pub(crate) async fn plan_snapshot_splits(
                 format: "paimon".to_string(),
                 snapshot_id: split.snapshot_id(),
                 partition: split_partition_identity(split, &partition_keys)?,
-                bucket_id: split.bucket(),
+                bucket_id: lake_bucket_id(split),
                 bucket_count: split.total_buckets(),
                 estimated_rows: split
                     .merged_row_count()
@@ -461,6 +467,9 @@ pub(crate) async fn plan_snapshot_splits(
 }
 
 fn validate_split_bucket_count(split: &DataSplit, expected: i32) -> Result<()> {
+    if expected == -1 && split.total_buckets() == -1 && matches!(split.bucket(), -1 | 0) {
+        return Ok(());
+    }
     if expected <= 0
         || split.total_buckets() != expected
         || split.bucket() < 0
@@ -472,6 +481,16 @@ fn validate_split_bucket_count(split: &DataSplit, expected: i32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn lake_bucket_id(split: &DataSplit) -> i32 {
+    // Physical bucket 0 in a bucket-unaware Paimon table is not ownership
+    // of Fluss log bucket 0. The public lake identity remains -1.
+    if split.total_buckets() == -1 {
+        -1
+    } else {
+        split.bucket()
+    }
 }
 
 fn validate_paimon_layout(
@@ -493,6 +512,11 @@ fn validate_paimon_layout(
             "Paimon primary keys {:?} do not match Fluss primary keys {:?} for {table_path}",
             actual_primary_keys, expected.primary_keys
         )));
+    }
+    // Append tasks are not reconciled with a Fluss bucket. Their own lake
+    // layout is validated by Paimon and the task envelope, not by Fluss hashing.
+    if expected.primary_keys.is_empty() {
+        return Ok(());
     }
     let core_options = CoreOptions::new(table_options);
     let bucket_keys = core_options.bucket_key().unwrap_or(default_bucket_keys);
@@ -524,15 +548,12 @@ fn validate_paimon_layout(
     Ok(())
 }
 
-/// Rejects Paimon merge engines whose current view v1 cannot reproduce.
+/// Requires deduplicate semantics for the default primary-key tail reconciliation.
 ///
-/// The hash-overlay merge presumes that overlaying a deduplicate changelog
-/// tail onto the lake current state yields the table's current view. Under
-/// any other merge engine that overlay silently produces a wrong view, so
-/// everything else must fail at planning: `partial-update` until paimon-rust
-/// gains write-time flush merges (apache/paimon-rust#380), `first-row` and
-/// `aggregation` as out of scope. Deduplicate is also what Fluss tiering
-/// writes, and Paimon's default when the option is absent.
+/// The Fluss overlay keeps each key's latest changelog row or tombstone.
+/// Applying that overlay to a lake baseline is not correct for merge engines
+/// such as aggregation, partial-update or first-row. Lake-only reads use
+/// Paimon's native current-view semantics and do not require this restriction.
 pub(crate) fn ensure_deduplicate_merge_engine(
     table_options: &HashMap<String, String>,
     table_path: &TablePath,
@@ -665,8 +686,9 @@ async fn read_snapshot_splits(
         return Ok(Box::pin(futures::stream::empty()));
     };
     let expected_bucket_id = first.bucket_id;
-    let table = open_pinned_table(&info.table_path, catalog_options, snapshot_id).await?;
-    if context.semantics == crate::LakeReadSemantics::PrimaryKey {
+    let lake_path = crate::table::resolve_lake_table_path(info)?;
+    let table = open_pinned_table(&lake_path, catalog_options, snapshot_id).await?;
+    if context.reconcile_primary_key {
         ensure_deduplicate_merge_engine(table.schema().options(), &info.table_path)?;
     }
     validate_paimon_layout(
@@ -693,9 +715,12 @@ async fn read_snapshot_splits(
                 ));
             }
             if task.bucket_id != expected_bucket_id
+                || (info.has_primary_key() && task.bucket_id < 0)
                 || task.partition != first.partition
                 || task.bucket_count != first.bucket_count
-                || (info.partition_keys.is_empty() && task.bucket_count != info.num_buckets)
+                || (info.has_primary_key()
+                    && info.partition_keys.is_empty()
+                    && task.bucket_count != info.num_buckets)
             {
                 return Err(FlussLakeError::PlanningFailed(
                     "Paimon read tasks must belong to one partition/bucket".to_string(),
@@ -723,7 +748,7 @@ async fn read_snapshot_splits(
                 split.snapshot_id()
             )));
         }
-        if split.bucket() != expected_bucket_id {
+        if lake_bucket_id(split) != expected_bucket_id {
             return Err(FlussLakeError::Internal(format!(
                 "Paimon split bucket id {} does not match logical split bucket id {expected_bucket_id}",
                 split.bucket()
@@ -977,9 +1002,10 @@ fn validate_storage_relative_path(path: &str) -> std::result::Result<(), String>
 
 fn paimon_error(action: &str, error: paimon::Error) -> FlussLakeError {
     // Storage errors may be wrapped by Parquet before they reach Paimon. The
-    // outer variant is then `ParquetDataUnexpected`, while the rendered error
-    // chain still contains the underlying OpenDAL NotFound classification.
-    let message = error.to_string().to_ascii_lowercase();
+    // outer Display may hide its cause, so include the available cause messages
+    // before checking storage and connection failures.
+    let diagnostic = error_message(action, &error);
+    let message = diagnostic.to_ascii_lowercase();
     let unavailable = message.contains("notfound")
         || message.contains("not found")
         || message.contains("does not exist")
@@ -993,11 +1019,11 @@ fn paimon_error(action: &str, error: paimon::Error) -> FlussLakeError {
         || message.contains("timeout")
         || message.contains("temporarily unavailable");
     if unavailable {
-        FlussLakeError::DataUnavailable(format!("failed to {action}: {error}"))
+        FlussLakeError::DataUnavailable(diagnostic)
     } else if connection_error {
-        FlussLakeError::ConnectionError(format!("failed to {action}: {error}"))
+        FlussLakeError::ConnectionError(diagnostic)
     } else {
-        FlussLakeError::Internal(format!("failed to {action}: {error}"))
+        FlussLakeError::Internal(diagnostic)
     }
 }
 
@@ -1009,6 +1035,41 @@ mod tests {
     use fluss::predicate::{Literal, Predicate, col};
     use paimon::spec::DataFileMeta;
     use std::sync::Arc;
+
+    // Model a backend wrapper that hides its cause in both Display and Debug.
+    #[derive(thiserror::Error)]
+    #[error("storage read failed")]
+    struct ReadFailure(#[source] std::io::Error);
+
+    impl Debug for ReadFailure {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ReadFailure")
+        }
+    }
+
+    #[test]
+    fn wrapped_backend_causes_preserve_diagnostics_and_failure_classification() {
+        for (detail, expected) in [
+            ("No such file: frozen.parquet", "unavailable"),
+            ("connection timed out reading frozen.parquet", "connection"),
+            ("invalid Parquet page", "internal"),
+        ] {
+            let source = paimon::Error::DataInvalid {
+                message: "wrapped read failure".into(),
+                source: Some(Box::new(ReadFailure(std::io::Error::other(detail)))),
+            };
+            assert!(!source.to_string().contains(detail));
+            let error = paimon_error("read frozen Paimon task", source);
+            let classification = match &error {
+                FlussLakeError::DataUnavailable(_) => "unavailable",
+                FlussLakeError::ConnectionError(_) => "connection",
+                FlussLakeError::Internal(_) => "internal",
+                other => panic!("unexpected error category: {other}"),
+            };
+            assert_eq!(classification, expected, "{detail}");
+            assert!(error.to_string().contains(detail));
+        }
+    }
 
     fn row_type() -> RowType {
         RowType::new(vec![
@@ -1035,225 +1096,6 @@ mod tests {
 
         assert_eq!(imported.schema().field(0).name(), "id");
         assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
-    }
-
-    #[tokio::test]
-    async fn parquet_reader_adapts_logical_types_for_append_and_primary_key_baselines() {
-        use crate::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource};
-        use arrow::array::{Array, AsArray};
-        use arrow_array_58::Array as _;
-        use futures::TryStreamExt;
-        use paimon::spec::{ArrayType, BinaryType, DataType as PaimonType, IntType, TimestampType};
-
-        // Use real local Parquet files, not mocked batches. The guard also
-        // removes the warehouse on assertion failure without an extra dependency.
-        struct Warehouse(std::path::PathBuf);
-        impl Drop for Warehouse {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("fluss-lake-types-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        let warehouse = Warehouse(path);
-        let warehouse_path = warehouse.0.to_str().unwrap();
-        let mut options = Options::default();
-        options.set("warehouse", warehouse_path);
-        let catalog = CatalogFactory::create(options).await.unwrap();
-        catalog
-            .create_database("types", false, HashMap::new())
-            .await
-            .unwrap();
-        for primary_key in [false, true] {
-            let name = if primary_key { "pk" } else { "append" };
-            let identifier = Identifier::new("types", name);
-            let mut lake_schema = paimon::spec::Schema::builder()
-                .column("id", PaimonType::Int(IntType::new()))
-                .column(
-                    "items",
-                    PaimonType::Array(ArrayType::new(PaimonType::Int(IntType::new()))),
-                )
-                .column("bytes", PaimonType::Binary(BinaryType::new(4).unwrap()))
-                .column("ts", PaimonType::Timestamp(TimestampType::new(0).unwrap()))
-                .option("bucket", "1")
-                .option("bucket-key", "id")
-                .option("file.format", "parquet");
-            let mut fluss_schema = Schema::builder()
-                .column("id", DataTypes::int())
-                .column("items", DataTypes::array(DataTypes::int()))
-                .column("bytes", DataTypes::binary(4))
-                .column("ts", DataTypes::timestamp_with_precision(0));
-            if primary_key {
-                lake_schema = lake_schema.primary_key(["id"]);
-                fluss_schema = fluss_schema.primary_key(vec!["id"]).unwrap();
-            }
-            catalog
-                .create_table(&identifier, lake_schema.build().unwrap(), false)
-                .await
-                .unwrap();
-            let lake_table = catalog.get_table(&identifier).await.unwrap();
-            let schema58 =
-                paimon::arrow::build_target_arrow_schema(lake_table.schema().fields()).unwrap();
-            let list = arrow_array_58::ListArray::from_iter_primitive::<
-                arrow_array_58::types::Int32Type,
-                _,
-                _,
-            >(vec![Some(vec![Some(1), None]), None, Some(vec![])]);
-            // Use Paimon's actual list child field, rather than Arrow's default.
-            let list = arrow_array_58::make_array(
-                list.to_data()
-                    .into_builder()
-                    .data_type(schema58.field(1).data_type().clone())
-                    .build()
-                    .unwrap(),
-            );
-            let input = arrow_array_58::RecordBatch::try_new(
-                schema58,
-                vec![
-                    Arc::new(Int32Array58::from(vec![1, 2, 3])),
-                    list,
-                    Arc::new(arrow_array_58::BinaryArray::from(vec![
-                        Some(b"abcd".as_slice()),
-                        None,
-                        Some(b"\0\0\xff\0".as_slice()),
-                    ])),
-                    Arc::new(arrow_array_58::TimestampMillisecondArray::from(vec![
-                        Some(-2000),
-                        None,
-                        Some(3000),
-                    ])),
-                ],
-            )
-            .unwrap();
-            let write_builder = lake_table.new_write_builder();
-            let mut writer = write_builder.new_write().unwrap();
-            writer.write_arrow_batch(&input).await.unwrap();
-            let commits = writer.prepare_commit().await.unwrap();
-            assert!(
-                commits
-                    .iter()
-                    .flat_map(|commit| &commit.new_files)
-                    .all(|file| file.file_name.ends_with(".parquet"))
-            );
-            write_builder.new_commit().commit(commits).await.unwrap();
-            let snapshot_id = lake_table
-                .snapshot_manager()
-                .get_latest_snapshot_id()
-                .await
-                .unwrap()
-                .unwrap();
-
-            let info = TableInfo::new(
-                TablePath::new("types", name),
-                7,
-                1,
-                fluss_schema.build().unwrap(),
-                vec!["id".to_string()],
-                Vec::<String>::new().into(),
-                1,
-                HashMap::new(),
-                HashMap::new(),
-                None,
-                0,
-                0,
-            );
-            let source = PaimonLakeSource::new(
-                &info,
-                &HashMap::from([("warehouse".to_string(), warehouse_path.to_string())]),
-            )
-            .unwrap();
-            let semantics = if primary_key {
-                LakeReadSemantics::PrimaryKey
-            } else {
-                LakeReadSemantics::Append
-            };
-            let filter = BoundPredicate::AlwaysTrue;
-            let splits = source
-                .plan(LakePlannerContext {
-                    table_info: &info,
-                    snapshot_id,
-                    semantics,
-                    filter: &filter,
-                })
-                .await
-                .unwrap();
-            assert!(!splits.is_empty());
-            let full_schema = fluss::record::to_arrow_schema(info.row_type()).unwrap();
-            // Reordering and pruning must be adapted to the physical read
-            // schema, not to full-table column positions.
-            for projection in [vec![0, 1, 2, 3], vec![3, 2, 1, 0], vec![2, 0]] {
-                let schema = Arc::new(full_schema.project(&projection).unwrap());
-                let batches: Vec<RecordBatch> = source
-                    .read(LakeReaderContext {
-                        table_info: &info,
-                        snapshot_id,
-                        semantics,
-                        splits: &splits,
-                        projection: &projection,
-                        schema: schema.clone(),
-                        filter: &filter,
-                    })
-                    .await
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
-                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
-                let mut ids = Vec::new();
-                for batch in &batches {
-                    assert_eq!(batch.schema(), schema);
-                    let id_position = projection.iter().position(|index| *index == 0).unwrap();
-                    for row in 0..batch.num_rows() {
-                        let id = batch
-                            .column(id_position)
-                            .as_primitive::<arrow::datatypes::Int32Type>()
-                            .value(row);
-                        ids.push(id);
-                        for (position, column) in projection.iter().enumerate() {
-                            let array = batch.column(position);
-                            if *column == 0 {
-                                continue;
-                            }
-                            assert_eq!(array.is_null(row), id == 2);
-                            if id == 2 {
-                                continue;
-                            }
-                            match column {
-                                1 => {
-                                    let values = array.as_list::<i32>().value(row);
-                                    let values = values
-                                        .as_primitive::<arrow::datatypes::Int32Type>()
-                                        .iter()
-                                        .collect::<Vec<_>>();
-                                    assert_eq!(
-                                        values,
-                                        if id == 1 { vec![Some(1), None] } else { vec![] }
-                                    );
-                                }
-                                2 => assert_eq!(
-                                    array.as_fixed_size_binary().value(row),
-                                    if id == 1 { b"abcd" } else { b"\0\0\xff\0" }
-                                ),
-                                3 => assert_eq!(
-                                    array
-                                        .as_primitive::<arrow::datatypes::TimestampSecondType>()
-                                        .value(row),
-                                    if id == 1 { -2 } else { 3 }
-                                ),
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
-                }
-                ids.sort_unstable();
-                assert_eq!(ids, vec![1, 2, 3]);
-            }
-        }
     }
 
     fn table_info(
@@ -1404,9 +1246,7 @@ mod tests {
         options
     }
 
-    /// v1 admits merge engine `deduplicate` only — which is what Fluss
-    /// tiering writes and what Paimon defaults to when the option is absent.
-    /// Everything else must fail at planning rather than silently misread.
+    /// PK tail reconciliation admits only deduplicate, including Paimon's default.
     #[test]
     fn merge_engine_gate_admits_deduplicate_only() {
         let table_path = TablePath::new("fluss", "pk_orders");
@@ -1513,16 +1353,17 @@ mod tests {
         ]);
         let expected = ExpectedPaimonLayout {
             partition_keys: &partitions,
-            primary_keys: &[],
+            primary_keys: &keys,
             bucket_keys: &keys,
             num_buckets: 4,
         };
-        validate_paimon_layout(&path, &partitions, &[], keys.clone(), &options, &expected).unwrap();
+        validate_paimon_layout(&path, &partitions, &keys, keys.clone(), &options, &expected)
+            .unwrap();
         let root = ExpectedPaimonLayout {
             partition_keys: &[],
             ..expected
         };
-        assert!(validate_paimon_layout(&path, &[], &[], keys.clone(), &options, &root).is_err());
+        assert!(validate_paimon_layout(&path, &[], &keys, keys.clone(), &options, &root).is_err());
     }
 
     #[test]

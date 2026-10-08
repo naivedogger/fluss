@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_split_carries_one_partition_bucket_lake_and_log_unit() {
+    fn primary_key_split_carries_one_partition_bucket_lake_and_log_unit() {
         let range = FrozenBucketRange {
             table_bucket: TableBucket::new_with_partition(5, Some(9), 2),
             partition_identity: FlussLakePartitionIdentity::KeyValues(vec![(
@@ -490,7 +490,7 @@ mod tests {
                 partition: range.partition_identity.clone(),
                 ..crate::source::testing_split()
             }],
-            Vec::new(),
+            vec![0],
             SplitStatistics::default(),
         )
         .unwrap();
@@ -500,7 +500,7 @@ mod tests {
             split.partition,
             FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string(),)])
         );
-        let descriptor = split.decode_execution_descriptor().unwrap();
+        let descriptor = split.validated_execution_descriptor().unwrap();
         assert_eq!(descriptor.snapshot_id(), Some(42));
         assert_eq!(descriptor.start_offset(), 12);
         assert_eq!(descriptor.stop_offset(), 20);
@@ -535,7 +535,7 @@ mod tests {
             split.partition,
             FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())])
         );
-        let descriptor = split.decode_execution_descriptor().unwrap();
+        let descriptor = split.validated_execution_descriptor().unwrap();
         assert!(descriptor.is_partitioned());
         assert_eq!(descriptor.table_bucket().partition_id(), None);
         assert_eq!(descriptor.start_offset(), 0);

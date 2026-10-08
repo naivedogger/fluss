@@ -23,29 +23,33 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, FlussLakeError>;
 
 /// Errors surfaced by the UnionRead planning and execution contract.
+///
+/// Match variants to classify failures; diagnostic messages are not a stable
+/// protocol. Boundary conversions include available cause messages, but do not
+/// retain the original error objects.
 #[derive(Debug, Error)]
 pub enum FlussLakeError {
     /// Requested table is not configured for lake reads.
     #[error("table is not lake-readable: {0}")]
     NotLakeReadable(String),
 
-    /// Planning failed for a reason other than invalid input.
+    /// Invalid read configuration or failure to construct the default read plan.
     #[error("UnionRead planning failed: {0}")]
     PlanningFailed(String),
 
-    /// The data behind a frozen read boundary no longer exists.
+    /// A frozen snapshot, partition or required log range is missing or unreadable.
     #[error("UnionRead data unavailable: {0}")]
     DataUnavailable(String),
 
-    /// Schema of the resolved table is incompatible with the frozen split.
+    /// Table identity, schema or layout is incompatible with the frozen read inputs.
     #[error("UnionRead schema incompatible: {0}")]
     SchemaIncompatible(String),
 
-    /// Connection to Fluss or the lake catalog failed.
+    /// Access to Fluss RPC or the lake storage/catalog failed.
     #[error("UnionRead connection error: {0}")]
     ConnectionError(String),
 
-    /// Merge engine is not supported by UnionRead.
+    /// Merge engine is not supported by the default PK tail reconciliation.
     #[error("unsupported merge engine: {0}")]
     UnsupportedMergeEngine(String),
 
@@ -61,7 +65,53 @@ pub enum FlussLakeError {
     #[error("incompatible UnionRead context version: {0}")]
     IncompatibleReadContextVersion(String),
 
-    /// Internal error that should not escape to engines.
+    /// Backend or execution failure outside the explicitly classified categories,
+    /// including malformed task payloads. Returned to callers like other read errors.
     #[error("UnionRead internal error: {0}")]
     Internal(String),
+}
+
+/// Retains cause messages in diagnostics without changing the public error variants.
+pub(crate) fn error_message(action: &str, error: &dyn std::error::Error) -> String {
+    let mut message = format!("failed to {action}: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if !detail.is_empty() && !message.contains(&detail) {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        source = cause.source();
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Error)]
+    enum ReadError {
+        #[error("reader failed")]
+        Hidden(#[source] std::io::Error),
+        #[error("reader failed: {0}")]
+        Included(#[source] std::io::Error),
+    }
+
+    #[test]
+    fn diagnostic_preserves_causes_without_repeating_displayed_messages() {
+        assert_eq!(
+            error_message("read frozen task", &std::io::Error::other("reader failed")),
+            "failed to read frozen task: reader failed"
+        );
+        for error in [
+            ReadError::Hidden(std::io::Error::other("underlying failure")),
+            ReadError::Included(std::io::Error::other("underlying failure")),
+        ] {
+            assert_eq!(
+                error_message("read frozen task", &error),
+                "failed to read frozen task: reader failed: underlying failure"
+            );
+        }
+    }
 }

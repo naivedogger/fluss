@@ -128,6 +128,12 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             .await
             .is_err()
     );
+    assert!(
+        ids_reader
+            .read_splits_with_concurrency(&ids_splits, 0)
+            .await
+            .is_err()
+    );
     let mut incompatible = ids_splits[0].clone();
     incompatible.descriptor_version += 1;
     assert!(matches!(
@@ -218,9 +224,51 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             .is_empty()
     );
 
-    // The coordinator's plan and scan can be dropped before worker execution.
+    // A reader captures immutable settings. Configuring another clone must not
+    // change its filter or projection, even after dropping the plan.
+    let local_reader = scan.new_reader();
+    let _other_scan = scan
+        .clone()
+        .with_projection(vec![0])
+        .with_filter(col("id").eq(3_i32));
     drop(plan);
     drop(scan);
+    let local_batches = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_reader
+            .read_split(&transported_split)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        local_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+    assert!(
+        local_batches
+            .iter()
+            .all(|batch| batch.schema().field(0).name() == "name")
+    );
+    let local_names = local_batches
+        .iter()
+        .flat_map(|batch| {
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..names.len()).map(|index| names.value(index).to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(local_names, vec!["before-2"]);
+    // A worker can independently restore the same scan settings.
     let read = lake_table
         .new_scan()
         .with_projection(vec![1])
@@ -345,24 +393,25 @@ async fn stale_schema_split_is_rejected_after_alter_table() {
 
     // `read_split` is asynchronous and lazy: schema drift is an environment
     // failure, so it surfaces as the first item of the returned stream.
-    for read in [plan.new_reader(), scan.new_reader()] {
-        let stream = read
-            .read_split(&stale_split)
-            .await
-            .expect("Opening a stale-schema split stream must not fail structurally");
-        let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-            .await
-            .expect("Timed out waiting for the stale-schema split to fail");
-        match result {
-            Err(FlussLakeError::SchemaIncompatible(message)) => {
-                assert!(
-                    message.contains("schema id"),
-                    "unexpected schema error: {message}"
-                );
-            }
-            Err(other) => panic!("expected a schema-incompatible error, got: {other}"),
-            Ok(_) => panic!("stale-schema split must not execute after alter table"),
+    let read = scan.new_reader();
+    drop(plan);
+    drop(scan);
+    let stream = read
+        .read_split(&stale_split)
+        .await
+        .expect("Opening a stale-schema split stream must not fail structurally");
+    let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
+        .await
+        .expect("Timed out waiting for the stale-schema split to fail");
+    match result {
+        Err(FlussLakeError::SchemaIncompatible(message)) => {
+            assert!(
+                message.contains("schema id"),
+                "unexpected schema error: {message}"
+            );
         }
+        Err(other) => panic!("expected a schema-incompatible error, got: {other}"),
+        Ok(_) => panic!("stale-schema split must not execute after alter table"),
     }
 
     drop(writer);

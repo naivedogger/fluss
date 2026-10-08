@@ -51,12 +51,39 @@ impl SplitDescriptor {
         lake_splits: Vec<crate::LakeSplit>,
         primary_key_indexes: Vec<usize>,
     ) -> Result<Self> {
+        let descriptor = Self {
+            table_path,
+            schema_id,
+            partitioned,
+            table_bucket,
+            start_offset,
+            stop_offset,
+            snapshot_id,
+            lake_splits,
+            primary_key_indexes,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let Self {
+            table_path,
+            schema_id,
+            partitioned,
+            table_bucket,
+            start_offset,
+            stop_offset,
+            snapshot_id,
+            lake_splits,
+            primary_key_indexes,
+        } = self;
         if table_path.database().is_empty() || table_path.table().is_empty() {
             return Err(invalid_descriptor(
                 "database and table names must not be empty",
             ));
         }
-        if schema_id < 0 {
+        if *schema_id < 0 {
             return Err(invalid_descriptor(format!(
                 "schema id must be non-negative, got {schema_id}"
             )));
@@ -68,7 +95,7 @@ impl SplitDescriptor {
             )));
         }
         if let Some(partition_id) = table_bucket.partition_id() {
-            if !partitioned {
+            if !*partitioned {
                 return Err(invalid_descriptor(
                     "an unpartitioned split must not carry a live partition id",
                 ));
@@ -79,24 +106,26 @@ impl SplitDescriptor {
                 )));
             }
         }
-        if table_bucket.bucket_id() < 0 {
+        if table_bucket.bucket_id() < 0
+            && !(self.is_append_lake() && table_bucket.bucket_id() == -1)
+        {
             return Err(invalid_descriptor(format!(
                 "bucket id must be non-negative, got {}",
                 table_bucket.bucket_id()
             )));
         }
-        if start_offset < 0 || stop_offset < 0 || start_offset > stop_offset {
+        if *start_offset < 0 || *stop_offset < 0 || start_offset > stop_offset {
             return Err(invalid_descriptor(format!(
                 "logical changelog range is invalid: [{start_offset}, {stop_offset})"
             )));
         }
-        if partitioned && table_bucket.partition_id().is_none() && start_offset != stop_offset {
+        if *partitioned && table_bucket.partition_id().is_none() && start_offset != stop_offset {
             return Err(invalid_descriptor(
                 "a partition that no longer exists in Fluss cannot carry a log range",
             ));
         }
         if let Some(snapshot_id) = snapshot_id
-            && snapshot_id < 0
+            && *snapshot_id < 0
         {
             return Err(invalid_descriptor(format!(
                 "lake snapshot id must be non-negative, got {snapshot_id}"
@@ -107,12 +136,12 @@ impl SplitDescriptor {
                 "lake splits require a pinned snapshot id",
             ));
         }
-        for task in &lake_splits {
+        for task in lake_splits {
             if task.format.is_empty()
-                || Some(task.snapshot_id) != snapshot_id
+                || Some(task.snapshot_id) != *snapshot_id
                 || task.bucket_id != table_bucket.bucket_id()
-                || task.bucket_count <= 0
-                || task.bucket_id >= task.bucket_count
+                || !task.has_valid_bucket()
+                || (self.is_primary_key() && task.bucket_id < 0)
                 || task.bucket_count != lake_splits[0].bucket_count
                 || task.payload_version == 0
                 || task.payload.is_empty()
@@ -129,17 +158,12 @@ impl SplitDescriptor {
             ));
         }
 
-        Ok(Self {
-            table_path,
-            schema_id,
-            partitioned,
-            table_bucket,
-            start_offset,
-            stop_offset,
-            snapshot_id,
-            lake_splits,
-            primary_key_indexes,
-        })
+        if !self.is_primary_key() && !lake_splits.is_empty() && !self.is_append_lake() {
+            return Err(invalid_descriptor(
+                "append lake tasks must be independent of log ranges",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn table_path(&self) -> &TablePath {
@@ -186,18 +210,10 @@ impl SplitDescriptor {
         self.start_offset == self.stop_offset && self.lake_splits.is_empty()
     }
 
-    pub(crate) fn validate(self) -> Result<Self> {
-        Self::try_new(
-            self.table_path,
-            self.schema_id,
-            self.partitioned,
-            self.table_bucket,
-            self.start_offset,
-            self.stop_offset,
-            self.snapshot_id,
-            self.lake_splits,
-            self.primary_key_indexes,
-        )
+    pub(crate) fn is_append_lake(&self) -> bool {
+        !self.is_primary_key()
+            && self.lake_splits.len() == 1
+            && self.start_offset == self.stop_offset
     }
 
     #[cfg(test)]
@@ -209,7 +225,8 @@ impl SplitDescriptor {
     fn decode(encoded: &[u8]) -> Result<Self> {
         let value: Self =
             serde_json::from_slice(encoded).map_err(|e| invalid_descriptor(e.to_string()))?;
-        value.validate()
+        value.validate()?;
+        Ok(value)
     }
 }
 
@@ -314,5 +331,32 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn bucket_unaware_append_task_never_becomes_a_log_or_pk_task() {
+        let mut value = serde_json::to_value(descriptor()).unwrap();
+        value["primary_key_indexes"] = json!([]);
+        value["start_offset"] = json!(0);
+        value["stop_offset"] = json!(0);
+        value["table_bucket"]["bucket"] = json!(-1);
+        value["lake_splits"][0]["bucket_id"] = json!(-1);
+        value["lake_splits"][0]["bucket_count"] = json!(-1);
+        let decoded = SplitDescriptor::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(decoded.is_append_lake());
+        for (key, invalid) in [
+            ("stop_offset", json!(1)),
+            ("primary_key_indexes", json!([0])),
+            ("lake_splits", json!([])),
+        ] {
+            let mut invalid_value = value.clone();
+            invalid_value[key] = invalid;
+            assert!(SplitDescriptor::decode(&serde_json::to_vec(&invalid_value).unwrap()).is_err());
+        }
+        for count in [0, 4] {
+            let mut invalid = value.clone();
+            invalid["lake_splits"][0]["bucket_count"] = json!(count);
+            assert!(SplitDescriptor::decode(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
     }
 }

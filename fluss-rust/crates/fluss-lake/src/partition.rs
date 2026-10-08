@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 /// Stable partition identity exposed for scheduling and diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FlussLakePartitionIdentity {
+    /// Root identity for an unpartitioned table.
     Unpartitioned,
+    /// Logical partition-key/value pairs in table partition-key order.
     KeyValues(Vec<(String, String)>),
 }
