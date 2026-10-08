@@ -351,7 +351,7 @@ fn required_paimon_literal(
 fn to_paimon_datum(literal: &BoundLiteral, data_type: &DataType) -> Option<PaimonDatum> {
     match literal {
         BoundLiteral::Null => None,
-        BoundLiteral::Boolean(value) => Some(PaimonDatum::Bool(*value)),
+        BoundLiteral::Bool(value) => Some(PaimonDatum::Bool(*value)),
         BoundLiteral::Int8(value) => Some(PaimonDatum::TinyInt(*value)),
         BoundLiteral::Int16(value) => Some(PaimonDatum::SmallInt(*value)),
         BoundLiteral::Int32(value) => Some(PaimonDatum::Int(*value)),
@@ -359,7 +359,7 @@ fn to_paimon_datum(literal: &BoundLiteral, data_type: &DataType) -> Option<Paimo
         BoundLiteral::Float32(value) => Some(PaimonDatum::Float(*value)),
         BoundLiteral::Float64(value) => Some(PaimonDatum::Double(*value)),
         BoundLiteral::String(value) => Some(PaimonDatum::String(value.clone())),
-        BoundLiteral::Binary(value) => Some(PaimonDatum::Bytes(value.clone())),
+        BoundLiteral::Bytes(value) => Some(PaimonDatum::Bytes(value.clone())),
         BoundLiteral::Decimal(value) => {
             let DataType::Decimal(decimal_type) = data_type else {
                 return None;
@@ -384,18 +384,12 @@ fn to_paimon_datum(literal: &BoundLiteral, data_type: &DataType) -> Option<Paimo
 }
 
 fn decimal_to_i128(value: &fluss::row::Decimal) -> Option<i128> {
-    let bytes = value.to_unscaled_bytes();
-    if bytes.len() > size_of::<i128>() {
-        return None;
-    }
-    let fill = if bytes.first().is_some_and(|value| value & 0x80 != 0) {
-        0xff
-    } else {
-        0
-    };
-    let mut result = [fill; size_of::<i128>()];
-    result[size_of::<i128>() - bytes.len()..].copy_from_slice(&bytes);
-    Some(i128::from_be_bytes(result))
+    value
+        .to_big_decimal()
+        .as_bigint_and_exponent()
+        .0
+        .try_into()
+        .ok()
 }
 
 /// Plans the immutable Paimon splits of one readable lake snapshot.
@@ -1077,6 +1071,29 @@ mod tests {
             DataField::new("name", DataTypes::string(), None),
             DataField::new("amount", DataTypes::bigint(), None),
         ])
+    }
+
+    #[test]
+    fn decimal_predicates_preserve_signed_unscaled_values() {
+        for unscaled in [
+            0,
+            128,
+            -129,
+            i128::from(i64::MAX) + 1,
+            -(10_i128.pow(38) - 1),
+        ] {
+            let literal = Literal::Decimal(
+                fluss::row::Decimal::from_unscaled_bytes(&unscaled.to_be_bytes(), 38, 3).unwrap(),
+            );
+            assert_eq!(
+                to_paimon_datum(&literal, &DataTypes::decimal(38, 3)),
+                Some(PaimonDatum::Decimal {
+                    unscaled,
+                    precision: 38,
+                    scale: 3
+                })
+            );
+        }
     }
 
     #[test]

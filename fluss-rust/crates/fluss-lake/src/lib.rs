@@ -35,6 +35,7 @@
 
 #![doc = include_str!("../README.md")]
 
+mod boundary;
 mod bucket_pruning;
 mod error;
 mod executor;
@@ -43,9 +44,9 @@ mod paimon;
 mod partition;
 mod plan;
 mod planner;
-mod planning;
 mod pruning;
 mod read_context;
+mod reader;
 mod source;
 mod split;
 mod split_descriptor;
@@ -54,8 +55,9 @@ mod table;
 pub use error::{FlussLakeError, Result};
 #[cfg(feature = "paimon")]
 pub use paimon::PaimonLakeSource;
-pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan, FlussLakeReader};
+pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
 pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
+pub use reader::FlussLakeReader;
 pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
 pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;
 pub use split::{FlussLakePartitionIdentity, FlussLakeReadSplit};

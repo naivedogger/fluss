@@ -156,7 +156,7 @@ fn to_pb_literal(
 
     match literal {
         BoundLiteral::Null => unreachable!("null literal returned above"),
-        BoundLiteral::Boolean(value) => pb.boolean_value = Some(*value),
+        BoundLiteral::Bool(value) => pb.boolean_value = Some(*value),
         BoundLiteral::Int8(value) => pb.int_value = Some(i32::from(*value)),
         BoundLiteral::Int16(value) => pb.int_value = Some(i32::from(*value)),
         BoundLiteral::Int32(value) => pb.int_value = Some(*value),
@@ -164,7 +164,7 @@ fn to_pb_literal(
         BoundLiteral::Float32(value) => pb.float_value = Some(*value),
         BoundLiteral::Float64(value) => pb.double_value = Some(*value),
         BoundLiteral::String(value) => pb.string_value = Some(value.clone()),
-        BoundLiteral::Binary(value) => pb.binary_value = Some(value.clone()),
+        BoundLiteral::Bytes(value) => pb.binary_value = Some(value.clone()),
         BoundLiteral::Decimal(value) => {
             if value.is_compact() {
                 pb.decimal_value = Some(value.to_unscaled_long()?);

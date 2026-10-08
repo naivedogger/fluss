@@ -181,9 +181,7 @@ fn compute_matching_buckets(
         .iter()
         .map(|key| {
             row_type
-                .fields()
-                .iter()
-                .position(|field| field.name() == key)
+                .get_field_index(key)
                 .expect("bucket keys were validated against the row type")
         })
         .collect();

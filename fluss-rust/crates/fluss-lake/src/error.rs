@@ -17,6 +17,7 @@
 
 //! Errors returned by bounded UnionRead planning and execution.
 
+use fluss::error::Error as ClientError;
 use thiserror::Error;
 
 /// Result type returned by UnionRead planning and execution APIs.
@@ -71,6 +72,37 @@ pub enum FlussLakeError {
     Internal(String),
 }
 
+/// Classifies metadata failures consistently for table opening and planning.
+pub(crate) fn planning_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    let message = error_message(action, &error);
+    match error {
+        ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
+        _ => FlussLakeError::PlanningFailed(message),
+    }
+}
+
+/// Missing frozen inputs invalidate the attempt; other failures retain their category.
+pub(crate) fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
+    let message = error_message(action, &error);
+    if matches!(
+        error.api_error(),
+        Some(
+            fluss::error::FlussError::TableNotExist
+                | fluss::error::FlussError::UnknownTableOrBucketException
+                | fluss::error::FlussError::PartitionNotExists
+                | fluss::error::FlussError::LakeSnapshotNotExist
+                | fluss::error::FlussError::KvSnapshotNotExist
+        )
+    ) {
+        return FlussLakeError::DataUnavailable(message);
+    }
+    match error {
+        ClientError::LogOffsetOutOfRange { .. } => FlussLakeError::DataUnavailable(message),
+        ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
+        _ => FlussLakeError::Internal(message),
+    }
+}
+
 /// Retains cause messages in diagnostics without changing the public error variants.
 pub(crate) fn error_message(action: &str, error: &dyn std::error::Error) -> String {
     let mut message = format!("failed to {action}: {error}");
@@ -112,6 +144,37 @@ mod tests {
                 error_message("read frozen task", &error),
                 "failed to read frozen task: reader failed: underlying failure"
             );
+        }
+    }
+
+    #[test]
+    fn log_offset_out_of_range_maps_to_data_unavailable() {
+        let error = ClientError::LogOffsetOutOfRange {
+            message: "offset 1 was removed".to_string(),
+        };
+
+        assert!(matches!(
+            execution_client_error("read bounded log", error),
+            FlussLakeError::DataUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn missing_planned_table_or_partition_maps_to_data_unavailable() {
+        for error in [
+            fluss::error::FlussError::TableNotExist,
+            fluss::error::FlussError::UnknownTableOrBucketException,
+            fluss::error::FlussError::PartitionNotExists,
+        ] {
+            assert!(matches!(
+                execution_client_error(
+                    "open frozen split",
+                    ClientError::FlussAPIError {
+                        api_error: error.to_api_error(None),
+                    },
+                ),
+                FlussLakeError::DataUnavailable(_)
+            ));
         }
     }
 }

@@ -21,36 +21,18 @@ use crate::error::Error::IllegalArgument;
 use crate::error::Result;
 use crate::metadata::{DataField, DataType, RowType};
 use crate::predicate::{CompoundFunction, LeafFunction, Literal, Predicate};
-use crate::row::{Date, Datum, Decimal, Time, TimestampLtz, TimestampNtz};
-use std::borrow::Cow;
+use crate::row::{Date, Datum, Decimal, Time};
 use std::collections::HashSet;
 
-/// A predicate literal coerced exactly to its bound Fluss column type.
+/// A core literal normalized for a bound predicate.
 ///
-/// This type is public only so sibling workspace crates can share the core
-/// predicate implementation. Applications should construct [`Predicate`]
-/// values instead.
+/// Binding checks literal kinds and exact numeric conversions against the
+/// Fluss column type. Consumers validate their physical representations.
+/// Reuse the core literal enum instead of defining another value model.
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum BoundLiteral {
-    Null,
-    Boolean(bool),
-    Int8(i8),
-    Int16(i16),
-    Int32(i32),
-    Int64(i64),
-    Float32(f32),
-    Float64(f64),
-    String(String),
-    Binary(Vec<u8>),
-    Decimal(Decimal),
-    Date(i32),
-    Time(i32),
-    TimestampNtz(TimestampNtz),
-    TimestampLtz(TimestampLtz),
-}
+pub type BoundLiteral = Literal;
 
-impl BoundLiteral {
+impl Literal {
     /// Returns whether this is a null literal.
     #[doc(hidden)]
     pub fn is_null(&self) -> bool {
@@ -85,20 +67,20 @@ impl BoundLiteral {
     pub fn to_datum(&self) -> Datum<'static> {
         match self {
             Self::Null => Datum::Null,
-            Self::Boolean(value) => Datum::Bool(*value),
-            Self::Int8(value) => Datum::Int8(*value),
-            Self::Int16(value) => Datum::Int16(*value),
-            Self::Int32(value) => Datum::Int32(*value),
-            Self::Int64(value) => Datum::Int64(*value),
-            Self::Float32(value) => Datum::Float32((*value).into()),
-            Self::Float64(value) => Datum::Float64((*value).into()),
-            Self::String(value) => Datum::String(Cow::Owned(value.clone())),
-            Self::Binary(value) => Datum::Blob(Cow::Owned(value.clone())),
-            Self::Decimal(value) => Datum::Decimal(value.clone()),
-            Self::Date(value) => Datum::Date(Date::new(*value)),
-            Self::Time(value) => Datum::Time(Time::new(*value)),
-            Self::TimestampNtz(value) => Datum::TimestampNtz(*value),
-            Self::TimestampLtz(value) => Datum::TimestampLtz(*value),
+            Self::Bool(value) => (*value).into(),
+            Self::Int8(value) => (*value).into(),
+            Self::Int16(value) => (*value).into(),
+            Self::Int32(value) => (*value).into(),
+            Self::Int64(value) => (*value).into(),
+            Self::Float32(value) => (*value).into(),
+            Self::Float64(value) => (*value).into(),
+            Self::String(value) => value.clone().into(),
+            Self::Bytes(value) => value.clone().into(),
+            Self::Decimal(value) => value.clone().into(),
+            Self::Date(value) => Date::new(*value).into(),
+            Self::Time(value) => Time::new(*value).into(),
+            Self::TimestampNtz(value) => (*value).into(),
+            Self::TimestampLtz(value) => (*value).into(),
         }
     }
 }
@@ -126,7 +108,8 @@ pub enum BoundPredicate {
 }
 
 impl BoundPredicate {
-    /// Binds an optional predicate to `row_type`.
+    /// Binds an optional predicate to `row_type` using Fluss literal coercion rules.
+    /// Consumers validate backend-specific physical representations separately.
     #[doc(hidden)]
     pub fn bind(predicate: Option<&Predicate>, row_type: &RowType) -> Result<Self> {
         match predicate {
@@ -205,10 +188,8 @@ impl BoundPredicate {
 
 fn resolve_field<'a>(row_type: &'a RowType, name: &str) -> Result<(usize, &'a DataField)> {
     row_type
-        .fields()
-        .iter()
-        .enumerate()
-        .find(|(_, field)| field.name() == name)
+        .get_field_index(name)
+        .map(|index| (index, &row_type.fields()[index]))
         .ok_or_else(|| IllegalArgument {
             message: format!(
                 "filter column '{}' does not exist in the table schema, available columns: {:?}",
@@ -220,13 +201,11 @@ fn resolve_field<'a>(row_type: &'a RowType, name: &str) -> Result<(usize, &'a Da
 
 fn validate_leaf(function: LeafFunction, field: &DataField, literals: &[Literal]) -> Result<()> {
     let expected = match function {
-        LeafFunction::In | LeafFunction::NotIn => None,
-        LeafFunction::IsNull | LeafFunction::IsNotNull => Some(0),
-        _ => Some(1),
+        LeafFunction::In | LeafFunction::NotIn => return Ok(()),
+        LeafFunction::IsNull | LeafFunction::IsNotNull => 0,
+        _ => 1,
     };
-    if let Some(expected) = expected
-        && literals.len() != expected
-    {
+    if literals.len() != expected {
         return Err(IllegalArgument {
             message: format!(
                 "{function:?} on column '{}' expects {expected} literal(s), got {}",
@@ -236,9 +215,7 @@ fn validate_leaf(function: LeafFunction, field: &DataField, literals: &[Literal]
         });
     }
 
-    if !matches!(function, LeafFunction::In | LeafFunction::NotIn)
-        && literals.first() == Some(&Literal::Null)
-    {
+    if literals.first() == Some(&Literal::Null) {
         return Err(IllegalArgument {
             message: format!(
                 "{function:?} on column '{}' cannot take a null literal, use is_null()/is_not_null()",
@@ -268,153 +245,36 @@ fn bind_literal(field: &DataField, literal: &Literal) -> Result<BoundLiteral> {
         return Ok(BoundLiteral::Null);
     }
 
-    let bound = match field.data_type() {
-        DataType::Boolean(_) => match literal {
-            Literal::Bool(value) => BoundLiteral::Boolean(*value),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::TinyInt(_) => {
+    // The coercion rules are shared with the existing protobuf encoder.
+    // Arrow physical-width checks belong to the evaluator, not the wire format.
+    Ok(match (field.data_type(), literal) {
+        (DataType::TinyInt(_), _) => {
             BoundLiteral::Int8(integer_in_range(field, literal, i8::MAX as i64)? as i8)
         }
-        DataType::SmallInt(_) => {
+        (DataType::SmallInt(_), _) => {
             BoundLiteral::Int16(integer_in_range(field, literal, i16::MAX as i64)? as i16)
         }
-        DataType::Int(_) => {
+        (DataType::Int(_), _) => {
             BoundLiteral::Int32(integer_in_range(field, literal, i32::MAX as i64)? as i32)
         }
-        DataType::BigInt(_) => BoundLiteral::Int64(integer_value(field, literal)?),
-        DataType::Float(_) => BoundLiteral::Float32(float32(field, literal)?),
-        DataType::Double(_) => BoundLiteral::Float64(float64(field, literal)?),
-        DataType::Char(_) | DataType::String(_) => match literal {
-            Literal::String(value) => BoundLiteral::String(value.clone()),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::Binary(binary_type) => match literal {
-            Literal::Bytes(value) if value.len() == binary_type.length() => {
-                BoundLiteral::Binary(value.clone())
-            }
-            Literal::Bytes(value) => {
-                return Err(IllegalArgument {
-                    message: format!(
-                        "filter binary literal has length {}, but column '{}' requires length {}",
-                        value.len(),
-                        field.name(),
-                        binary_type.length()
-                    ),
-                });
-            }
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::Bytes(_) => match literal {
-            Literal::Bytes(value) => BoundLiteral::Binary(value.clone()),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::Decimal(decimal_type) => {
-            let Literal::Decimal(value) = literal else {
-                return Err(mismatch(field, literal));
-            };
-            BoundLiteral::Decimal(rescale(
-                field,
-                value,
-                decimal_type.precision(),
-                decimal_type.scale(),
-            )?)
-        }
-        DataType::Date(_) => match literal {
-            Literal::Date(value) => BoundLiteral::Date(*value),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::Time(_) => match literal {
-            Literal::Time(value) => BoundLiteral::Time(*value),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::Timestamp(_) => match literal {
-            Literal::TimestampNtz(value) => BoundLiteral::TimestampNtz(*value),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::TimestampLTz(_) => match literal {
-            Literal::TimestampLtz(value) => BoundLiteral::TimestampLtz(*value),
-            _ => return Err(mismatch(field, literal)),
-        },
-        DataType::Array(_) | DataType::Map(_) | DataType::Row(_) => {
+        (DataType::BigInt(_), _) => BoundLiteral::Int64(integer_value(field, literal)?),
+        (DataType::Float(_), _) => BoundLiteral::Float32(float32(field, literal)?),
+        (DataType::Double(_), _) => BoundLiteral::Float64(float64(field, literal)?),
+        (DataType::Decimal(decimal_type), Literal::Decimal(value)) => BoundLiteral::Decimal(
+            rescale(field, value, decimal_type.precision(), decimal_type.scale())?,
+        ),
+        (DataType::Boolean(_), Literal::Bool(_))
+        | (DataType::Char(_) | DataType::String(_), Literal::String(_))
+        | (DataType::Binary(_) | DataType::Bytes(_), Literal::Bytes(_))
+        | (DataType::Date(_), Literal::Date(_))
+        | (DataType::Time(_), Literal::Time(_))
+        | (DataType::Timestamp(_), Literal::TimestampNtz(_))
+        | (DataType::TimestampLTz(_), Literal::TimestampLtz(_)) => literal.clone(),
+        (DataType::Array(_) | DataType::Map(_) | DataType::Row(_), _) => {
             return Err(unsupported_column(field));
         }
-    };
-    validate_arrow_representability(field, &bound)?;
-    Ok(bound)
-}
-
-/// Ensures every accepted bound literal has the same exact value in the
-/// Arrow physical type used by local predicate evaluation.
-///
-/// Protocol encoding and Arrow evaluation share this binder. Rejecting an
-/// inexact temporal value here prevents a predicate from being accepted by
-/// one consumer and failing later in another.
-fn validate_arrow_representability(field: &DataField, literal: &BoundLiteral) -> Result<()> {
-    match (field.data_type(), literal) {
-        (DataType::Time(data_type), BoundLiteral::Time(millis)) => {
-            let total_nanos = i128::from(*millis) * 1_000_000;
-            validate_temporal_precision(field, total_nanos, data_type.precision())?;
-        }
-        (DataType::Timestamp(data_type), BoundLiteral::TimestampNtz(value)) => {
-            validate_timestamp(
-                field,
-                value.get_millisecond(),
-                value.get_nano_of_millisecond(),
-                data_type.precision(),
-            )?;
-        }
-        (DataType::TimestampLTz(data_type), BoundLiteral::TimestampLtz(value)) => {
-            validate_timestamp(
-                field,
-                value.get_epoch_millisecond(),
-                value.get_nano_of_millisecond(),
-                data_type.precision(),
-            )?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_timestamp(
-    field: &DataField,
-    millis: i64,
-    nano_of_millisecond: i32,
-    precision: u32,
-) -> Result<()> {
-    let total_nanos = i128::from(millis) * 1_000_000 + i128::from(nano_of_millisecond);
-    validate_temporal_precision(field, total_nanos, precision)?;
-
-    let arrow_divisor = match precision {
-        0 => 1_000_000_000,
-        1..=3 => 1_000_000,
-        4..=6 => 1_000,
-        7..=9 => 1,
-        _ => unreachable!("validated timestamp precision"),
-    };
-    i64::try_from(total_nanos / arrow_divisor).map_err(|_| IllegalArgument {
-        message: format!(
-            "filter literal cannot be represented by the Arrow physical type for column '{}' of type {}",
-            field.name(),
-            field.data_type()
-        ),
-    })?;
-    Ok(())
-}
-
-fn validate_temporal_precision(field: &DataField, total_nanos: i128, precision: u32) -> Result<()> {
-    let granularity = 10_i128.pow(9 - precision);
-    if total_nanos.rem_euclid(granularity) != 0 {
-        return Err(IllegalArgument {
-            message: format!(
-                "filter literal has finer precision than column '{}' of type {}",
-                field.name(),
-                field.data_type()
-            ),
-        });
-    }
-    Ok(())
+        _ => return Err(mismatch(field, literal)),
+    })
 }
 
 fn integer_value(field: &DataField, literal: &Literal) -> Result<i64> {
@@ -526,7 +386,6 @@ mod tests {
     use super::*;
     use crate::metadata::{DataField, DataTypes};
     use crate::predicate::col;
-    use crate::row::TimestampNtz;
 
     fn row_type() -> RowType {
         RowType::new(vec![
@@ -571,45 +430,6 @@ mod tests {
         let error = BoundPredicate::bind(Some(&predicate), &row_type()).unwrap_err();
 
         assert!(error.to_string().contains("expects 0 literal(s), got 1"));
-    }
-
-    #[test]
-    fn rejects_temporal_literals_that_are_not_exact_in_the_column_type() {
-        let row_type = RowType::new(vec![
-            DataField::new("t", DataTypes::time_with_precision(0), None),
-            DataField::new("ts", DataTypes::timestamp_with_precision(3), None),
-        ]);
-        let time = Predicate::Leaf {
-            field: "t".to_string(),
-            function: LeafFunction::Equal,
-            literals: vec![Literal::Time(1)],
-        };
-        let timestamp = Predicate::Leaf {
-            field: "ts".to_string(),
-            function: LeafFunction::Equal,
-            literals: vec![Literal::TimestampNtz(
-                TimestampNtz::from_millis_nanos(1, 1).unwrap(),
-            )],
-        };
-
-        assert!(BoundPredicate::bind(Some(&time), &row_type).is_err());
-        assert!(BoundPredicate::bind(Some(&timestamp), &row_type).is_err());
-    }
-
-    #[test]
-    fn rejects_timestamp_outside_the_arrow_physical_range() {
-        let row_type = RowType::new(vec![DataField::new(
-            "ts",
-            DataTypes::timestamp_with_precision(9),
-            None,
-        )]);
-        let predicate = Predicate::Leaf {
-            field: "ts".to_string(),
-            function: LeafFunction::Equal,
-            literals: vec![Literal::TimestampNtz(TimestampNtz::new(i64::MAX))],
-        };
-
-        assert!(BoundPredicate::bind(Some(&predicate), &row_type).is_err());
     }
 
     #[test]

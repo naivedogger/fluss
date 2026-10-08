@@ -15,103 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Low-level planning helpers used by the UnionRead implementation.
+//! Freezes the lake snapshot and server-issued log ranges before scan pruning.
 //!
-//! Engines consume the public read context rather than the default reader's
-//! opaque split descriptors or these private planning helpers.
+//! This module does not open a lake catalog, generate splits or schedule reads.
 
-use crate::split::{FlussLakeReadSplit, SplitStatistics};
-use crate::split_descriptor::SplitDescriptor;
-use crate::{CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeError, FlussLakePartitionIdentity, Result};
-use fluss::SnapshotId;
+use crate::error::planning_client_error;
+use crate::{
+    FlussLakeError, FlussLakeLogRange, FlussLakePartitionIdentity, FlussLakeReadContext, Result,
+};
 use fluss::client::FlussAdmin;
-use fluss::error::Error as ClientError;
 use fluss::metadata::{LakeSnapshotInfo, PartitionInfo, TableBucket, TableInfo, TablePath};
 use fluss::rpc::message::OffsetSpec;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 
-pub(crate) use crate::FlussLakeLogRange as FrozenBucketRange;
-
-/// A readable lake snapshot and all server-issued Fluss log boundaries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FrozenReadBoundary {
-    pub(crate) readable_lake_snapshot_id: Option<SnapshotId>,
-    pub(crate) bucket_ranges: Vec<FrozenBucketRange>,
-}
-
-/// Creates one opaque logical `(partition, bucket)` split.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn create_logical_split(
-    table_path: &TablePath,
-    schema_id: i32,
-    bucket_range: &FrozenBucketRange,
-    snapshot_id: Option<i64>,
-    lake_splits: Vec<crate::LakeSplit>,
-    primary_key_indexes: Vec<usize>,
-    statistics: SplitStatistics,
-) -> Result<FlussLakeReadSplit> {
-    let descriptor = SplitDescriptor::try_new(
-        table_path.clone(),
-        schema_id,
-        matches!(
-            bucket_range.partition_identity,
-            FlussLakePartitionIdentity::KeyValues(_)
-        ),
-        bucket_range.table_bucket.clone(),
-        bucket_range.start_offset,
-        bucket_range.stop_offset,
-        snapshot_id,
-        lake_splits,
-        primary_key_indexes,
-    )?;
-    let partition = match (
-        &bucket_range.partition_identity,
-        bucket_range.table_bucket.partition_id(),
-    ) {
-        (FlussLakePartitionIdentity::Unpartitioned, None) => "root".to_string(),
-        (FlussLakePartitionIdentity::KeyValues(_), Some(partition_id)) => partition_id.to_string(),
-        (FlussLakePartitionIdentity::KeyValues(key_values), None) => format!(
-            "lake-only({})",
-            serde_json::to_string(key_values)
-                .map_err(|error| FlussLakeError::Internal(error.to_string()))?
-        ),
-        (FlussLakePartitionIdentity::Unpartitioned, Some(partition_id)) => {
-            return Err(FlussLakeError::Internal(format!(
-                "unpartitioned logical split unexpectedly carries partition id {partition_id}"
-            )));
-        }
-    };
-    let split_id = format!(
-        "{table_path}:{partition}:{}",
-        bucket_range.table_bucket.bucket_id()
-    );
-    FlussLakeReadSplit::try_new(
-        split_id,
-        bucket_range.table_bucket.bucket_id(),
-        bucket_range.partition_identity.clone(),
-        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
-        descriptor,
-        statistics,
-    )
-}
-
-impl FrozenReadBoundary {
-    pub fn readable_lake_snapshot_id(&self) -> Option<SnapshotId> {
-        self.readable_lake_snapshot_id
-    }
-
-    pub fn bucket_ranges(&self) -> &[FrozenBucketRange] {
-        &self.bucket_ranges
-    }
-}
-
 /// Freezes all live boundaries for a resolved table, before scan pruning.
-pub(crate) async fn freeze_read_boundary_for_table(
+pub(crate) async fn freeze_read_context(
     admin: &FlussAdmin,
-    table_path: &TablePath,
     table_info: &TableInfo,
-) -> Result<FrozenReadBoundary> {
+) -> Result<FlussLakeReadContext> {
+    let table_path = &table_info.table_path;
     if table_info.num_buckets <= 0 {
         return Err(FlussLakeError::PlanningFailed(format!(
             "table {table_path} has invalid bucket count {}",
@@ -193,10 +116,11 @@ pub(crate) async fn freeze_read_boundary_for_table(
         }
     }
 
-    Ok(FrozenReadBoundary {
-        readable_lake_snapshot_id: readable_snapshot.map(|snapshot| snapshot.snapshot_id),
+    FlussLakeReadContext::from_boundary(
+        table_info,
+        readable_snapshot.map(|snapshot| snapshot.snapshot_id),
         bucket_ranges,
-    })
+    )
 }
 
 /// Admin resolves legacy counts; never substitute the table default here.
@@ -343,7 +267,7 @@ fn freeze_bucket_range(
     snapshot_offset: Option<i64>,
     earliest_offset: i64,
     stop_offset: i64,
-) -> Result<FrozenBucketRange> {
+) -> Result<FlussLakeLogRange> {
     if earliest_offset < 0 || stop_offset < 0 {
         return Err(FlussLakeError::PlanningFailed(format!(
             "server returned a negative log boundary [{earliest_offset}, {stop_offset}) for {table_bucket}"
@@ -365,7 +289,7 @@ fn freeze_bucket_range(
         )));
     }
 
-    Ok(FrozenBucketRange {
+    Ok(FlussLakeLogRange {
         table_bucket,
         partition_identity,
         bucket_count,
@@ -373,15 +297,6 @@ fn freeze_bucket_range(
         stop_offset,
         earliest_offset,
     })
-}
-
-fn planning_client_error(action: &str, error: ClientError) -> FlussLakeError {
-    match error {
-        ClientError::RpcError { .. } => {
-            FlussLakeError::ConnectionError(format!("failed to {action}: {error}"))
-        }
-        _ => FlussLakeError::PlanningFailed(format!("failed to {action}: {error}")),
-    }
 }
 
 #[cfg(test)]
@@ -411,7 +326,7 @@ mod tests {
         snapshot_offset: Option<i64>,
         earliest_offset: i64,
         stop_offset: i64,
-    ) -> Result<FrozenBucketRange> {
+    ) -> Result<FlussLakeLogRange> {
         freeze_bucket_range(
             TableBucket::new(5, 2),
             FlussLakePartitionIdentity::Unpartitioned,
@@ -465,110 +380,5 @@ mod tests {
         let range = root_range(Some(20), 8, 20).unwrap();
 
         assert!(range.is_empty());
-    }
-
-    #[test]
-    fn primary_key_split_carries_one_partition_bucket_lake_and_log_unit() {
-        let range = FrozenBucketRange {
-            table_bucket: TableBucket::new_with_partition(5, Some(9), 2),
-            partition_identity: FlussLakePartitionIdentity::KeyValues(vec![(
-                "region".to_string(),
-                "US".to_string(),
-            )]),
-            bucket_count: 4,
-            start_offset: 12,
-            stop_offset: 20,
-            earliest_offset: 8,
-        };
-        let split = create_logical_split(
-            &TablePath::new("fluss", "orders"),
-            3,
-            &range,
-            Some(42),
-            vec![crate::LakeSplit {
-                bucket_id: 2,
-                partition: range.partition_identity.clone(),
-                ..crate::source::testing_split()
-            }],
-            vec![0],
-            SplitStatistics::default(),
-        )
-        .unwrap();
-
-        assert_eq!(split.bucket_id, 2);
-        assert_eq!(
-            split.partition,
-            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string(),)])
-        );
-        let descriptor = split.validated_execution_descriptor().unwrap();
-        assert_eq!(descriptor.snapshot_id(), Some(42));
-        assert_eq!(descriptor.start_offset(), 12);
-        assert_eq!(descriptor.stop_offset(), 20);
-        assert_eq!(descriptor.lake_splits().len(), 1);
-    }
-
-    #[test]
-    fn lake_only_expired_partition_has_identity_without_live_partition_id() {
-        let range = FrozenBucketRange::lake_only(
-            5,
-            2,
-            4,
-            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())]),
-        );
-        let split = create_logical_split(
-            &TablePath::new("fluss", "orders"),
-            3,
-            &range,
-            Some(42),
-            vec![crate::LakeSplit {
-                bucket_id: 2,
-                partition: range.partition_identity.clone(),
-                ..crate::source::testing_split()
-            }],
-            Vec::new(),
-            SplitStatistics::new(Some(3), Some(100)),
-        )
-        .unwrap();
-
-        assert!(split.split_id.contains("lake-only("));
-        assert_eq!(
-            split.partition,
-            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())])
-        );
-        let descriptor = split.validated_execution_descriptor().unwrap();
-        assert!(descriptor.is_partitioned());
-        assert_eq!(descriptor.table_bucket().partition_id(), None);
-        assert_eq!(descriptor.start_offset(), 0);
-        assert_eq!(descriptor.stop_offset(), 0);
-    }
-
-    #[test]
-    fn lake_only_split_ids_do_not_collide_on_partition_delimiters() {
-        let split = |a: &str, b: &str| {
-            let range = FrozenBucketRange::lake_only(
-                5,
-                0,
-                4,
-                FlussLakePartitionIdentity::KeyValues(vec![
-                    ("a".into(), a.into()),
-                    ("b".into(), b.into()),
-                ]),
-            );
-            create_logical_split(
-                &TablePath::new("fluss", "orders"),
-                3,
-                &range,
-                Some(42),
-                vec![crate::LakeSplit {
-                    partition: range.partition_identity.clone(),
-                    ..crate::source::testing_split()
-                }],
-                Vec::new(),
-                SplitStatistics::default(),
-            )
-            .unwrap()
-        };
-        // Both used to produce "a=x/b=y/b=z" with delimiter concatenation.
-        assert_ne!(split("x/b=y", "z").split_id, split("x", "y/b=z").split_id);
     }
 }

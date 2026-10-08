@@ -299,6 +299,45 @@ equivalent algorithm under the same semantics.
 - Snapshot selection is source-owned. There is no arbitrary historical
   `with_snapshot_id`, target-parallelism knob, or public memory-pool API.
 
+## Implementation map
+
+The modules separate source boundaries, default task planning and execution. They are internal implementation boundaries, not additional public APIs or planning stages that engines must implement.
+
+| Module | Responsibility |
+| --- | --- |
+| `table.rs` | Public table/scan configuration; shared schema binding, table semantics and runtime lake-source selection. |
+| `boundary.rs` | Capture the readable lake snapshot and server-issued log ranges. No lake catalog, file planning or task scheduling. |
+| `read_context.rs`, `partition.rs` | Source identity and the validated, credential-free context transport. |
+| `planner.rs` | Apply safe pruning, call `LakeSource::plan`, and construct the default append or PK tasks. |
+| `plan.rs` | Immutable planning result: context, output schema, splits and statistics. No reader or I/O. |
+| `split.rs`, `split_descriptor.rs` | Default task envelope, private execution payload and transport validation. |
+| `reader.rs` | The single scan-created reader API; lazy task streams, concurrency limits, first-error termination and cancellation. |
+| `executor.rs` | Execute one task, read bounded logs, reconcile PK rows, then apply exact filtering, output projection and batch sizing. |
+| `source.rs` | The lake-format extension contract and predicates safe to push below reconciliation. |
+| `paimon.rs`, `paimon/arrow_conversion.rs` | Paimon catalog/snapshot access, portable task payloads, native baseline reads and lossless Arrow adaptation. |
+| `pruning.rs`, `bucket_pruning.rs` | Conservative partition and bucket pruning. Neither replaces the exact result filter. |
+| `error.rs` | Public error categories, shared client-error classification and cause diagnostics. |
+
+```text
+scan.plan()
+  -> scan.prepare_bound(): resolve table metadata and bind scan settings
+  -> boundary::freeze_read_context(): freeze source inputs
+  -> planner::plan_prepared(): prune and construct tasks
+  -> FlussLakeReadPlan
+
+scan.new_reader().read_split(original_split)
+  -> reader: validate configuration and establish the stream lifecycle
+  -> executor: validate the task and live identity, then bind matching settings
+  -> lake-only baseline / append input / PK tail plus baseline
+  -> exact filter -> output projection -> batch sizing
+
+table.prepare() or scan.prepare()
+  -> the same source preparation, without the default task planner
+  -> host-engine planning, reading and reconciliation
+```
+
+The planner and executor share `FlussLakeScan::bind` and runtime source selection; the executor does not call or import the planner. The core client owns predicate binding/evaluation, bucket hashing, log routing, bounded append reading and `DeduplicateCurrentView`. The lake crate composes these facilities instead of maintaining second implementations. Paimon representation adaptation remains backend-specific and must not become a generic permission to cast source columns.
+
 ## Tests
 
 Run from the Rust workspace:

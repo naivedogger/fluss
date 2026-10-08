@@ -17,12 +17,9 @@
 
 //! UnionRead planning result.
 
-use crate::executor::execute_split;
 use crate::split::FlussLakeReadSplit;
-use crate::table::{FlussLakeScan, stop_after_first_error};
-use crate::{FlussLakeError, FlussLakeReadContext, RecordBatchStream, Result};
+use crate::{FlussLakeError, FlussLakeReadContext, Result};
 use arrow::datatypes::SchemaRef;
-use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -122,76 +119,6 @@ impl std::fmt::Debug for FlussLakeReadPlan {
     }
 }
 
-/// Reusable reader with immutable scan configuration.
-///
-/// Local callers and distributed workers use the same scan-created reader.
-/// The caller must supply the original tasks and the planner's scan settings,
-/// including a compatible lake backend. No plan object is retained or rebuilt.
-#[derive(Clone, Debug)]
-pub struct FlussLakeReader {
-    scan: Arc<FlussLakeScan>,
-}
-
-impl FlussLakeReader {
-    pub(crate) fn from_scan(scan: FlussLakeScan) -> Self {
-        Self {
-            scan: Arc::new(scan),
-        }
-    }
-
-    pub(crate) fn scan(&self) -> &FlussLakeScan {
-        &self.scan
-    }
-
-    /// Read a frozen task, including a serialized round-trip from a coordinator.
-    /// Opening is lazy; the first stream error is terminal. Drop cancels the read.
-    pub async fn read_split(&self, split: &FlussLakeReadSplit) -> Result<RecordBatchStream> {
-        self.scan().validate_configuration()?;
-        execute_split(split, self).map(stop_after_first_error)
-    }
-
-    /// Read a task collection as an unordered stream with at most eight
-    /// active logical tasks. Duplicate tasks are rejected. Engines may instead
-    /// schedule `read_split` themselves. An error drops all sibling streams;
-    /// discard this attempt's output before replanning with fresh boundaries.
-    pub async fn read_splits(&self, splits: &[FlussLakeReadSplit]) -> Result<RecordBatchStream> {
-        self.read_splits_with_concurrency(splits, 8).await
-    }
-
-    /// As `read_splits`, with an explicit positive active-task limit.
-    pub async fn read_splits_with_concurrency(
-        &self,
-        splits: &[FlussLakeReadSplit],
-        concurrency: usize,
-    ) -> Result<RecordBatchStream> {
-        if concurrency == 0 {
-            return Err(FlussLakeError::PlanningFailed(
-                "read concurrency must be positive".to_string(),
-            ));
-        }
-        self.scan().validate_configuration()?;
-        let mut seen = HashSet::with_capacity(splits.len());
-        for split in splits {
-            if !seen.insert(&split.split_id) {
-                return Err(FlussLakeError::PlanningFailed(
-                    "duplicate read task".to_string(),
-                ));
-            }
-        }
-        let streams = splits
-            .iter()
-            .map(|split| execute_split(split, self))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(merge_split_streams(streams, concurrency))
-    }
-}
-
-fn merge_split_streams(streams: Vec<RecordBatchStream>, concurrency: usize) -> RecordBatchStream {
-    stop_after_first_error(Box::pin(
-        futures::stream::iter(streams).flatten_unordered(concurrency),
-    ))
-}
-
 fn sum_estimates(mut estimates: impl Iterator<Item = Option<usize>>) -> Option<usize> {
     estimates.try_fold(0usize, |total, estimate| total.checked_add(estimate?))
 }
@@ -201,93 +128,7 @@ mod tests {
     use super::*;
     use crate::split::{FlussLakePartitionIdentity, SplitStatistics};
     use crate::split_descriptor::SplitDescriptor;
-    use arrow::array::Int32Array;
-    use arrow::record_batch::RecordBatch;
     use fluss::metadata::{TableBucket, TablePath};
-    use futures::TryStreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct ActiveRead(Arc<AtomicUsize>);
-    impl Drop for ActiveRead {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    fn counted_stream(active: Arc<AtomicUsize>, peak: Arc<AtomicUsize>) -> RecordBatchStream {
-        Box::pin(
-            futures::stream::once(async move {
-                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(count, Ordering::SeqCst);
-                let guard = ActiveRead(active);
-                let batch = RecordBatch::try_from_iter(vec![(
-                    "id",
-                    Arc::new(Int32Array::from(vec![1])) as arrow::array::ArrayRef,
-                )])
-                .unwrap();
-                Ok::<RecordBatchStream, FlussLakeError>(Box::pin(
-                    futures::stream::iter([Ok(batch.clone()), Ok(batch)]).map(move |item| {
-                        let _keep_alive = &guard;
-                        item
-                    }),
-                ))
-            })
-            .try_flatten(),
-        )
-    }
-
-    #[test]
-    fn merged_reads_bound_active_streams_and_release_on_drop() {
-        futures::executor::block_on(async {
-            let active = Arc::new(AtomicUsize::new(0));
-            let peak = Arc::new(AtomicUsize::new(0));
-            let streams = (0..12)
-                .map(|_| counted_stream(active.clone(), peak.clone()))
-                .collect();
-            let batches = merge_split_streams(streams, 2)
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            assert_eq!(batches.len(), 24);
-            assert!(peak.load(Ordering::SeqCst) <= 2);
-            assert_eq!(active.load(Ordering::SeqCst), 0);
-
-            let streams = (0..12)
-                .map(|_| counted_stream(active.clone(), peak.clone()))
-                .collect();
-            let mut merged = merge_split_streams(streams, 2);
-            assert!(merged.next().await.unwrap().is_ok());
-            drop(merged);
-            assert_eq!(active.load(Ordering::SeqCst), 0);
-        });
-    }
-
-    #[test]
-    fn merged_error_drops_siblings_and_cannot_be_followed_by_rows() {
-        futures::executor::block_on(async {
-            let active = Arc::new(AtomicUsize::new(0));
-            let peak = Arc::new(AtomicUsize::new(0));
-            let streams = vec![
-                counted_stream(active.clone(), peak),
-                Box::pin(futures::stream::once(async {
-                    Err(FlussLakeError::DataUnavailable("expired input".into()))
-                })) as RecordBatchStream,
-            ];
-            let mut stream = merge_split_streams(streams, 2);
-            loop {
-                if stream
-                    .next()
-                    .await
-                    .expect("must report the failure")
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            assert_eq!(active.load(Ordering::SeqCst), 0);
-            assert!(stream.next().await.is_none());
-        });
-    }
 
     fn split(rows: Option<usize>, size: Option<usize>) -> FlussLakeReadSplit {
         let descriptor = SplitDescriptor::try_new(

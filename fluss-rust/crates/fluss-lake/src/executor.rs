@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::FlussLakeReader;
-use crate::error::error_message;
-use crate::planner::{
-    physical_primary_key_indexes, resolve_lake_source, validate_pk_union_merge_engine,
-};
+//! Executes one frozen task: open inputs, reconcile if needed, then filter and project.
+
+use crate::error::{error_message, execution_client_error};
 use crate::split_descriptor::SplitDescriptor;
-use crate::{FlussLakeError, FlussLakeReadSplit, RecordBatchStream, Result};
+use crate::table::{BoundScan, physical_primary_key_indexes, validate_pk_union_merge_engine};
+use crate::{FlussLakeError, FlussLakeReadSplit, FlussLakeScan, RecordBatchStream, Result};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use fluss::client::{DeduplicateCurrentView, FlussTable, RecordBatchLogReader};
@@ -43,31 +42,30 @@ const TAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// Executes a frozen task using the reader's immutable scan configuration.
 pub(crate) fn execute_split(
     split: &FlussLakeReadSplit,
-    reader: &FlussLakeReader,
+    scan: &Arc<FlussLakeScan>,
 ) -> Result<RecordBatchStream> {
     // Validation borrows the payload; ownership is needed only for the lazy stream.
     let descriptor = split.validated_execution_descriptor()?.clone();
-    if descriptor.table_path() != reader.scan().table_path() {
+    if descriptor.table_path() != scan.table_path() {
         return Err(FlussLakeError::PlanningFailed(
             "split and reader refer to different tables".to_string(),
         ));
     }
-    if descriptor.is_empty() || (reader.scan().lake_only() && descriptor.lake_splits().is_empty()) {
+    if descriptor.is_empty() || (scan.lake_only() && descriptor.lake_splits().is_empty()) {
         return Ok(Box::pin(futures::stream::empty()));
     }
     Ok(lazy_stream(open_logical_stream(
         descriptor,
         split.partition.clone(),
-        reader.clone(),
+        scan.clone(),
     )))
 }
 
 async fn open_logical_stream(
     descriptor: SplitDescriptor,
     partition: crate::FlussLakePartitionIdentity,
-    reader: FlussLakeReader,
+    scan: Arc<FlussLakeScan>,
 ) -> Result<RecordBatchStream> {
-    let scan = reader.scan();
     let table = scan
         .connection()
         .get_table(descriptor.table_path())
@@ -79,10 +77,11 @@ async fn open_logical_stream(
     if descriptor.is_primary_key() && !scan.lake_only() {
         validate_pk_union_merge_engine(table_info)?;
     }
-    let bound_filter = BoundPredicate::bind(scan.filter(), table_info.row_type())
-        .map_err(|error| FlussLakeError::PlanningFailed(error.to_string()))?;
-    let filter = &bound_filter;
-    let output_projection = scan.resolve_projection(table_info.row_type())?;
+    let BoundScan {
+        projection: output_projection,
+        filter,
+    } = scan.bind(table_info.row_type())?;
+    let filter = &filter;
     let physical = PhysicalProjection::resolve(
         table_info.row_type(),
         output_projection.as_deref(),
@@ -93,7 +92,7 @@ async fn open_logical_stream(
     let lake_stream = if descriptor.lake_splits().is_empty() {
         Box::pin(futures::stream::empty()) as RecordBatchStream
     } else {
-        let source = resolve_lake_source(scan, table_info)?;
+        let source = scan.resolve_lake_source(table_info)?;
         let snapshot_id = descriptor
             .snapshot_id()
             .ok_or_else(|| FlussLakeError::Internal("lake tasks need a snapshot".to_string()))?;
@@ -134,32 +133,23 @@ async fn open_logical_stream(
     let lake_stream = normalize_stream_schema(lake_stream, physical_schema.clone());
     let output_column_count = output_projection.as_deref().map(|indexes| indexes.len());
     let batch_size = scan.batch_size();
-    if scan.lake_only() {
-        return Ok(apply_output_processing(
-            lake_stream,
-            filter,
-            output_column_count,
-            batch_size,
-        ));
-    }
-    if descriptor.is_primary_key() {
+    let stream = if scan.lake_only() {
+        lake_stream
+    } else if descriptor.is_primary_key() {
         let mut current_view =
             DeduplicateCurrentView::try_new(physical_schema, physical.key_positions.clone())
                 .map_err(reconciliation_error)?;
         fold_logical_changelog_tail(&table, &descriptor, &physical, &mut current_view).await?;
-        return Ok(apply_output_processing(
-            reconciled_stream(current_view, lake_stream, batch_size.unwrap_or(4096)),
-            filter,
-            output_column_count,
-            batch_size,
-        ));
-    }
-    let log_stream = normalize_stream_schema(
-        open_logical_append_log_stream(&table, &descriptor, &physical, scan.filter()).await?,
-        physical_schema,
-    );
+        reconciled_stream(current_view, lake_stream, batch_size.unwrap_or(4096))
+    } else {
+        let log_stream = normalize_stream_schema(
+            open_logical_append_log_stream(&table, &descriptor, &physical, scan.filter()).await?,
+            physical_schema,
+        );
+        Box::pin(lake_stream.chain(log_stream))
+    };
     Ok(apply_output_processing(
-        Box::pin(lake_stream.chain(log_stream)),
+        stream,
         filter,
         output_column_count,
         batch_size,
@@ -472,22 +462,10 @@ fn validate_frozen_identity(
             table_info.schema_id
         )));
     }
-    let partition_matches = match partition {
-        crate::FlussLakePartitionIdentity::Unpartitioned => {
-            table_info.partition_keys.is_empty()
-                && (descriptor.is_append_lake()
-                    || descriptor.table_bucket().bucket_id() < table_info.num_buckets)
-        }
-        crate::FlussLakePartitionIdentity::KeyValues(values) => {
-            !table_info.partition_keys.is_empty()
-                && values.len() == table_info.partition_keys.len()
-                && values
-                    .iter()
-                    .zip(table_info.partition_keys.iter())
-                    .all(|((name, _), expected)| name == expected)
-        }
-    };
-    if !partition_matches
+    if !partition.matches_keys(&table_info.partition_keys)
+        || (table_info.partition_keys.is_empty()
+            && !descriptor.is_append_lake()
+            && descriptor.table_bucket().bucket_id() >= table_info.num_buckets)
         || descriptor.is_partitioned() == table_info.partition_keys.is_empty()
         || descriptor.is_primary_key() != table_info.has_primary_key()
         || descriptor.primary_key_indexes() != physical_primary_key_indexes(table_info)?
@@ -586,27 +564,6 @@ fn reconciliation_error(error: ClientError) -> FlussLakeError {
         "reconcile the primary-key current view",
         &error,
     ))
-}
-
-fn execution_client_error(action: &str, error: ClientError) -> FlussLakeError {
-    let message = error_message(action, &error);
-    if matches!(
-        error.api_error(),
-        Some(
-            fluss::error::FlussError::TableNotExist
-                | fluss::error::FlussError::UnknownTableOrBucketException
-                | fluss::error::FlussError::PartitionNotExists
-                | fluss::error::FlussError::LakeSnapshotNotExist
-                | fluss::error::FlussError::KvSnapshotNotExist
-        )
-    ) {
-        return FlussLakeError::DataUnavailable(message);
-    }
-    match error {
-        ClientError::LogOffsetOutOfRange { .. } => FlussLakeError::DataUnavailable(message),
-        ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
-        _ => FlussLakeError::Internal(message),
-    }
 }
 
 /// Restates every source batch under the physical schema frozen from Fluss
@@ -1116,37 +1073,6 @@ mod tests {
         let resized = resize_batches(source, 3);
 
         assert_eq!(collect_batches(resized).unwrap(), expected);
-    }
-
-    #[test]
-    fn log_offset_out_of_range_maps_to_data_unavailable() {
-        let error = ClientError::LogOffsetOutOfRange {
-            message: "offset 1 was removed".to_string(),
-        };
-
-        assert!(matches!(
-            execution_client_error("read bounded log", error),
-            FlussLakeError::DataUnavailable(_)
-        ));
-    }
-
-    #[test]
-    fn missing_planned_table_or_partition_maps_to_data_unavailable() {
-        for error in [
-            fluss::error::FlussError::TableNotExist,
-            fluss::error::FlussError::UnknownTableOrBucketException,
-            fluss::error::FlussError::PartitionNotExists,
-        ] {
-            assert!(matches!(
-                execution_client_error(
-                    "open frozen split",
-                    ClientError::FlussAPIError {
-                        api_error: error.to_api_error(None),
-                    },
-                ),
-                FlussLakeError::DataUnavailable(_)
-            ));
-        }
     }
 
     #[test]

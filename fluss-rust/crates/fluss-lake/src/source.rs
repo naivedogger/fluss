@@ -204,13 +204,7 @@ pub(crate) fn lake_pushdown_filter(
     let primary_key_indexes: HashSet<usize> = table_info
         .primary_keys
         .iter()
-        .filter_map(|key| {
-            table_info
-                .row_type()
-                .fields()
-                .iter()
-                .position(|field| field.name() == key)
-        })
+        .filter_map(|key| table_info.row_type().get_field_index(key))
         .collect();
     if primary_key_indexes.len() != table_info.primary_keys.len() {
         return None;

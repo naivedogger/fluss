@@ -199,7 +199,7 @@ fn literal_array(
 ) -> Result<ArrayRef> {
     let arrow_type = to_arrow_type(data_type)?;
     let array: ArrayRef = match (literal, &arrow_type) {
-        (BoundLiteral::Boolean(value), ArrowDataType::Boolean) => {
+        (BoundLiteral::Bool(value), ArrowDataType::Boolean) => {
             Arc::new(BooleanArray::from(vec![*value; len]))
         }
         (BoundLiteral::Int8(value), ArrowDataType::Int8) => {
@@ -223,12 +223,15 @@ fn literal_array(
         (BoundLiteral::String(value), ArrowDataType::Utf8) => {
             Arc::new(StringArray::from(vec![value.as_str(); len]))
         }
-        (BoundLiteral::Binary(value), ArrowDataType::Binary) => {
+        (BoundLiteral::Bytes(value), ArrowDataType::Binary) => {
             Arc::new(BinaryArray::from(vec![value.as_slice(); len]))
         }
-        (BoundLiteral::Binary(value), ArrowDataType::FixedSizeBinary(_)) => Arc::new(
-            FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(value.as_slice(), len))?,
-        ),
+        (BoundLiteral::Bytes(value), ArrowDataType::FixedSizeBinary(width)) => {
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                std::iter::repeat_n(Some(value.as_slice()), len),
+                *width,
+            )?)
+        }
         (BoundLiteral::Decimal(value), ArrowDataType::Decimal128(precision, scale)) => Arc::new(
             Decimal128Array::from(vec![decimal_to_i128(value)?; len])
                 .with_precision_and_scale(*precision, *scale)?,
@@ -330,12 +333,7 @@ fn timestamp_array(
 }
 
 fn timestamp_to_arrow_value(millis: i64, nano_of_millisecond: i32, unit: TimeUnit) -> Result<i64> {
-    let total_nanos = i128::from(millis)
-        .checked_mul(1_000_000)
-        .and_then(|value| value.checked_add(i128::from(nano_of_millisecond)))
-        .ok_or_else(|| IllegalArgument {
-            message: "timestamp predicate literal overflows nanoseconds".to_string(),
-        })?;
+    let total_nanos = i128::from(millis) * 1_000_000 + i128::from(nano_of_millisecond);
     let divisor = match unit {
         TimeUnit::Second => 1_000_000_000,
         TimeUnit::Millisecond => 1_000_000,
@@ -363,30 +361,25 @@ fn inexact_time(value: i32, unit: TimeUnit) -> crate::error::Error {
 }
 
 fn decimal_to_i128(value: &crate::row::Decimal) -> Result<i128> {
-    let bytes = value.to_unscaled_bytes();
-    if bytes.len() > size_of::<i128>() {
-        return Err(IllegalArgument {
+    value
+        .to_big_decimal()
+        .as_bigint_and_exponent()
+        .0
+        .try_into()
+        .map_err(|_| IllegalArgument {
             message: format!(
                 "decimal predicate literal {} exceeds Arrow Decimal128 range",
                 value.to_big_decimal()
             ),
-        });
-    }
-    let fill = if bytes.first().is_some_and(|value| value & 0x80 != 0) {
-        0xff
-    } else {
-        0
-    };
-    let mut result = [fill; size_of::<i128>()];
-    result[size_of::<i128>() - bytes.len()..].copy_from_slice(&bytes);
-    Ok(i128::from_be_bytes(result))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metadata::{DataField, DataTypes, RowType};
-    use crate::predicate::{Predicate, col};
+    use crate::predicate::{Literal, Predicate, col, to_pb_predicate};
+    use crate::row::TimestampNtz;
     use arrow::array::{ArrayRef, Int32Array, StringArray};
 
     fn row_type() -> RowType {
@@ -474,5 +467,87 @@ mod tests {
         .unwrap();
 
         assert!(bound.evaluate_batch(&missing).is_err());
+    }
+
+    #[test]
+    fn wire_literals_are_not_restricted_by_arrow_physical_types() {
+        let cases: Vec<(FlussDataType, Literal, ArrayRef)> = vec![
+            (
+                DataTypes::time_with_precision(0),
+                Literal::Time(1),
+                Arc::new(Time32SecondArray::from(vec![0])),
+            ),
+            (
+                DataTypes::timestamp_with_precision(3),
+                Literal::TimestampNtz(TimestampNtz::from_millis_nanos(1, 1).unwrap()),
+                Arc::new(TimestampMillisecondArray::from(vec![0])),
+            ),
+            (
+                DataTypes::timestamp_with_precision(9),
+                Literal::TimestampNtz(TimestampNtz::new(i64::MAX)),
+                Arc::new(TimestampNanosecondArray::from(vec![0])),
+            ),
+            (
+                DataTypes::binary(4),
+                Literal::Bytes(vec![1, 2, 3]),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        [Some([1, 2, 3, 4].as_slice())].into_iter(),
+                        4,
+                    )
+                    .unwrap(),
+                ),
+            ),
+        ];
+        for (data_type, literal, array) in cases {
+            let row_type = RowType::new(vec![DataField::with_field_id(
+                "c",
+                data_type.clone(),
+                None,
+                7,
+            )]);
+            let predicate = col("c").eq(literal);
+            // Preserve the existing wire encoder's accepted inputs. Exact Arrow
+            // evaluation must reject narrowing instead of truncating literals.
+            to_pb_predicate(&predicate, &row_type).unwrap();
+            let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
+            let batch = RecordBatch::try_from_iter([("c", array)]).unwrap();
+            assert!(bound.evaluate_batch(&batch).is_err(), "{data_type}");
+        }
+    }
+
+    #[test]
+    fn fixed_binary_literals_use_the_declared_width_even_without_rows() {
+        for len in [0, 1, 3] {
+            let array = literal_array(
+                &BoundLiteral::Bytes(vec![1, 2, 3, 4]),
+                &DataTypes::binary(4),
+                len,
+            )
+            .unwrap();
+            assert_eq!(array.data_type(), &ArrowDataType::FixedSizeBinary(4));
+            assert_eq!(array.len(), len);
+        }
+    }
+
+    #[test]
+    fn decimal_literals_preserve_signed_unscaled_values() {
+        for unscaled in [
+            0,
+            127,
+            128,
+            -128,
+            -129,
+            i128::from(i64::MAX) + 1,
+            -(10_i128.pow(38) - 1),
+        ] {
+            let value =
+                crate::row::Decimal::from_unscaled_bytes(&unscaled.to_be_bytes(), 38, 3).unwrap();
+            let array =
+                literal_array(&Literal::Decimal(value), &DataTypes::decimal(38, 3), 2).unwrap();
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            assert_eq!(array.values().as_ref(), &[unscaled, unscaled]);
+            assert_eq!(array.data_type(), &ArrowDataType::Decimal128(38, 3));
+        }
     }
 }

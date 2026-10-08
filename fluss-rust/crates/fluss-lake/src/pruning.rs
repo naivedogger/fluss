@@ -47,9 +47,7 @@ impl PartitionPruner {
             .iter()
             .filter_map(|partition_key| {
                 row_type
-                    .fields()
-                    .iter()
-                    .position(|field| field.name() == partition_key)
+                    .get_field_index(partition_key)
                     .map(|field_index| (field_index, partition_key.clone()))
             })
             .collect();

@@ -17,7 +17,6 @@
 
 //! Source boundaries shared by the default reader and engine-native readers.
 
-use crate::planning::FrozenReadBoundary;
 use crate::{FlussLakeError, FlussLakePartitionIdentity, Result};
 use fluss::metadata::{
     DataLakeFormat, JsonSerde, MergeEngineType, Schema, TableBucket, TableInfo, TablePath,
@@ -164,7 +163,11 @@ struct ContextDescriptor {
 }
 
 impl FlussLakeReadContext {
-    pub(crate) fn from_boundary(table: &TableInfo, boundary: FrozenReadBoundary) -> Result<Self> {
+    pub(crate) fn from_boundary(
+        table: &TableInfo,
+        lake_snapshot_id: Option<i64>,
+        log_ranges: Vec<FlussLakeLogRange>,
+    ) -> Result<Self> {
         ContextDescriptor {
             context_version: CONTEXT_VERSION,
             table_path: table.table_path.clone(),
@@ -186,8 +189,8 @@ impl FlussLakeReadContext {
                 .properties
                 .get("table.merge-engine")
                 .map(|value| value.to_ascii_lowercase()),
-            lake_snapshot_id: boundary.readable_lake_snapshot_id(),
-            log_ranges: boundary.bucket_ranges().to_vec(),
+            lake_snapshot_id,
+            log_ranges,
         }
         .try_into()
     }
@@ -434,13 +437,11 @@ impl TryFrom<ContextDescriptor> for FlussLakeReadContext {
                         ));
                     }
                 }
-                FlussLakePartitionIdentity::KeyValues(values) => {
-                    if descriptor.partition_keys.is_empty()
-                        || bucket.partition_id().is_none()
-                        || !values
-                            .iter()
-                            .map(|(key, _)| key)
-                            .eq(descriptor.partition_keys.iter())
+                FlussLakePartitionIdentity::KeyValues(_) => {
+                    if bucket.partition_id().is_none()
+                        || !range
+                            .partition_identity()
+                            .matches_keys(&descriptor.partition_keys)
                     {
                         return Err(invalid_context(
                             "partition values do not match the frozen schema",
@@ -548,23 +549,21 @@ mod tests {
         };
         FlussLakeReadContext::from_boundary(
             &table(partitioned),
-            FrozenReadBoundary {
-                readable_lake_snapshot_id: Some(42),
-                bucket_ranges: (0..2)
-                    .map(|bucket| FlussLakeLogRange {
-                        table_bucket: TableBucket::new_with_partition(
-                            7,
-                            partitioned.then_some(9),
-                            bucket,
-                        ),
-                        partition_identity: partition.clone(),
-                        bucket_count: 2,
-                        start_offset: 12,
-                        stop_offset: 20,
-                        earliest_offset: 8,
-                    })
-                    .collect(),
-            },
+            Some(42),
+            (0..2)
+                .map(|bucket| FlussLakeLogRange {
+                    table_bucket: TableBucket::new_with_partition(
+                        7,
+                        partitioned.then_some(9),
+                        bucket,
+                    ),
+                    partition_identity: partition.clone(),
+                    bucket_count: 2,
+                    start_offset: 12,
+                    stop_offset: 20,
+                    earliest_offset: 8,
+                })
+                .collect(),
         )
         .unwrap()
     }
