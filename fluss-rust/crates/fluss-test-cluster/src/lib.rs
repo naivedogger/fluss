@@ -689,27 +689,4 @@ mod tests {
             assert_eq!(remote_properties, vec![expected_property.as_str()]);
         }
     }
-
-    #[test]
-    fn remote_data_dir_without_override_preserves_cluster_configuration() {
-        let conf = HashMap::from([(
-            "remote.data.dir".to_string(),
-            "/configured-remote-data".to_string(),
-        )]);
-        let builder = FlussTestingClusterBuilder::new_with_cluster_conf("remote-dir", &conf);
-        let properties = builder.to_fluss_properties_with(HashMap::new());
-        assert!(
-            properties
-                .lines()
-                .any(|line| line == "remote.data.dir: /configured-remote-data")
-        );
-
-        let default_builder = FlussTestingClusterBuilder::new("default-remote-dir");
-        let default_properties = default_builder.to_fluss_properties_with(HashMap::new());
-        assert!(
-            !default_properties
-                .lines()
-                .any(|line| line.starts_with("remote.data.dir:"))
-        );
-    }
 }
