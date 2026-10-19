@@ -215,11 +215,12 @@
             </build>
         </profile>
         <profile>
-            <!-- Ships the Iceberg 1.12 plugin in opt/. Skip it with -Dskip.iceberg-1.12. -->
+            <!-- Ship the optional Iceberg 1.12 plugin in opt/ when enabled. -->
             <id>iceberg-1.12</id>
             <activation>
                 <property>
-                    <name>!skip.iceberg-1.12</name>
+                    <name>enable.iceberg-1.12</name>
+                    <value>true</value>
                 </property>
             </activation>
             <dependencies>

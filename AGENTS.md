@@ -363,7 +363,7 @@ public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
 
 ### Quick Start (Deployment)
 
-**Prerequisites:** Java 11, JDK 17 (Maven toolchain for `fluss-lake-iceberg-1.12`; skip with `-Dskip.iceberg-1.12`), Maven 3.8.6+, Unix-like environment
+**Prerequisites:** Java 11, JDK 17 only when enabling `fluss-lake-iceberg-1.12` with `-Denable.iceberg-1.12`, Maven 3.8.6+, Unix-like environment
 
 **Build from source:**
 ```bash

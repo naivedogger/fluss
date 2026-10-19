@@ -67,7 +67,7 @@ make_binary_release() {
   dir_name="fluss-$RELEASE_VERSION-bin"
 
   # enable release profile here (to check for the maven version)
-  $MVN clean package -Prelease -am -Dgpg.skip -Dcheckstyle.skip=true -DskipTests
+  $MVN clean package -Prelease -Denable.iceberg-1.12 -am -Dgpg.skip -Dcheckstyle.skip=true -DskipTests
 
   cd fluss-dist/target/fluss-${RELEASE_VERSION}-bin
   tar $TAR_OPTIONS -czf "${dir_name}.tgz" fluss-*

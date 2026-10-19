@@ -11,13 +11,6 @@ In order to build Fluss you need to get the source code by [cloning the git repo
 
 In addition, you need **Maven 3.8.6** and a **JDK** (Java Development Kit). Fluss requires **Java 11** to build.
 
-The Iceberg 1.12 lake plugin (`fluss-lake-iceberg-1.12`) also needs a **JDK 17** installation, which it uses as a
-[Maven toolchain](https://maven.apache.org/guides/mini/guide-using-toolchains.html) while Maven itself keeps running on Java 11.
-The JDK 17 is found automatically in `~/.m2/toolchains.xml`, through `JAVA<version>_HOME` environment variables
-(e.g. `JAVA17_HOME`), or in common install locations such as SDKMAN! and `/Library/Java/JavaVirtualMachines`.
-To build without it, skip the plugin, which also leaves it out of the binary distribution: `mvn clean install -DskipTests -Dskip.iceberg-1.12`.
-If the build fails with `Non-existing JDK home configuration`, remove the entry for that JDK from `~/.m2/toolchains.xml`.
-
 To clone from git, enter:
 
 ```bash
@@ -47,6 +40,19 @@ This instructs [Maven](http://maven.apache.org) (`mvn`) to first remove all exis
 :::tip
 Using the included [Maven Wrapper](https://maven.apache.org/wrapper/) by replacing `mvn` with `./mvnw` ensures that the correct Maven version is used.
 :::
+
+The optional Iceberg 1.12 lake plugin (`fluss-lake-iceberg-1.12`) is excluded from the default build and binary distribution.
+To include it in the build and under `opt/iceberg-1.12/` in the distribution, run:
+
+```bash
+mvn clean install -DskipTests -Denable.iceberg-1.12
+```
+
+This plugin needs a **JDK 17** installation, which it uses as a
+[Maven toolchain](https://maven.apache.org/guides/mini/guide-using-toolchains.html) while Maven itself keeps running on Java 11.
+The JDK 17 is found automatically in `~/.m2/toolchains.xml`, through `JAVA<version>_HOME` environment variables
+(e.g. `JAVA17_HOME`), or in common install locations such as SDKMAN! and `/Library/Java/JavaVirtualMachines`.
+If the build fails with `Non-existing JDK home configuration`, remove the entry for that JDK from `~/.m2/toolchains.xml`.
 
 To speed up the build you can:
 - skip tests by using ` -DskipTests`

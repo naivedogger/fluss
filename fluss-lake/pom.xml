@@ -91,11 +91,12 @@
 
     <profiles>
         <profile>
-            <!-- The Iceberg 1.12 plugin needs a JDK 17 toolchain. Skip it with -Dskip.iceberg-1.12. -->
+            <!-- The optional Iceberg 1.12 plugin needs a JDK 17 toolchain. -->
             <id>iceberg-1.12</id>
             <activation>
                 <property>
-                    <name>!skip.iceberg-1.12</name>
+                    <name>enable.iceberg-1.12</name>
+                    <value>true</value>
                 </property>
             </activation>
             <modules>
