@@ -20,7 +20,7 @@
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
 use crate::metadata::DataType as FlussDataType;
-use crate::predicate::{BoundLiteral, BoundPredicate, CompoundFunction, LeafFunction};
+use crate::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use crate::record::to_arrow_type;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, Scalar, StringArray, make_builder};
 use arrow::compute::cast;
@@ -69,7 +69,7 @@ fn evaluate_leaf(
     field_name: &str,
     data_type: &FlussDataType,
     function: LeafFunction,
-    literals: &[BoundLiteral],
+    literals: &[Literal],
 ) -> Result<BooleanArray> {
     let array = batch
         .column_by_name(field_name)
@@ -103,10 +103,10 @@ fn evaluate_membership(
     array: &ArrayRef,
     data_type: &FlussDataType,
     function: LeafFunction,
-    literals: &[BoundLiteral],
+    literals: &[Literal],
     len: usize,
 ) -> Result<BooleanArray> {
-    if function == LeafFunction::NotIn && literals.iter().any(BoundLiteral::is_null) {
+    if function == LeafFunction::NotIn && literals.iter().any(Literal::is_null) {
         return Ok(BooleanArray::from(vec![false; len]));
     }
 
@@ -127,7 +127,7 @@ fn evaluate_membership(
 fn compare(
     array: &ArrayRef,
     function: LeafFunction,
-    literal: &BoundLiteral,
+    literal: &Literal,
     data_type: &FlussDataType,
 ) -> Result<BooleanArray> {
     let constant = literal_array(literal, data_type)?;
@@ -148,7 +148,7 @@ fn compare(
 fn evaluate_string_function(
     array: &ArrayRef,
     function: LeafFunction,
-    literal: &BoundLiteral,
+    literal: &Literal,
 ) -> Result<BooleanArray> {
     let expected = literal.as_string().ok_or_else(|| IllegalArgument {
         message: "string predicate was not bound to a string literal".to_string(),
@@ -186,13 +186,13 @@ fn null_as_false(mask: &BooleanArray) -> BooleanArray {
 }
 
 /// Builds one scalar value, rather than repeating the literal for every input row.
-fn literal_array(literal: &BoundLiteral, data_type: &FlussDataType) -> Result<ArrayRef> {
+fn literal_array(literal: &Literal, data_type: &FlussDataType) -> Result<ArrayRef> {
     let arrow_type = to_arrow_type(data_type)?;
     let timestamp = match literal {
-        BoundLiteral::TimestampNtz(value) => {
+        Literal::TimestampNtz(value) => {
             Some((value.get_millisecond(), value.get_nano_of_millisecond()))
         }
-        BoundLiteral::TimestampLtz(value) => Some((
+        Literal::TimestampLtz(value) => Some((
             value.get_epoch_millisecond(),
             value.get_nano_of_millisecond(),
         )),
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn fixed_binary_scalar_filters_empty_and_nonempty_batches() {
         let data_type = DataTypes::binary(4);
-        let literal = BoundLiteral::Bytes(vec![1, 2, 3, 4]);
+        let literal = Literal::Bytes(vec![1, 2, 3, 4]);
         let scalar = literal_array(&literal, &data_type).unwrap();
         assert_eq!(scalar.data_type(), &ArrowDataType::FixedSizeBinary(4));
         assert_eq!(scalar.len(), 1);

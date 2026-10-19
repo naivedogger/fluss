@@ -21,7 +21,7 @@ use crate::FlussLakePartitionIdentity;
 #[cfg(test)]
 use fluss::metadata::ResolvedPartitionSpec;
 use fluss::metadata::RowType;
-use fluss::predicate::{BoundLiteral, BoundPredicate, CompoundFunction, LeafFunction};
+use fluss::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +142,7 @@ impl PartitionPruner {
 fn evaluate_leaf(
     partition_value: &str,
     function: LeafFunction,
-    literals: &[BoundLiteral],
+    literals: &[Literal],
 ) -> TruthValue {
     match function {
         LeafFunction::IsNull | LeafFunction::IsNotNull => TruthValue::Unknown,
@@ -178,7 +178,7 @@ fn evaluate_leaf(
             }
         }
         LeafFunction::StartsWith | LeafFunction::EndsWith | LeafFunction::Contains => {
-            let Some(expected) = literals.first().and_then(BoundLiteral::as_string) else {
+            let Some(expected) = literals.first().and_then(Literal::as_string) else {
                 return TruthValue::Unknown;
             };
             let matches = match function {
@@ -196,7 +196,7 @@ fn evaluate_leaf(
 fn evaluate_comparison(
     partition_value: &str,
     function: LeafFunction,
-    literal: &BoundLiteral,
+    literal: &Literal,
 ) -> TruthValue {
     if let Some(expected) = literal.as_string() {
         return truth(match function {
@@ -226,7 +226,7 @@ fn evaluate_comparison(
     })
 }
 
-fn literal_equals(partition_value: &str, literal: &BoundLiteral) -> Option<bool> {
+fn literal_equals(partition_value: &str, literal: &Literal) -> Option<bool> {
     if let Some(expected) = literal.as_string() {
         return Some(partition_value == expected);
     }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Predicates for server-side filter pushdown on log scans.
+//! Predicates for server-side filter pushdown and local Arrow evaluation.
 //!
 //! ```rust
 //! use fluss::predicate::col;
@@ -31,16 +31,16 @@
 //! Setting a predicate on a scan is only supported on log scans over tables
 //! with the ARROW log format.
 
-mod bound;
+mod arrow_eval;
+mod binding;
 mod coercion;
-mod eval;
 mod pb;
 
 #[doc(hidden)]
-pub use bound::{BoundLiteral, BoundPredicate};
+pub use binding::BoundPredicate;
 pub(crate) use pb::to_pb_predicate;
 
-use crate::row::{Decimal, TimestampLtz, TimestampNtz};
+use crate::row::{Date, Datum, Decimal, Time, TimestampLtz, TimestampNtz};
 
 /// Comparison applied by a [`Predicate::Leaf`] to one column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +87,59 @@ pub enum Literal {
     Time(i32),
     TimestampNtz(TimestampNtz),
     TimestampLtz(TimestampLtz),
+}
+
+impl Literal {
+    /// Returns whether this is a null literal.
+    #[doc(hidden)]
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// Returns an integer representation useful for conservative pruning.
+    #[doc(hidden)]
+    pub fn as_integer(&self) -> Option<i128> {
+        match self {
+            Self::Int8(value) => Some(i128::from(*value)),
+            Self::Int16(value) => Some(i128::from(*value)),
+            Self::Int32(value) | Self::Date(value) | Self::Time(value) => Some(i128::from(*value)),
+            Self::Int64(value) => Some(i128::from(*value)),
+            Self::TimestampNtz(value) => Some(i128::from(value.get_millisecond())),
+            Self::TimestampLtz(value) => Some(i128::from(value.get_epoch_millisecond())),
+            _ => None,
+        }
+    }
+
+    /// Returns the string value useful for conservative pruning.
+    #[doc(hidden)]
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Converts this literal into a Fluss row datum.
+    #[doc(hidden)]
+    pub fn to_datum(&self) -> Datum<'static> {
+        match self {
+            Self::Null => Datum::Null,
+            Self::Bool(value) => (*value).into(),
+            Self::Int8(value) => (*value).into(),
+            Self::Int16(value) => (*value).into(),
+            Self::Int32(value) => (*value).into(),
+            Self::Int64(value) => (*value).into(),
+            Self::Float32(value) => (*value).into(),
+            Self::Float64(value) => (*value).into(),
+            Self::String(value) => value.clone().into(),
+            Self::Bytes(value) => value.clone().into(),
+            Self::Decimal(value) => value.clone().into(),
+            Self::Date(value) => Date::new(*value).into(),
+            Self::Time(value) => Time::new(*value).into(),
+            Self::TimestampNtz(value) => (*value).into(),
+            Self::TimestampLtz(value) => (*value).into(),
+        }
+    }
 }
 
 macro_rules! impl_from_literal {

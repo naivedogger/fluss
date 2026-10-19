@@ -25,69 +25,7 @@ use crate::error::Error::IllegalArgument;
 use crate::error::Result;
 use crate::metadata::{DataField, DataType, RowType};
 use crate::predicate::{CompoundFunction, LeafFunction, Literal, Predicate};
-use crate::row::{Date, Datum, Time};
 use std::collections::HashSet;
-
-/// A core literal normalized for a bound predicate.
-///
-/// Binding checks literal kinds and exact numeric conversions against the
-/// Fluss column type. Consumers validate their physical representations.
-/// Reuse the core literal enum instead of defining another value model.
-#[doc(hidden)]
-pub type BoundLiteral = Literal;
-
-impl Literal {
-    /// Returns whether this is a null literal.
-    #[doc(hidden)]
-    pub fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
-    }
-
-    /// Returns an integer representation useful for conservative pruning.
-    #[doc(hidden)]
-    pub fn as_integer(&self) -> Option<i128> {
-        match self {
-            Self::Int8(value) => Some(i128::from(*value)),
-            Self::Int16(value) => Some(i128::from(*value)),
-            Self::Int32(value) | Self::Date(value) | Self::Time(value) => Some(i128::from(*value)),
-            Self::Int64(value) => Some(i128::from(*value)),
-            Self::TimestampNtz(value) => Some(i128::from(value.get_millisecond())),
-            Self::TimestampLtz(value) => Some(i128::from(value.get_epoch_millisecond())),
-            _ => None,
-        }
-    }
-
-    /// Returns the string value useful for conservative pruning.
-    #[doc(hidden)]
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    /// Converts this literal into a Fluss row datum.
-    #[doc(hidden)]
-    pub fn to_datum(&self) -> Datum<'static> {
-        match self {
-            Self::Null => Datum::Null,
-            Self::Bool(value) => (*value).into(),
-            Self::Int8(value) => (*value).into(),
-            Self::Int16(value) => (*value).into(),
-            Self::Int32(value) => (*value).into(),
-            Self::Int64(value) => (*value).into(),
-            Self::Float32(value) => (*value).into(),
-            Self::Float64(value) => (*value).into(),
-            Self::String(value) => value.clone().into(),
-            Self::Bytes(value) => value.clone().into(),
-            Self::Decimal(value) => value.clone().into(),
-            Self::Date(value) => Date::new(*value).into(),
-            Self::Time(value) => Time::new(*value).into(),
-            Self::TimestampNtz(value) => (*value).into(),
-            Self::TimestampLtz(value) => (*value).into(),
-        }
-    }
-}
 
 /// A core predicate resolved against a concrete Fluss row type.
 ///
@@ -103,7 +41,7 @@ pub enum BoundPredicate {
         field_id: i32,
         data_type: DataType,
         function: LeafFunction,
-        literals: Vec<BoundLiteral>,
+        literals: Vec<Literal>,
     },
     Compound {
         function: CompoundFunction,
@@ -190,29 +128,32 @@ impl BoundPredicate {
     }
 }
 
-fn bind_literal(field: &DataField, literal: &Literal) -> Result<BoundLiteral> {
+fn bind_literal(field: &DataField, literal: &Literal) -> Result<Literal> {
     if matches!(literal, Literal::Null) {
-        return Ok(BoundLiteral::Null);
+        return Ok(Literal::Null);
     }
 
     // The coercion rules are shared with the existing protobuf encoder.
     // Arrow physical-width checks belong to the evaluator, not the wire format.
     Ok(match (field.data_type(), literal) {
         (DataType::TinyInt(_), _) => {
-            BoundLiteral::Int8(integer_in_range(field, literal, i8::MAX as i64)? as i8)
+            Literal::Int8(integer_in_range(field, literal, i8::MAX as i64)? as i8)
         }
         (DataType::SmallInt(_), _) => {
-            BoundLiteral::Int16(integer_in_range(field, literal, i16::MAX as i64)? as i16)
+            Literal::Int16(integer_in_range(field, literal, i16::MAX as i64)? as i16)
         }
         (DataType::Int(_), _) => {
-            BoundLiteral::Int32(integer_in_range(field, literal, i32::MAX as i64)? as i32)
+            Literal::Int32(integer_in_range(field, literal, i32::MAX as i64)? as i32)
         }
-        (DataType::BigInt(_), _) => BoundLiteral::Int64(integer_value(field, literal)?),
-        (DataType::Float(_), _) => BoundLiteral::Float32(float32(field, literal)?),
-        (DataType::Double(_), _) => BoundLiteral::Float64(float64(field, literal)?),
-        (DataType::Decimal(decimal_type), Literal::Decimal(value)) => BoundLiteral::Decimal(
-            rescale(field, value, decimal_type.precision(), decimal_type.scale())?,
-        ),
+        (DataType::BigInt(_), _) => Literal::Int64(integer_value(field, literal)?),
+        (DataType::Float(_), _) => Literal::Float32(float32(field, literal)?),
+        (DataType::Double(_), _) => Literal::Float64(float64(field, literal)?),
+        (DataType::Decimal(decimal_type), Literal::Decimal(value)) => Literal::Decimal(rescale(
+            field,
+            value,
+            decimal_type.precision(),
+            decimal_type.scale(),
+        )?),
         (DataType::Boolean(_), Literal::Bool(_))
         | (DataType::Char(_) | DataType::String(_), Literal::String(_))
         | (DataType::Binary(_) | DataType::Bytes(_), Literal::Bytes(_))
@@ -252,7 +193,7 @@ mod tests {
                 field_id: 3,
                 data_type: DataTypes::int(),
                 function: LeafFunction::Equal,
-                literals: vec![BoundLiteral::Int32(1)],
+                literals: vec![Literal::Int32(1)],
             }
         );
     }

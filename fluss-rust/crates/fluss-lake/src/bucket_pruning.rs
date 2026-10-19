@@ -23,7 +23,7 @@
 
 use fluss::BucketingFunction;
 use fluss::metadata::{DataLakeFormat, RowType};
-use fluss::predicate::{BoundLiteral, BoundPredicate, CompoundFunction, LeafFunction};
+use fluss::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use fluss::row::GenericRow;
 use fluss::row::encode::KeyEncoderFactory;
 use std::collections::{HashMap, HashSet};
@@ -98,7 +98,7 @@ impl BucketPruner {
 /// Equality values extracted for each bucket-key column.
 #[derive(Debug, Clone)]
 struct BucketConstraints<'a> {
-    values: Vec<Vec<&'a BoundLiteral>>,
+    values: Vec<Vec<&'a Literal>>,
 }
 
 impl BucketConstraints<'_> {
@@ -119,7 +119,7 @@ fn extract_bucket_constraints<'a>(
     if bucket_keys.len() > MAX_BUCKET_PRUNING_WORK {
         return None;
     }
-    let mut per_column: HashMap<&str, Vec<&BoundLiteral>> = HashMap::new();
+    let mut per_column: HashMap<&str, Vec<&Literal>> = HashMap::new();
     let mut value_count = 0_usize;
 
     // Collect equality constraints from the top-level AND structure.
@@ -149,7 +149,7 @@ fn extract_bucket_constraints<'a>(
         }
     }
 
-    let values: Vec<Vec<&BoundLiteral>> = bucket_keys
+    let values: Vec<Vec<&Literal>> = bucket_keys
         .iter()
         .map(|key| per_column.remove(key.as_str()).unwrap_or_default())
         .collect();

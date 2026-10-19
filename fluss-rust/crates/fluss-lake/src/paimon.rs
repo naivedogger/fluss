@@ -34,7 +34,7 @@ use crate::{FlussLakeError, FlussLakePartitionIdentity, RecordBatchStream, Resul
 use arrow::array::StructArray;
 use arrow::record_batch::RecordBatch;
 use fluss::metadata::{DataType, RowType, TableInfo, TablePath};
-use fluss::predicate::{BoundLiteral, BoundPredicate, CompoundFunction, LeafFunction};
+use fluss::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use futures::StreamExt;
 use paimon::catalog::Identifier;
 use paimon::spec::{
@@ -301,7 +301,7 @@ fn convert_paimon_predicate(
                         builder.is_in(field_name, literals)
                     }
                 }
-                LeafFunction::NotIn if literals.iter().any(BoundLiteral::is_null) => {
+                LeafFunction::NotIn if literals.iter().any(Literal::is_null) => {
                     Ok(PaimonPredicate::AlwaysFalse)
                 }
                 LeafFunction::NotIn => builder.is_not_in(field_name, non_null_literals()?),
@@ -337,7 +337,7 @@ fn convert_paimon_predicate(
 }
 
 fn required_paimon_literal(
-    literals: &[BoundLiteral],
+    literals: &[Literal],
     data_type: &DataType,
 ) -> paimon::Result<PaimonDatum> {
     literals
@@ -348,19 +348,19 @@ fn required_paimon_literal(
         })
 }
 
-fn to_paimon_datum(literal: &BoundLiteral, data_type: &DataType) -> Option<PaimonDatum> {
+fn to_paimon_datum(literal: &Literal, data_type: &DataType) -> Option<PaimonDatum> {
     match literal {
-        BoundLiteral::Null => None,
-        BoundLiteral::Bool(value) => Some(PaimonDatum::Bool(*value)),
-        BoundLiteral::Int8(value) => Some(PaimonDatum::TinyInt(*value)),
-        BoundLiteral::Int16(value) => Some(PaimonDatum::SmallInt(*value)),
-        BoundLiteral::Int32(value) => Some(PaimonDatum::Int(*value)),
-        BoundLiteral::Int64(value) => Some(PaimonDatum::Long(*value)),
-        BoundLiteral::Float32(value) => Some(PaimonDatum::Float(*value)),
-        BoundLiteral::Float64(value) => Some(PaimonDatum::Double(*value)),
-        BoundLiteral::String(value) => Some(PaimonDatum::String(value.clone())),
-        BoundLiteral::Bytes(value) => Some(PaimonDatum::Bytes(value.clone())),
-        BoundLiteral::Decimal(value) => {
+        Literal::Null => None,
+        Literal::Bool(value) => Some(PaimonDatum::Bool(*value)),
+        Literal::Int8(value) => Some(PaimonDatum::TinyInt(*value)),
+        Literal::Int16(value) => Some(PaimonDatum::SmallInt(*value)),
+        Literal::Int32(value) => Some(PaimonDatum::Int(*value)),
+        Literal::Int64(value) => Some(PaimonDatum::Long(*value)),
+        Literal::Float32(value) => Some(PaimonDatum::Float(*value)),
+        Literal::Float64(value) => Some(PaimonDatum::Double(*value)),
+        Literal::String(value) => Some(PaimonDatum::String(value.clone())),
+        Literal::Bytes(value) => Some(PaimonDatum::Bytes(value.clone())),
+        Literal::Decimal(value) => {
             let DataType::Decimal(decimal_type) = data_type else {
                 return None;
             };
@@ -370,13 +370,13 @@ fn to_paimon_datum(literal: &BoundLiteral, data_type: &DataType) -> Option<Paimo
                 scale: decimal_type.scale(),
             })
         }
-        BoundLiteral::Date(value) => Some(PaimonDatum::Date(*value)),
-        BoundLiteral::Time(value) => Some(PaimonDatum::Time(*value)),
-        BoundLiteral::TimestampNtz(value) => Some(PaimonDatum::Timestamp {
+        Literal::Date(value) => Some(PaimonDatum::Date(*value)),
+        Literal::Time(value) => Some(PaimonDatum::Time(*value)),
+        Literal::TimestampNtz(value) => Some(PaimonDatum::Timestamp {
             millis: value.get_millisecond(),
             nanos: value.get_nano_of_millisecond(),
         }),
-        BoundLiteral::TimestampLtz(value) => Some(PaimonDatum::LocalZonedTimestamp {
+        Literal::TimestampLtz(value) => Some(PaimonDatum::LocalZonedTimestamp {
             millis: value.get_epoch_millisecond(),
             nanos: value.get_nano_of_millisecond(),
         }),
