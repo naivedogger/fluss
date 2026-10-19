@@ -28,4 +28,6 @@ Contexts and tasks carry frozen work, not credentials or a complete worker confi
 
 The crate requires Rust 1.91. Run `cargo test -p fluss-lake --lib` for source-contract and planner tests.
 
-At this layer a caller must inject a `LakeSource`; no default format backend is installed.
+## Paimon
+
+Enable the `paimon` feature for the default Paimon 0.3 backend. It plans and reads the pinned snapshot using Parquet, owns lake merge/delete semantics, and converts Arrow 58 output to the workspace Arrow 59 representation. It does not silently substitute a newer snapshot. Run `cargo test -p fluss-lake --features paimon --lib` for backend and local Parquet tests.

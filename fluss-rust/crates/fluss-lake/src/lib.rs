@@ -21,6 +21,8 @@
 mod boundary;
 mod bucket_pruning;
 mod error;
+#[cfg(feature = "paimon")]
+mod paimon;
 mod partition;
 mod plan;
 mod planner;
@@ -32,6 +34,8 @@ mod split_descriptor;
 mod table;
 
 pub use error::{FlussLakeError, Result};
+#[cfg(feature = "paimon")]
+pub use paimon::PaimonLakeSource;
 pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
 pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
 pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
