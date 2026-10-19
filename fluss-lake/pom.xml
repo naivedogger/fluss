@@ -103,5 +103,25 @@
                 <module>fluss-lake-iceberg-1.12</module>
             </modules>
         </profile>
+        <profile>
+            <id>release</id>
+            <activation>
+                <property>
+                    <name>release</name>
+                </property>
+            </activation>
+            <modules>
+                <module>fluss-lake-iceberg-1.12</module>
+            </modules>
+        </profile>
+        <profile>
+            <id>iceberg-1.12-jdk17</id>
+            <activation>
+                <jdk>[17,)</jdk>
+            </activation>
+            <modules>
+                <module>fluss-lake-iceberg-1.12</module>
+            </modules>
+        </profile>
     </profiles>
 </project>

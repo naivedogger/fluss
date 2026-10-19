@@ -41,14 +41,16 @@ This instructs [Maven](http://maven.apache.org) (`mvn`) to first remove all exis
 Using the included [Maven Wrapper](https://maven.apache.org/wrapper/) by replacing `mvn` with `./mvnw` ensures that the correct Maven version is used.
 :::
 
-The optional Iceberg 1.12 lake plugin (`fluss-lake-iceberg-1.12`) is excluded from the default build and binary distribution.
-To include it in the build and under `opt/iceberg-1.12/` in the distribution, run:
+The optional Iceberg 1.12 lake plugin (`fluss-lake-iceberg-1.12`) is excluded from a default JDK 11 build.
+It is included automatically when Maven runs on JDK 17+ or the `release` profile is active.
+To include it explicitly when Maven runs on JDK 11, run:
 
 ```bash
 mvn clean install -DskipTests -Denable.iceberg-1.12
 ```
 
-This plugin needs a **JDK 17** installation, which it uses as a
+The distribution places this plugin under `opt/iceberg-1.12/`.
+When Maven runs on JDK 11, this plugin needs a **JDK 17** installation, which it uses as a
 [Maven toolchain](https://maven.apache.org/guides/mini/guide-using-toolchains.html) while Maven itself keeps running on Java 11.
 The JDK 17 is found automatically in `~/.m2/toolchains.xml`, through `JAVA<version>_HOME` environment variables
 (e.g. `JAVA17_HOME`), or in common install locations such as SDKMAN! and `/Library/Java/JavaVirtualMachines`.

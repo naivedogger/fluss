@@ -36,7 +36,7 @@ if [[ `basename $CURR_DIR` != "tools" ]] ; then
 fi
 
 ###########################
-COMMON_OPTIONS="-Prelease -Denable.iceberg-1.12 -DskipTests -DretryFailedDeploymentCount=10 "
+COMMON_OPTIONS="-Prelease -DskipTests -DretryFailedDeploymentCount=10 "
 
 cd ..
 

@@ -78,17 +78,17 @@ jobs:
             </toolchain>
           </toolchains>
           EOF
-          echo "MAVEN_TOOLCHAIN_ARGS=-t ${{ runner.temp }}/toolchains.xml -Dtoolchain.jdk.discover=false" >> "$GITHUB_ENV"
+          echo "MAVEN_TOOLCHAIN_ARGS=-Denable.iceberg-1.12 -t ${{ runner.temp }}/toolchains.xml -Dtoolchain.jdk.discover=false" >> "$GITHUB_ENV"
       - name: Build
         run: |
-          mvn -T 1C -B clean install -DskipTests -Denable.iceberg-1.12 $MAVEN_TOOLCHAIN_ARGS ${{ matrix.module == 'spark3-scala213' && '-Pscala-2.13' || '' }} ${{ inputs.maven-parameters }}
+          mvn -T 1C -B clean install -DskipTests $MAVEN_TOOLCHAIN_ARGS ${{ matrix.module == 'spark3-scala213' && '-Pscala-2.13' || '' }} ${{ inputs.maven-parameters }}
       - name: Test
         timeout-minutes: 60
         run: |
           TEST_MODULES=$(./.github/workflows/stage.sh ${{ matrix.module }})
           echo "github ref: ${{ github.ref }}"
           echo "Start testing modules: $TEST_MODULES"
-          mvn -B verify $TEST_MODULES -Denable.iceberg-1.12 $MAVEN_TOOLCHAIN_ARGS -Ptest-coverage -P${{ startsWith(matrix.module, 'spark3') && 'test-spark3' || format('test-{0}', matrix.module) }} -Dlog.dir=${{ runner.temp }}/fluss-logs -Dlog4j.configurationFile=${{ github.workspace }}/tools/ci/log4j.properties ${{ inputs.maven-parameters }}
+          mvn -B verify $TEST_MODULES $MAVEN_TOOLCHAIN_ARGS -Ptest-coverage -P${{ startsWith(matrix.module, 'spark3') && 'test-spark3' || format('test-{0}', matrix.module) }} -Dlog.dir=${{ runner.temp }}/fluss-logs -Dlog4j.configurationFile=${{ github.workspace }}/tools/ci/log4j.properties ${{ inputs.maven-parameters }}
         env:
           MAVEN_OPTS: -Xmx4096m
           ARTIFACTS_OSS_ENDPOINT: ${{ secrets.ARTIFACTS_OSS_ENDPOINT }}

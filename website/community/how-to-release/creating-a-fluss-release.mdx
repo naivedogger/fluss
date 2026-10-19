@@ -84,7 +84,7 @@ This ensures the milestone accurately reflects all the issues delivered in the r
 
 Run `mvn -v` and `java -version` on your local machine. All of the following steps require to use **Maven 3.8.6** and **Java 11**. Modify your `PATH` environment variable accordingly if needed.
 
-The binary release and Maven staging scripts explicitly enable the optional Iceberg 1.12 plugin with `-Denable.iceberg-1.12` so that it remains part of the release. A **JDK 17** installation is also required: the Iceberg 1.12 lake plugin is compiled and tested with it as a Maven toolchain, while Maven keeps running on Java 11 (see [Building Fluss](/community/dev/building)).
+The `release` profile used by the binary release and Maven staging scripts automatically includes the optional Iceberg 1.12 plugin. A **JDK 17** installation is also required: the Iceberg 1.12 lake plugin is compiled and tested with it as a Maven toolchain, while Maven keeps running on Java 11 (see [Building Fluss](/community/dev/building)).
 
 
 ### 5. Clone Fluss into a fresh workspace
