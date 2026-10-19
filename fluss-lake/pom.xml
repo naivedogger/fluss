@@ -90,6 +90,7 @@
     <packaging>pom</packaging>
 
     <profiles>
+        <!-- Remove these Iceberg 1.12 profiles when the Iceberg 1.10 plugin is dropped (#4547). -->
         <profile>
             <!-- The optional Iceberg 1.12 plugin needs a JDK 17 toolchain. -->
             <id>iceberg-1.12</id>
