@@ -18,7 +18,8 @@
 //! Table and scan APIs for bounded UnionRead.
 
 use crate::error::planning_client_error;
-use crate::{FlussLakeError, FlussLakeReadContext, Result};
+use crate::planner::{plan_union_read, plan_with_context};
+use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, LakeSource, Result};
 use fluss::client::FlussConnection;
 use fluss::metadata::{RowType, TableInfo, TablePath};
 use fluss::predicate::{BoundPredicate, Predicate};
@@ -31,6 +32,12 @@ use std::sync::Arc;
 enum FlussLakeProjection {
     Indices(Vec<usize>),
     Names(Vec<String>),
+}
+
+/// Schema-bound scan settings shared by the planner and executor.
+pub(crate) struct BoundScan {
+    pub(crate) projection: Option<Vec<usize>>,
+    pub(crate) filter: BoundPredicate,
 }
 
 /// Entry point for bounded reads over a lake-enabled Fluss table.
@@ -93,6 +100,7 @@ impl FlussLakeTable {
             filter: None,
             batch_size: None,
             lake_only: false,
+            lake_source: None,
             catalog_property_overrides: self.catalog_property_overrides.clone(),
         }
     }
@@ -132,6 +140,7 @@ pub struct FlussLakeScan {
     filter: Option<Predicate>,
     batch_size: Option<usize>,
     lake_only: bool,
+    lake_source: Option<Arc<dyn crate::LakeSource>>,
     catalog_property_overrides: HashMap<String, String>,
 }
 
@@ -173,14 +182,65 @@ impl FlussLakeScan {
     /// Captures source boundaries for an engine-native or default execution.
     ///
     /// Projection and filter are validated but do not prune this table-wide
-    /// context. The host engine applies query-specific pruning separately.
+    /// context. They are applied by `plan_with_context` or by the host engine.
     /// No lake catalog or file reader is opened by this method.
     pub async fn prepare(&self) -> Result<FlussLakeReadContext> {
-        self.prepare_context().await
+        Ok(self.prepare_bound().await?.1)
+    }
+
+    /// Prepares source boundaries and builds the complete default read plan.
+    ///
+    /// Lake planning uses the configured source. The plan exposes frozen tasks
+    /// for execution by a compatible reader.
+    pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
+        plan_union_read(self).await
+    }
+
+    /// Builds a default plan without choosing new snapshots or log offsets.
+    ///
+    /// The context must refer to this table. Metadata drift is rejected.
+    /// Different scans may share a context without sharing predicates or
+    /// projection. Engines implementing their own UnionRead can instead
+    /// consume the public context directly and skip this default planner.
+    pub async fn plan_with_context(
+        &self,
+        context: &FlussLakeReadContext,
+    ) -> Result<FlussLakeReadPlan> {
+        plan_with_context(self, context).await
+    }
+
+    /// Use a lake backend instead of the feature-selected default implementation.
+    /// The source owns both task planning and reading; it may delegate either
+    /// operation to another compatible source. It must match the table format.
+    pub fn with_lake_source(mut self, source: Arc<dyn crate::LakeSource>) -> Self {
+        self.lake_source = Some(source);
+        self
+    }
+
+    pub(crate) fn resolve_lake_source(&self, info: &TableInfo) -> Result<Arc<dyn LakeSource>> {
+        let format = info
+            .table_config
+            .get_datalake_format()
+            .map_err(|e| FlussLakeError::PlanningFailed(e.to_string()))?
+            .ok_or_else(|| FlussLakeError::NotLakeReadable("missing lake format".to_string()))?
+            .to_string();
+        if let Some(source) = &self.lake_source {
+            if source.format() != format {
+                return Err(FlussLakeError::PlanningFailed(
+                    "LakeSource format does not match the table".to_string(),
+                ));
+            }
+            return Ok(source.clone());
+        }
+        Err(FlussLakeError::PlanningFailed(format!(
+            "no LakeSource for {format}; enable its feature or supply a custom source"
+        )))
     }
 
     /// Resolves metadata and scan settings once before freezing the source inputs.
-    async fn prepare_context(&self) -> Result<FlussLakeReadContext> {
+    pub(crate) async fn prepare_bound(
+        &self,
+    ) -> Result<(TableInfo, FlussLakeReadContext, BoundScan)> {
         self.validate_configuration()?;
         let admin = self
             .connection
@@ -191,11 +251,27 @@ impl FlussLakeScan {
             .await
             .map_err(|error| planning_client_error("get table metadata", error))?;
         validate_lake_readable(&table_info)?;
-        self.resolve_projection(table_info.row_type())?;
-        BoundPredicate::bind(self.filter(), table_info.row_type()).map_err(|error| {
-            FlussLakeError::PlanningFailed(format!("failed to bind filter predicate: {error}"))
-        })?;
-        crate::boundary::freeze_read_context(&admin, &table_info).await
+        let bound = self.bind(table_info.row_type())?;
+        let context = crate::boundary::freeze_read_context(&admin, &table_info).await?;
+        Ok((table_info, context, bound))
+    }
+
+    /// Shares predicate coercion and projection resolution between planning and reading.
+    pub(crate) fn bind(&self, row_type: &RowType) -> Result<BoundScan> {
+        Ok(BoundScan {
+            projection: self.resolve_projection(row_type)?,
+            filter: BoundPredicate::bind(self.filter(), row_type).map_err(|error| {
+                FlussLakeError::PlanningFailed(format!("failed to bind filter predicate: {error}"))
+            })?,
+        })
+    }
+
+    pub(crate) fn connection(&self) -> &Arc<FlussConnection> {
+        &self.connection
+    }
+
+    pub(crate) fn table_path(&self) -> &TablePath {
+        &self.table_path
     }
 
     fn resolve_projection(&self, row_type: &RowType) -> Result<Option<Vec<usize>>> {
@@ -235,6 +311,10 @@ impl FlussLakeScan {
 
     pub(crate) fn filter(&self) -> Option<&Predicate> {
         self.filter.as_ref()
+    }
+
+    pub(crate) fn lake_only(&self) -> bool {
+        self.lake_only
     }
 
     pub(crate) fn validate_configuration(&self) -> Result<()> {
@@ -316,6 +396,40 @@ pub(crate) fn validate_lake_readable(table_info: &TableInfo) -> Result<()> {
             table_info.table_path
         ))),
     }
+}
+
+pub(crate) fn validate_pk_union_merge_engine(table_info: &TableInfo) -> Result<()> {
+    let merge_engine = table_info
+        .table_config
+        .get_merge_engine_type()
+        .map_err(|error| {
+            FlussLakeError::PlanningFailed(format!(
+                "failed to resolve the merge engine of {}: {error}",
+                table_info.table_path
+            ))
+        })?;
+    if let Some(merge_engine) = merge_engine {
+        return Err(FlussLakeError::UnsupportedMergeEngine(format!(
+            "primary-key UnionRead only supports the default deduplicate semantics, but table {} uses table.merge-engine={merge_engine}",
+            table_info.table_path
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn physical_primary_key_indexes(table_info: &TableInfo) -> Result<Vec<usize>> {
+    table_info
+        .get_physical_primary_keys()
+        .iter()
+        .map(|name| {
+            table_info.row_type().get_field_index(name).ok_or_else(|| {
+                FlussLakeError::PlanningFailed(format!(
+                    "physical primary-key column '{name}' is missing from table {}",
+                    table_info.table_path
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

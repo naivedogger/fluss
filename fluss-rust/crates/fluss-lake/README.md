@@ -16,23 +16,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# UnionRead source preparation
+# Bounded UnionRead planning
 
-`fluss-lake` captures reusable source boundaries without opening a lake catalog or reading lake files. This layer provides preparation and context transport; the default lake planner and reader are delivered separately.
+`fluss-lake` provides reusable source boundaries, a `LakeSource` interface and default split planning. The combined lake/log executor is delivered separately; this layer supports lake baseline reads through `LakeSource::read`.
 
-```rust,no_run
-# use std::sync::Arc;
-# use fluss::client::FlussConnection;
-# use fluss::metadata::TablePath;
-# use fluss_lake::{FlussLakeTable, FlussLakeReadContext};
-# async fn prepare(connection: Arc<FlussConnection>, path: &TablePath) -> fluss_lake::Result<()> {
-let table = FlussLakeTable::open(connection, path).await?;
-let context = table.prepare().await?;
-let transported = FlussLakeReadContext::from_json(&context.to_json()?)?;
-# Ok(())
-# }
-```
+Use `FlussLakeTable::prepare()` to freeze source inputs. Inject a source with `scan.with_lake_source(source)` and call `scan.plan()` or `scan.plan_with_context(&context)`. The resulting plan exposes splits, output schema and estimates, without retaining a reader. Native engines may consume the context directly instead of using the default split representation.
 
-The context freezes table/schema identity, physical lake table mapping, a readable snapshot and half-open log ranges `[start, stop)`. Projection and filters do not prune this table-wide capture. Actual per-partition bucket counts are preserved. The context contains no credentials or physical lake-file tasks, is not a global transactional snapshot and does not acquire a retention lease. Its JSON representation is an evolving Rust contract, not a stable cross-language ABI.
+A lake source owns its task payload and baseline semantics. Append tasks are independent of each other and of nonempty log tails. For PK reconciliation, the complete supplied bucket group must produce at most one live row per full key, with lake versions and deletes already resolved. PK tasks retain their complete baseline and tail together. Lake-only expired partitions are included. Pruning is conservative and does not replace exact result filtering.
 
-The lake crate requires Rust 1.91 independently of the core workspace MSRV. Run `cargo test -p fluss-lake --lib` for unit tests. `test_prepare` requires the `integration_tests` feature and the existing Fluss Docker test-cluster environment.
+Contexts and tasks carry frozen work, not credentials or a complete worker configuration. Callers must preserve matching filters, projection, read mode and runtime mappings. Neither context capture nor task planning acquires a retention lease. Transport is an evolving Rust contract, not a stable cross-language ABI.
+
+The crate requires Rust 1.91. Run `cargo test -p fluss-lake --lib` for source-contract and planner tests.
+
+At this layer a caller must inject a `LakeSource`; no default format backend is installed.
