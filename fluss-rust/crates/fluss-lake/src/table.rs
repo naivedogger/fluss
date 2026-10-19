@@ -19,7 +19,9 @@
 
 use crate::error::planning_client_error;
 use crate::planner::{plan_union_read, plan_with_context};
-use crate::{FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, LakeSource, Result};
+use crate::{
+    FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReader, LakeSource, Result,
+};
 use fluss::client::FlussConnection;
 use fluss::metadata::{RowType, TableInfo, TablePath};
 use fluss::predicate::{BoundPredicate, Predicate};
@@ -190,10 +192,26 @@ impl FlussLakeScan {
 
     /// Prepares source boundaries and builds the complete default read plan.
     ///
-    /// Lake planning uses the configured source. The plan exposes frozen tasks
-    /// for execution by a compatible reader.
+    /// Create the reader using this scan's `new_reader()`. Lake planning and reading
+    /// use the injected source or the feature-selected default implementation.
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
         plan_union_read(self).await
+    }
+
+    /// Creates a reader without planning or refreshing read boundaries.
+    ///
+    /// The caller must use the planner's projection, filter, read mode and batch
+    /// size, plus a compatible lake backend and runtime catalog mapping. Workers
+    /// restore these settings using the engine's own transport. They are not
+    /// carried in splits or checked against a plan. Mismatches are caller errors
+    /// and can produce incomplete results or the wrong schema.
+    ///
+    /// Splits must come from a trusted coordinator. Version, table/schema,
+    /// layout and payload checks still apply, but do not authenticate a task.
+    /// Credentials stay local. Configuration and metadata validation is
+    /// deferred until reading; constructing this reader performs no I/O.
+    pub fn new_reader(&self) -> FlussLakeReader {
+        FlussLakeReader::from_scan(self.clone())
     }
 
     /// Builds a default plan without choosing new snapshots or log offsets.
@@ -318,6 +336,10 @@ impl FlussLakeScan {
 
     pub(crate) fn filter(&self) -> Option<&Predicate> {
         self.filter.as_ref()
+    }
+
+    pub(crate) fn batch_size(&self) -> Option<usize> {
+        self.batch_size
     }
 
     pub(crate) fn lake_only(&self) -> bool {

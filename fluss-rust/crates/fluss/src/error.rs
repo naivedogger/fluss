@@ -38,6 +38,9 @@ pub enum Error {
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
 
+    #[snafu(display("Fluss log offset out of range: {}", message))]
+    LogOffsetOutOfRange { message: String },
+
     #[snafu(
         visibility(pub(crate)),
         display("Fluss hitting unexpected io error {}: {:?}", message, source)

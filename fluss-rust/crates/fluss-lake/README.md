@@ -16,18 +16,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Bounded UnionRead planning
+# Bounded Append UnionRead
 
-`fluss-lake` provides reusable source boundaries, a `LakeSource` interface and default split planning. The combined lake/log executor is delivered separately; this layer supports lake baseline reads through `LakeSource::read`.
+`fluss-lake` reads a frozen lake snapshot and complementary bounded Fluss log tails. Append and supported lake-only reads are available. PK union execution is explicitly rejected until reconciliation is added.
 
-Use `FlussLakeTable::prepare()` to freeze source inputs. Inject a source with `scan.with_lake_source(source)` and call `scan.plan()` or `scan.plan_with_context(&context)`. The resulting plan exposes splits, output schema and estimates, without retaining a reader. Native engines may consume the context directly instead of using the default split representation.
+```rust,no_run
+# use fluss_lake::FlussLakeTable;
+# async fn read(table: &FlussLakeTable) -> fluss_lake::Result<()> {
+let scan = table.new_scan().with_projection(vec![0]);
+let plan = scan.plan().await?;
+let reader = scan.new_reader();
+let stream = reader.read_splits(plan.splits()).await?;
+# Ok(())
+# }
+```
 
-A lake source owns its task payload and baseline semantics. Append tasks are independent of each other and of nonempty log tails. For PK reconciliation, the complete supplied bucket group must produce at most one live row per full key, with lake versions and deletes already resolved. PK tasks retain their complete baseline and tail together. Lake-only expired partitions are included. Pruning is conservative and does not replace exact result filtering.
+Local callers and workers use the same scan-created reader. Workers receive original transported splits and restore matching filters, projection, read mode, batch size and compatible runtime lake-source mappings. They do not replan or retain the coordinator plan. Credentials stay local. Task validation does not authenticate input or detect every configuration mismatch.
 
-Contexts and tasks carry frozen work, not credentials or a complete worker configuration. Callers must preserve matching filters, projection, read mode and runtime mappings. Neither context capture nor task planning acquires a retention lease. Transport is an evolving Rust contract, not a stable cross-language ABI.
+Append lake tasks and nonempty Fluss bucket tails are independently schedulable. The reader supports bounded task concurrency, lazy I/O, cancellation and terminal errors. Hidden filter columns are retained until exact filtering; an empty output projection preserves row counts. Missing required frozen inputs fail the attempt instead of refreshing the snapshot or skipping data.
 
-The crate requires Rust 1.91. Run `cargo test -p fluss-lake --lib` for source-contract and planner tests.
+Enable `paimon` for the Paimon 0.3 Parquet backend, or inject `LakeSource` for another compatible implementation. Source preparation works without Paimon. Contexts are not global transactional snapshots or retention leases, and their transport is not a stable cross-language ABI. The crate requires Rust 1.91 independently of core.
 
-## Paimon
-
-Enable the `paimon` feature for the default Paimon 0.3 backend. It plans and reads the pinned snapshot using Parquet, owns lake merge/delete semantics, and converts Arrow 58 output to the workspace Arrow 59 representation. It does not silently substitute a newer snapshot. Run `cargo test -p fluss-lake --features paimon --lib` for backend and local Parquet tests.
+Run `cargo test -p fluss-lake --features paimon --lib` for unit and local Parquet tests. Fluss cluster tests use the `integration_tests` feature. The existing client-integration workflow contains a change-scoped `rust-union-read` job: it precompiles the Rust verifier, then runs the Java-owned `RustUnionReadITCase` fixture against the same local warehouse. This layer requires three Append scenarios (ordinary, partition default-count growth and shrinkage), with zero skips. The ordinary Java suite does not require Rust.

@@ -14,13 +14,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Lake-source contracts and frozen task planning for bounded UnionRead.
+//! Engine-neutral bounded lake and log read kernel for Apache Fluss.
+//!
+//! Union read is a bounded batch query. Results are delivered lazily as a
+//! finite stream of Arrow record batches.
+//!
+//! Three integration levels share the same source contract:
+//! - [`FlussLakeScan::plan`] and [`FlussLakeScan::new_reader`] provide the
+//!   default Append reader, including lake access and bounded log reading.
+//!   Local callers and workers use matching scan settings to
+//!   execute transported splits without retaining or rebuilding the plan.
+//! - [`FlussLakeScan::with_lake_source`] replaces lake planning/reading while
+//!   retaining the default Fluss log reader. PK union execution is not supported yet.
+//! - [`FlussLakeTable::prepare`] returns a portable [`FlussLakeReadContext`]
+//!   without a lake backend. Engines can use their own lake planners, readers,
+//!   reconciliation operators, and schedulers against these frozen inputs.
+//!
+//! A context is table-wide and independent of scan predicates and projection.
+//! It is not a retention lease or a global transactional snapshot.
 
 #![doc = include_str!("../README.md")]
 
 mod boundary;
 mod bucket_pruning;
 mod error;
+mod executor;
 #[cfg(feature = "paimon")]
 mod paimon;
 mod partition;
@@ -28,6 +46,7 @@ mod plan;
 mod planner;
 mod pruning;
 mod read_context;
+mod reader;
 mod source;
 mod split;
 mod split_descriptor;
@@ -38,6 +57,7 @@ pub use error::{FlussLakeError, Result};
 pub use paimon::PaimonLakeSource;
 pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
 pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
+pub use reader::FlussLakeReader;
 pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
 pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;
 pub use split::{FlussLakePartitionIdentity, FlussLakeReadSplit};
