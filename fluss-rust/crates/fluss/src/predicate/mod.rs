@@ -32,6 +32,7 @@
 //! with the ARROW log format.
 
 mod bound;
+mod coercion;
 mod eval;
 mod pb;
 

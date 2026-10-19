@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema binding and literal coercion shared by predicate consumers.
+//! Schema-bound predicates for local evaluation and conservative pruning.
 
+use super::coercion::{
+    compound_name, float32, float64, integer_in_range, integer_value, mismatch, rescale,
+    resolve_field, unsupported_column, validate_leaf,
+};
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
 use crate::metadata::{DataField, DataType, RowType};
 use crate::predicate::{CompoundFunction, LeafFunction, Literal, Predicate};
-use crate::row::{Date, Datum, Decimal, Time};
+use crate::row::{Date, Datum, Time};
 use std::collections::HashSet;
 
 /// A core literal normalized for a bound predicate.
@@ -88,7 +92,7 @@ impl Literal {
 /// A core predicate resolved against a concrete Fluss row type.
 ///
 /// This type is public only so sibling workspace crates can share binding,
-/// coercion, protocol encoding, pruning, and exact evaluation semantics.
+/// coercion, pruning, and exact evaluation semantics.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundPredicate {
@@ -186,60 +190,6 @@ impl BoundPredicate {
     }
 }
 
-fn resolve_field<'a>(row_type: &'a RowType, name: &str) -> Result<(usize, &'a DataField)> {
-    row_type
-        .get_field_index(name)
-        .map(|index| (index, &row_type.fields()[index]))
-        .ok_or_else(|| IllegalArgument {
-            message: format!(
-                "filter column '{}' does not exist in the table schema, available columns: {:?}",
-                name,
-                row_type.get_field_names()
-            ),
-        })
-}
-
-fn validate_leaf(function: LeafFunction, field: &DataField, literals: &[Literal]) -> Result<()> {
-    let expected = match function {
-        LeafFunction::In | LeafFunction::NotIn => return Ok(()),
-        LeafFunction::IsNull | LeafFunction::IsNotNull => 0,
-        _ => 1,
-    };
-    if literals.len() != expected {
-        return Err(IllegalArgument {
-            message: format!(
-                "{function:?} on column '{}' expects {expected} literal(s), got {}",
-                field.name(),
-                literals.len()
-            ),
-        });
-    }
-
-    if literals.first() == Some(&Literal::Null) {
-        return Err(IllegalArgument {
-            message: format!(
-                "{function:?} on column '{}' cannot take a null literal, use is_null()/is_not_null()",
-                field.name()
-            ),
-        });
-    }
-
-    if matches!(
-        function,
-        LeafFunction::StartsWith | LeafFunction::EndsWith | LeafFunction::Contains
-    ) && !matches!(field.data_type(), DataType::Char(_) | DataType::String(_))
-    {
-        return Err(IllegalArgument {
-            message: format!(
-                "{function:?} requires a character string column, but column '{}' is {}",
-                field.name(),
-                field.data_type()
-            ),
-        });
-    }
-    Ok(())
-}
-
 fn bind_literal(field: &DataField, literal: &Literal) -> Result<BoundLiteral> {
     if matches!(literal, Literal::Null) {
         return Ok(BoundLiteral::Null);
@@ -275,110 +225,6 @@ fn bind_literal(field: &DataField, literal: &Literal) -> Result<BoundLiteral> {
         }
         _ => return Err(mismatch(field, literal)),
     })
-}
-
-fn integer_value(field: &DataField, literal: &Literal) -> Result<i64> {
-    match literal {
-        Literal::Int8(value) => Ok(i64::from(*value)),
-        Literal::Int16(value) => Ok(i64::from(*value)),
-        Literal::Int32(value) => Ok(i64::from(*value)),
-        Literal::Int64(value) => Ok(*value),
-        _ => Err(mismatch(field, literal)),
-    }
-}
-
-fn integer_in_range(field: &DataField, literal: &Literal, max: i64) -> Result<i64> {
-    let value = integer_value(field, literal)?;
-    if value > max || value < -max - 1 {
-        return Err(IllegalArgument {
-            message: format!(
-                "filter literal {value} is out of range for column '{}' of type {}",
-                field.name(),
-                field.data_type()
-            ),
-        });
-    }
-    Ok(value)
-}
-
-fn float32(field: &DataField, literal: &Literal) -> Result<f32> {
-    if let Literal::Float32(value) = literal {
-        return Ok(*value);
-    }
-    let value = float64(field, literal)?;
-    let narrowed = value as f32;
-    if f64::from(narrowed) != value && !value.is_nan() {
-        return Err(inexact(field, value));
-    }
-    Ok(narrowed)
-}
-
-fn float64(field: &DataField, literal: &Literal) -> Result<f64> {
-    match literal {
-        Literal::Float64(value) => Ok(*value),
-        Literal::Float32(value) => Ok(f64::from(*value)),
-        Literal::Int8(_) | Literal::Int16(_) | Literal::Int32(_) | Literal::Int64(_) => {
-            let value = integer_value(field, literal)?;
-            let widened = value as f64;
-            if widened as i128 != i128::from(value) {
-                return Err(inexact(field, widened));
-            }
-            Ok(widened)
-        }
-        _ => Err(mismatch(field, literal)),
-    }
-}
-
-fn inexact(field: &DataField, value: f64) -> crate::error::Error {
-    IllegalArgument {
-        message: format!(
-            "filter literal {value} cannot be represented exactly by column '{}' of type {}",
-            field.name(),
-            field.data_type()
-        ),
-    }
-}
-
-fn rescale(field: &DataField, value: &Decimal, precision: u32, scale: u32) -> Result<Decimal> {
-    let big_decimal = value.to_big_decimal();
-    let rescaled = Decimal::from_big_decimal(big_decimal.clone(), precision, scale)?;
-    if rescaled.to_big_decimal() != big_decimal {
-        return Err(IllegalArgument {
-            message: format!(
-                "filter literal {big_decimal} does not fit column '{}' of type {}",
-                field.name(),
-                field.data_type()
-            ),
-        });
-    }
-    Ok(rescaled)
-}
-
-fn mismatch(field: &DataField, literal: &Literal) -> crate::error::Error {
-    IllegalArgument {
-        message: format!(
-            "filter literal {literal:?} does not match column '{}' of type {}",
-            field.name(),
-            field.data_type()
-        ),
-    }
-}
-
-pub(crate) fn unsupported_column(field: &DataField) -> crate::error::Error {
-    IllegalArgument {
-        message: format!(
-            "filter on column '{}' of type {} is not supported",
-            field.name(),
-            field.data_type()
-        ),
-    }
-}
-
-fn compound_name(function: CompoundFunction) -> &'static str {
-    match function {
-        CompoundFunction::And => "AND",
-        CompoundFunction::Or => "OR",
-    }
 }
 
 #[cfg(test)]
@@ -430,6 +276,18 @@ mod tests {
         let error = BoundPredicate::bind(Some(&predicate), &row_type()).unwrap_err();
 
         assert!(error.to_string().contains("expects 0 literal(s), got 1"));
+    }
+
+    #[test]
+    fn local_binding_does_not_require_protocol_field_ids() {
+        let row_type = RowType::new(vec![DataField::new("id", DataTypes::int(), None)]);
+        let bound = BoundPredicate::bind(Some(&col("id").eq(1_i8)), &row_type).unwrap();
+
+        assert!(matches!(
+            bound,
+            BoundPredicate::Leaf { field_index: 0, ref literals, .. }
+                if literals == &[Literal::Int32(1)]
+        ));
     }
 
     #[test]
