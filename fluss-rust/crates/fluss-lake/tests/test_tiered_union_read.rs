@@ -127,7 +127,7 @@ async fn verify() {
     let scenario = required_env("FLUSS_RUST_UNION_READ_SCENARIO");
     assert!(matches!(
         scenario.as_str(),
-        "append" | "append-grow" | "append-shrink"
+        "append" | "pk" | "append-grow" | "append-shrink" | "pk-grow" | "pk-shrink"
     ));
     let connection = Arc::new(
         FlussConnection::new(Config {

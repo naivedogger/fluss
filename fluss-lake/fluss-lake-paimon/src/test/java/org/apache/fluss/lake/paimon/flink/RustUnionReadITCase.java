@@ -103,7 +103,7 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"append"})
+    @ValueSource(strings = {"append", "pk"})
     void testRustUnionRead(String scenario) throws Exception {
         boolean primaryKey = scenario.equals("pk");
         TablePath tablePath = TablePath.of(DEFAULT_DB, "rust_union_read_" + scenario);
@@ -163,7 +163,7 @@ class RustUnionReadITCase extends FlinkPaimonTieringTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"append-grow", "append-shrink"})
+    @ValueSource(strings = {"append-grow", "append-shrink", "pk-grow", "pk-shrink"})
     void testRustUnionReadWithPartitionBucketCounts(String scenario) throws Exception {
         boolean primaryKey = scenario.startsWith("pk");
         int oldCount = scenario.endsWith("grow") ? 2 : 4;
