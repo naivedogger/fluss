@@ -46,7 +46,7 @@ It is included automatically when Maven runs on JDK 17+ or the `release` profile
 To include it explicitly when Maven runs on JDK 11, run:
 
 ```bash
-mvn clean install -DskipTests -Denable.iceberg-1.12
+mvn clean install -DskipTests -Diceberg-1.12
 ```
 
 The distribution places this plugin under `opt/iceberg-1.12/`.

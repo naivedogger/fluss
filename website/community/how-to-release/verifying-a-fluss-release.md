@@ -67,7 +67,7 @@ fluss-1.0.0-src.tgz: OK
 Extract `fluss-1.0.0-src.tgz` and verify that it builds correctly, including the optional Iceberg 1.12 plugin shipped in the release. Use Java 11 to run Maven and provide a JDK 17 toolchain as described in [Building Fluss](/community/dev/building):
 
 ```bash
-mvn clean package -DskipTests -Denable.iceberg-1.12
+mvn clean package -DskipTests -Diceberg-1.12
 ```
 
 Gateway is a separate Cargo workspace, not built by Maven or the `fluss-rust`

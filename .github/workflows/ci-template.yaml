@@ -78,7 +78,7 @@ jobs:
             </toolchain>
           </toolchains>
           EOF
-          echo "MAVEN_TOOLCHAIN_ARGS=-Denable.iceberg-1.12 -t ${{ runner.temp }}/toolchains.xml -Dtoolchain.jdk.discover=false" >> "$GITHUB_ENV"
+          echo "MAVEN_TOOLCHAIN_ARGS=-Diceberg-1.12 -t ${{ runner.temp }}/toolchains.xml -Dtoolchain.jdk.discover=false" >> "$GITHUB_ENV"
       - name: Build
         run: |
           mvn -T 1C -B clean install -DskipTests $MAVEN_TOOLCHAIN_ARGS ${{ matrix.module == 'spark3-scala213' && '-Pscala-2.13' || '' }} ${{ inputs.maven-parameters }}

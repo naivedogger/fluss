@@ -95,7 +95,7 @@
             <id>iceberg-1.12</id>
             <activation>
                 <property>
-                    <name>enable.iceberg-1.12</name>
+                    <name>iceberg-1.12</name>
                     <value>true</value>
                 </property>
             </activation>
