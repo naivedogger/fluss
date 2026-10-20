@@ -144,7 +144,7 @@ fn compare(
 ) -> Result<BooleanArray> {
     let column = TypedColumn::build(array.as_ref(), data_type)?;
     match (&column, operand) {
-        (TypedColumn::Timestamp(_), Operand::Temporal(Literal::TimestampNtz(bound))) => {
+        (TypedColumn::Timestamp(_), Operand::Literal(Literal::TimestampNtz(bound))) => {
             timestamp_mask(array, &column, TypedColumn::get_timestamp_ntz, |value| {
                 matches_order(
                     value.map_or_else(|side| side, |value| value.cmp(bound)),
@@ -152,7 +152,7 @@ fn compare(
                 )
             })
         }
-        (TypedColumn::TimestampLtz(_), Operand::Temporal(Literal::TimestampLtz(bound))) => {
+        (TypedColumn::TimestampLtz(_), Operand::Literal(Literal::TimestampLtz(bound))) => {
             timestamp_mask(array, &column, TypedColumn::get_timestamp_ltz, |value| {
                 matches_order(
                     value.map_or_else(|side| side, |value| value.cmp(bound)),
@@ -160,12 +160,18 @@ fn compare(
                 )
             })
         }
-        (TypedColumn::Time(time), Operand::Temporal(Literal::Time(bound))) => Ok(compare_values(
+        (TypedColumn::Time(time), Operand::Literal(Literal::Time(bound))) => Ok(compare_values(
             (0..array.len()).map(|i| array.is_valid(i).then(|| time.get_nanos(i))),
             i128::from(*bound) * 1_000_000,
             function,
             |a, b| a.cmp(&b),
         )),
+        (TypedColumn::Binary(values), Operand::Literal(Literal::Bytes(bound))) => Ok(
+            compare_values(values.iter(), bound.as_slice(), function, compare_binary),
+        ),
+        (TypedColumn::Bytes(values), Operand::Literal(Literal::Bytes(bound))) => Ok(
+            compare_values(values.iter(), bound.as_slice(), function, compare_binary),
+        ),
         (_, Operand::Scalar(constant)) => compare_scalar(&column, function, constant),
         _ => Err(literal_mismatch()),
     }
@@ -208,8 +214,6 @@ fn compare_scalar(
                 .collect(),
             _ => compare!(a, b),
         },
-        (TypedColumn::Binary(a), TypedColumn::Binary(b)) => compare!(a, b, compare_binary),
-        (TypedColumn::Bytes(a), TypedColumn::Bytes(b)) => compare!(a, b, compare_binary),
         // Binding has already aligned the scale. Compare unscaled values rather
         // than allocating a core Decimal/BigDecimal for every row.
         (TypedColumn::Decimal(a, _), TypedColumn::Decimal(b, _)) => compare!(a, b),
@@ -426,7 +430,7 @@ impl PreparedPredicate {
 enum Operand {
     None,
     Constant(bool),
-    Temporal(Literal),
+    Literal(Literal),
     Scalar(Box<TypedColumn>),
     Membership(MembershipSet),
 }
@@ -452,13 +456,18 @@ impl Operand {
         }
         let literal = &literals[0];
         match (data_type, literal) {
-            (FlussDataType::Time(_), Literal::Time(_))
+            (FlussDataType::Binary(_) | FlussDataType::Bytes(_), Literal::Bytes(_))
+            | (FlussDataType::Time(_), Literal::Time(_))
             | (FlussDataType::Timestamp(_), Literal::TimestampNtz(_))
             | (FlussDataType::TimestampLTz(_), Literal::TimestampLtz(_)) => {
-                Ok(Self::Temporal(literal.clone()))
+                // Comparison bounds keep their precision and length; row-writer
+                // narrowing and fixed-width checks apply only to stored values.
+                Ok(Self::Literal(literal.clone()))
             }
             (
-                FlussDataType::Time(_)
+                FlussDataType::Binary(_)
+                | FlussDataType::Bytes(_)
+                | FlussDataType::Time(_)
                 | FlussDataType::Timestamp(_)
                 | FlussDataType::TimestampLTz(_),
                 _,
@@ -489,6 +498,7 @@ fn combine_masks(
 
 #[derive(Debug)]
 enum MembershipSet {
+    Bytes(HashSet<Vec<u8>>),
     Timestamps(HashSet<TimestampNtz>),
     TimestampsLtz(HashSet<TimestampLtz>),
     Times(HashSet<i128>),
@@ -502,12 +512,12 @@ enum MembershipSet {
 impl MembershipSet {
     fn new(literals: &[Literal], data_type: &FlussDataType) -> Result<Self> {
         macro_rules! core_set {
-            ($literal:ident, $variant:ident, $convert:expr) => {{
+            ($literal:ident, $variant:ident, $value:ident => $convert:expr) => {{
                 let values = literals
                     .iter()
                     .filter(|literal| !literal.is_null())
                     .map(|literal| match literal {
-                        Literal::$literal(value) => Ok(($convert)(*value)),
+                        Literal::$literal($value) => Ok($convert),
                         _ => Err(literal_mismatch()),
                     })
                     .collect::<Result<HashSet<_>>>()?;
@@ -515,9 +525,16 @@ impl MembershipSet {
             }};
         }
         match data_type {
-            FlussDataType::Timestamp(_) => core_set!(TimestampNtz, Timestamps, |v| v),
-            FlussDataType::TimestampLTz(_) => core_set!(TimestampLtz, TimestampsLtz, |v| v),
-            FlussDataType::Time(_) => core_set!(Time, Times, |v| i128::from(v) * 1_000_000),
+            FlussDataType::Binary(_) | FlussDataType::Bytes(_) => {
+                core_set!(Bytes, Bytes, value => value.clone())
+            }
+            FlussDataType::Timestamp(_) => core_set!(TimestampNtz, Timestamps, value => *value),
+            FlussDataType::TimestampLTz(_) => {
+                core_set!(TimestampLtz, TimestampsLtz, value => *value)
+            }
+            FlussDataType::Time(_) => {
+                core_set!(Time, Times, value => i128::from(*value) * 1_000_000)
+            }
             _ => {}
         }
         let arrow_type = to_arrow_type(data_type)?;
@@ -553,6 +570,16 @@ impl MembershipSet {
     ) -> Result<BooleanArray> {
         let negate = function == LeafFunction::NotIn;
         let (converter, values) = match self {
+            Self::Bytes(values) => {
+                let matches = |value: Option<&[u8]>| {
+                    value.is_some_and(|value| values.contains(value) != negate)
+                };
+                return Ok(match TypedColumn::build(array.as_ref(), data_type)? {
+                    TypedColumn::Binary(array) => array.iter().map(matches).collect(),
+                    TypedColumn::Bytes(array) => array.iter().map(matches).collect(),
+                    _ => return Err(literal_mismatch()),
+                });
+            }
             Self::Timestamps(values) => {
                 let column = TypedColumn::build(array.as_ref(), data_type)?;
                 return timestamp_mask(array, &column, TypedColumn::get_timestamp_ntz, |value| {
@@ -600,8 +627,7 @@ impl MembershipSet {
         if values.is_empty() {
             return constant_filter(array, negate);
         }
-        // For non-floats Arrow row encoding has the same equality relation as
-        // Fluss, including byte arrays whose ordering differs from Arrow's.
+        // For the remaining scalar types, Arrow row encoding agrees with Fluss equality.
         let rows = converter.convert_columns(std::slice::from_ref(array))?;
         Ok(rows
             .iter()
@@ -616,7 +642,7 @@ mod tests {
     use super::*;
     use crate::metadata::{DataField, DataTypes, RowType};
     use crate::predicate::tests::assert_comparisons;
-    use crate::predicate::{Literal, Predicate, col, to_pb_predicate};
+    use crate::predicate::{Literal, Predicate, col};
     use crate::row::{TimestampLtz, TimestampNtz};
     use arrow::array::{
         ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray,
@@ -1199,26 +1225,63 @@ mod tests {
     }
 
     #[test]
-    fn wire_binary_literals_do_not_require_arrow_width() {
-        let data_type = DataTypes::binary(4);
-        let row_type = RowType::new(vec![DataField::with_field_id(
-            "c",
-            data_type.clone(),
-            None,
-            7,
-        )]);
-        let predicate = col("c").eq(Literal::Bytes(vec![1, 2, 3]));
-        // The wire encoder accepts variable-width literals; Arrow evaluation
-        // must still validate the fixed-size binary width, even on empty input.
-        to_pb_predicate(&predicate, &row_type).unwrap();
-        let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
-        let batch = RecordBatch::try_from_iter([(
-            "c",
-            new_empty_array(&to_arrow_type(&data_type).unwrap()),
-        )])
-        .unwrap();
-        assert!(bound.evaluate_batch(&batch).is_err());
-        assert!(bound.into_evaluator().is_err());
+    fn binary_literals_allow_different_lengths_but_columns_keep_their_width() {
+        use Ordering::{Equal, Greater, Less};
+        use arrow::array::BinaryArray;
+        let values = [Some(&[1, 2, 3, 4][..]), None];
+        for (data_type, array) in [
+            (
+                DataTypes::bytes(),
+                Arc::new(BinaryArray::from(values.to_vec())) as ArrayRef,
+            ),
+            (
+                DataTypes::binary(4),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 4)
+                        .unwrap(),
+                ) as ArrayRef,
+            ),
+        ] {
+            for (literal, ordering) in [
+                (vec![], Greater),
+                (vec![1, 2, 3], Greater),
+                (vec![1, 2, 3, 4], Equal),
+                (vec![1, 2, 3, 4, 0], Less),
+                (vec![1, 2, 4], Less),
+                (vec![1, 2, 3, 0x80], Greater),
+            ] {
+                assert_comparisons(
+                    data_type.clone(),
+                    array.clone(),
+                    Literal::Bytes(literal),
+                    vec![Some(ordering), None],
+                );
+            }
+            assert_membership_strategies(
+                data_type,
+                array,
+                vec![vec![], vec![1, 2, 3], vec![1, 2, 3, 4], vec![1, 2, 3, 4, 0]]
+                    .into_iter()
+                    .map(Literal::Bytes)
+                    .collect(),
+            );
+        }
+        let row_type = RowType::new(vec![DataField::new("c", DataTypes::binary(4), None)]);
+        let bound =
+            BoundPredicate::bind(Some(&col("c").ne(Literal::Bytes(vec![1, 2, 3]))), &row_type)
+                .unwrap();
+        assert!(bound.evaluate_partition_value("01020304").unwrap());
+        assert!(bound.evaluate_partition_value("010203").is_err());
+        let evaluator = bound.clone().into_evaluator().unwrap();
+        for wrong_type in [DataTypes::bytes(), DataTypes::binary(3)] {
+            let batch = RecordBatch::try_from_iter([(
+                "c",
+                new_empty_array(&to_arrow_type(&wrong_type).unwrap()),
+            )])
+            .unwrap();
+            assert!(bound.evaluate_batch(&batch).is_err());
+            assert!(evaluator.evaluate_batch(&batch).is_err());
+        }
     }
 
     #[test]
