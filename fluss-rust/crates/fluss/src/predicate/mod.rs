@@ -34,8 +34,11 @@
 mod arrow_eval;
 mod binding;
 mod coercion;
+mod numeric;
 mod pb;
 
+#[doc(hidden)]
+pub use arrow_eval::PredicateEvaluator;
 #[doc(hidden)]
 pub use binding::BoundPredicate;
 pub(crate) use pb::to_pb_predicate;
@@ -96,7 +99,9 @@ impl Literal {
         matches!(self, Self::Null)
     }
 
-    /// Returns an integer representation useful for conservative pruning.
+    /// Returns an integer value for conservative pruning: dates use epoch days,
+    /// times use milliseconds. Timestamps return `None`; pruning them requires
+    /// an explicit unit and preservation of the sub-millisecond fraction.
     #[doc(hidden)]
     pub fn as_integer(&self) -> Option<i128> {
         match self {
@@ -104,8 +109,6 @@ impl Literal {
             Self::Int16(value) => Some(i128::from(*value)),
             Self::Int32(value) | Self::Date(value) | Self::Time(value) => Some(i128::from(*value)),
             Self::Int64(value) => Some(i128::from(*value)),
-            Self::TimestampNtz(value) => Some(i128::from(value.get_millisecond())),
-            Self::TimestampLtz(value) => Some(i128::from(value.get_epoch_millisecond())),
             _ => None,
         }
     }
@@ -412,6 +415,28 @@ mod tests {
                 ]
             )
         );
+    }
+
+    #[test]
+    fn pruning_integer_conversion_preserves_units_and_rejects_timestamps() {
+        assert_eq!(
+            Literal::Int64(i64::MIN).as_integer(),
+            Some(i128::from(i64::MIN))
+        );
+        assert_eq!(Literal::Date(-1).as_integer(), Some(-1));
+        assert_eq!(Literal::Time(123).as_integer(), Some(123));
+        for (millis, nanos) in [(0, 0), (1, 1), (-1, 999_999), (i64::MAX, 999_999)] {
+            assert_eq!(
+                Literal::TimestampNtz(TimestampNtz::from_millis_nanos(millis, nanos).unwrap())
+                    .as_integer(),
+                None
+            );
+            assert_eq!(
+                Literal::TimestampLtz(TimestampLtz::from_millis_nanos(millis, nanos).unwrap())
+                    .as_integer(),
+                None
+            );
+        }
     }
 
     #[test]

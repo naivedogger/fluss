@@ -44,29 +44,7 @@ pub(super) fn validate_leaf(
     field: &DataField,
     literals: &[Literal],
 ) -> Result<()> {
-    let expected = match function {
-        LeafFunction::In | LeafFunction::NotIn => return Ok(()),
-        LeafFunction::IsNull | LeafFunction::IsNotNull => 0,
-        _ => 1,
-    };
-    if literals.len() != expected {
-        return Err(IllegalArgument {
-            message: format!(
-                "{function:?} on column '{}' expects {expected} literal(s), got {}",
-                field.name(),
-                literals.len()
-            ),
-        });
-    }
-
-    if literals.first() == Some(&Literal::Null) {
-        return Err(IllegalArgument {
-            message: format!(
-                "{function:?} on column '{}' cannot take a null literal, use is_null()/is_not_null()",
-                field.name()
-            ),
-        });
-    }
+    validate_leaf_shape(function, field.name(), literals)?;
 
     if matches!(
         function,
@@ -81,6 +59,38 @@ pub(super) fn validate_leaf(
             ),
         });
     }
+    Ok(())
+}
+
+pub(super) fn validate_leaf_shape(
+    function: LeafFunction,
+    field_name: &str,
+    literals: &[Literal],
+) -> Result<()> {
+    let expected = match function {
+        LeafFunction::In | LeafFunction::NotIn => return Ok(()),
+        LeafFunction::IsNull | LeafFunction::IsNotNull => 0,
+        _ => 1,
+    };
+    if literals.len() != expected {
+        return Err(IllegalArgument {
+            message: format!(
+                "{function:?} on column '{}' expects {expected} literal(s), got {}",
+                field_name,
+                literals.len()
+            ),
+        });
+    }
+
+    if literals.first() == Some(&Literal::Null) {
+        return Err(IllegalArgument {
+            message: format!(
+                "{function:?} on column '{}' cannot take a null literal, use is_null()/is_not_null()",
+                field_name
+            ),
+        });
+    }
+
     Ok(())
 }
 
