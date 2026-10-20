@@ -23,17 +23,15 @@ use crate::error::Result;
 use crate::metadata::DataType as FlussDataType;
 use crate::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use crate::record::to_arrow_type;
-use crate::row::Datum;
+use crate::row::column_vector::{TimestampColumn, TypedColumn};
+use crate::row::{Datum, TimestampLtz, TimestampNtz};
 use crate::util::partition::parse_value_of_type;
 use crate::util::{canonicalize_nan, compare_floats};
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Int32Array, Int64Array, Scalar, StringArray,
-    make_builder,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, StringArray, make_builder,
 };
-use arrow::compute::cast;
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, or};
-use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow::datatypes::{DataType as ArrowDataType, Float32Type, Float64Type, TimeUnit};
+use arrow::datatypes::{DataType as ArrowDataType, Float32Type, Float64Type};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
 use std::cmp::Ordering;
@@ -57,14 +55,16 @@ impl BoundPredicate {
     /// Evaluates a leaf against a non-null, encoded Fluss partition value.
     ///
     /// Uses the same exact filter semantics as [`Self::evaluate_batch`]. Returns
-    /// an error for non-leaves, invalid encodings, unsupported types, or values
-    /// that cannot be represented losslessly in the column's Arrow type.
+    /// an error for non-leaves, invalid encodings, or unsupported types.
+    /// Temporal values retain their core precision, independently of Arrow units.
     /// A pruning caller must retain the partition on error.
     #[doc(hidden)]
     pub fn evaluate_partition_value(&self, value: &str) -> Result<bool> {
         let Self::Leaf {
             field_name,
             data_type,
+            function,
+            literals,
             ..
         } = self
         else {
@@ -73,19 +73,33 @@ impl BoundPredicate {
             });
         };
         let datum = parse_value_of_type(value, data_type)?;
-        let temporal = match &datum {
-            Datum::TimestampNtz(value) => Some(Literal::TimestampNtz(*value)),
-            Datum::TimestampLtz(value) => Some(Literal::TimestampLtz(*value)),
-            Datum::Time(value) => Some(Literal::Time(value.get_inner())),
-            _ => None,
-        };
-        let array = if let Some(literal) = temporal {
-            membership_scalar(&literal, data_type)?.ok_or_else(|| IllegalArgument {
-                message: "partition value cannot be represented exactly in its Arrow type".into(),
-            })?
-        } else {
-            datum_array(&datum, data_type)?
-        };
+        validate_leaf_shape(*function, field_name, literals)?;
+        // Partition strings are core values, not Arrow rows. In particular a
+        // timestamp must not be narrowed to the column's physical unit here.
+        match &datum {
+            Datum::TimestampNtz(value) => {
+                return evaluate_value(*value, *function, literals, |literal| match literal {
+                    Literal::TimestampNtz(value) => Ok(*value),
+                    _ => Err(literal_mismatch()),
+                });
+            }
+            Datum::TimestampLtz(value) => {
+                return evaluate_value(*value, *function, literals, |literal| match literal {
+                    Literal::TimestampLtz(value) => Ok(*value),
+                    _ => Err(literal_mismatch()),
+                });
+            }
+            Datum::Time(value) => {
+                return evaluate_value(value.get_inner(), *function, literals, |literal| {
+                    match literal {
+                        Literal::Time(value) => Ok(*value),
+                        _ => Err(literal_mismatch()),
+                    }
+                });
+            }
+            _ => {}
+        }
+        let array = datum_array(&datum, data_type)?;
         let batch = RecordBatch::try_from_iter([(field_name.as_str(), array)])?;
         Ok(self.evaluate_batch(&batch)?.value(0))
     }
@@ -174,7 +188,7 @@ fn evaluate_membership(
     if literals.is_empty() {
         return constant_filter(array, function == LeafFunction::NotIn);
     }
-    MembershipSet::new(literals, data_type)?.evaluate(array, function)
+    MembershipSet::new(literals, data_type)?.evaluate(array, data_type, function)
 }
 
 fn compare(
@@ -183,90 +197,148 @@ fn compare(
     literal: &Literal,
     data_type: &FlussDataType,
 ) -> Result<BooleanArray> {
-    let nanos = temporal_nanos(literal, data_type);
-    if let Some(nanos) = nanos {
-        match array.data_type() {
-            ArrowDataType::Timestamp(unit, _)
-            | ArrowDataType::Time32(unit)
-            | ArrowDataType::Time64(unit) => {
-                return compare_temporal(array, function, nanos, *unit);
-            }
-            _ => {}
+    let column = TypedColumn::build(array.as_ref(), data_type)?;
+    match (&column, literal) {
+        (TypedColumn::Timestamp(_), Literal::TimestampNtz(bound)) => {
+            timestamp_mask(array, &column, TypedColumn::get_timestamp_ntz, |value| {
+                matches_order(
+                    value.map_or_else(|side| side, |value| value.cmp(bound)),
+                    function,
+                )
+            })
         }
+        (TypedColumn::TimestampLtz(_), Literal::TimestampLtz(bound)) => {
+            timestamp_mask(array, &column, TypedColumn::get_timestamp_ltz, |value| {
+                matches_order(
+                    value.map_or_else(|side| side, |value| value.cmp(bound)),
+                    function,
+                )
+            })
+        }
+        (TypedColumn::Time(time), Literal::Time(bound)) => Ok(compare_values(
+            (0..array.len()).map(|i| array.is_valid(i).then(|| time.get_nanos(i))),
+            i128::from(*bound) * 1_000_000,
+            function,
+            |a, b| a.cmp(&b),
+        )),
+        (TypedColumn::Time(_) | TypedColumn::Timestamp(_) | TypedColumn::TimestampLtz(_), _) => {
+            Err(literal_mismatch())
+        }
+        _ => compare_scalar(
+            &column,
+            function,
+            literal_array(literal, data_type)?,
+            data_type,
+        ),
     }
-    compare_scalar(array, function, literal_array(literal, data_type)?)
 }
 
-fn temporal_nanos(literal: &Literal, data_type: &FlussDataType) -> Option<i128> {
-    match (data_type, literal) {
-        (FlussDataType::Time(_), Literal::Time(millis)) => Some(i128::from(*millis) * 1_000_000),
-        (FlussDataType::Timestamp(_), Literal::TimestampNtz(value)) => Some(
-            i128::from(value.get_millisecond()) * 1_000_000
-                + i128::from(value.get_nano_of_millisecond()),
-        ),
-        (FlussDataType::TimestampLTz(_), Literal::TimestampLtz(value)) => Some(
-            i128::from(value.get_epoch_millisecond()) * 1_000_000
-                + i128::from(value.get_nano_of_millisecond()),
-        ),
-        _ => None,
+fn literal_mismatch() -> crate::error::Error {
+    IllegalArgument {
+        message: "predicate literal does not match its column type".into(),
     }
 }
 
 fn compare_scalar(
-    array: &ArrayRef,
+    column: &TypedColumn,
     function: LeafFunction,
     constant: ArrayRef,
+    data_type: &FlussDataType,
 ) -> Result<BooleanArray> {
-    let result = match array.data_type() {
-        ArrowDataType::Float32 => Some(compare_values(
-            array.as_primitive::<Float32Type>().iter(),
-            constant.as_primitive::<Float32Type>().value(0),
-            function,
-            |a, b| compare_floats(f64::from(a), f64::from(b)),
-        )),
-        ArrowDataType::Float64 => Some(compare_values(
-            array.as_primitive::<Float64Type>().iter(),
-            constant.as_primitive::<Float64Type>().value(0),
-            function,
-            compare_floats,
-        )),
-        ArrowDataType::Binary
-            if !matches!(function, LeafFunction::Equal | LeafFunction::NotEqual) =>
-        {
-            Some(compare_values(
-                array.as_binary::<i32>().iter(),
-                constant.as_binary::<i32>().value(0),
-                function,
-                compare_binary,
-            ))
-        }
-        ArrowDataType::FixedSizeBinary(_)
-            if !matches!(function, LeafFunction::Equal | LeafFunction::NotEqual) =>
-        {
-            Some(compare_values(
-                array.as_fixed_size_binary().iter(),
-                constant.as_fixed_size_binary().value(0),
-                function,
-                compare_binary,
-            ))
-        }
-        _ => None,
-    };
-    if let Some(result) = result {
-        return Ok(result);
+    let constant = TypedColumn::build(constant.as_ref(), data_type)?;
+    macro_rules! compare {
+        ($array:expr, $bound:expr, $cmp:expr) => {
+            compare_values($array.iter(), $bound.value(0), function, $cmp)
+        };
+        ($array:expr, $bound:expr) => {
+            compare!($array, $bound, |a, b| a.cmp(&b))
+        };
     }
-    let left: &dyn Array = array.as_ref();
-    let right = Scalar::new(constant);
-    let result = match function {
-        LeafFunction::Equal => eq(&left, &right),
-        LeafFunction::NotEqual => neq(&left, &right),
-        LeafFunction::LessThan => lt(&left, &right),
-        LeafFunction::LessOrEqual => lt_eq(&left, &right),
-        LeafFunction::GreaterThan => gt(&left, &right),
-        LeafFunction::GreaterOrEqual => gt_eq(&left, &right),
+    Ok(match (column, &constant) {
+        (TypedColumn::Boolean(a), TypedColumn::Boolean(b)) => compare!(a, b),
+        (TypedColumn::TinyInt(a), TypedColumn::TinyInt(b)) => compare!(a, b),
+        (TypedColumn::SmallInt(a), TypedColumn::SmallInt(b)) => compare!(a, b),
+        (TypedColumn::Int(a), TypedColumn::Int(b)) => compare!(a, b),
+        (TypedColumn::BigInt(a), TypedColumn::BigInt(b)) => compare!(a, b),
+        (TypedColumn::Date(a), TypedColumn::Date(b)) => compare!(a, b),
+        (TypedColumn::Float(a), TypedColumn::Float(b)) => {
+            compare!(a, b, |a, b| compare_floats(f64::from(a), f64::from(b)))
+        }
+        (TypedColumn::Double(a), TypedColumn::Double(b)) => compare!(a, b, compare_floats),
+        (TypedColumn::String(a), TypedColumn::String(b)) => compare!(a, b),
+        (TypedColumn::Binary(a), TypedColumn::Binary(b)) => compare!(a, b, compare_binary),
+        (TypedColumn::Bytes(a), TypedColumn::Bytes(b)) => compare!(a, b, compare_binary),
+        // Binding has already aligned the scale. Compare unscaled values rather
+        // than allocating a core Decimal/BigDecimal for every row.
+        (TypedColumn::Decimal(a, _), TypedColumn::Decimal(b, _)) => compare!(a, b),
+        _ => return Err(literal_mismatch()),
+    })
+}
+
+// Arrow seconds span a wider range than core timestamps. Classify only those
+// out-of-range rows before using the existing core timestamp accessors.
+fn timestamp_mask<T>(
+    array: &ArrayRef,
+    column: &TypedColumn,
+    read: impl Fn(&TypedColumn, usize) -> Result<T>,
+    matches: impl Fn(std::result::Result<T, Ordering>) -> bool,
+) -> Result<BooleanArray> {
+    let mut mask = BooleanBuilder::with_capacity(array.len());
+    for i in 0..array.len() {
+        if array.is_null(i) {
+            mask.append_value(false);
+            continue;
+        }
+        if let TypedColumn::Timestamp(TimestampColumn::Second(seconds))
+        | TypedColumn::TimestampLtz(TimestampColumn::Second(seconds)) = column
+        {
+            let value = seconds.value(i);
+            if value.checked_mul(1_000).is_none() {
+                mask.append_value(matches(Err(value.cmp(&0))));
+                continue;
+            }
+        }
+        mask.append_value(matches(Ok(read(column, i)?)));
+    }
+    Ok(mask.finish())
+}
+
+fn evaluate_value<T: Ord + Copy>(
+    value: T,
+    function: LeafFunction,
+    literals: &[Literal],
+    extract: impl Fn(&Literal) -> Result<T>,
+) -> Result<bool> {
+    match function {
+        LeafFunction::IsNull => Ok(false),
+        LeafFunction::IsNotNull => Ok(true),
+        LeafFunction::In | LeafFunction::NotIn => {
+            if function == LeafFunction::NotIn && literals.iter().any(Literal::is_null) {
+                return Ok(false);
+            }
+            let mut found = false;
+            for literal in literals.iter().filter(|literal| !literal.is_null()) {
+                found |= value == extract(literal)?;
+            }
+            Ok(found != (function == LeafFunction::NotIn))
+        }
+        LeafFunction::StartsWith | LeafFunction::EndsWith | LeafFunction::Contains => {
+            Err(literal_mismatch())
+        }
+        _ => Ok(matches_order(value.cmp(&extract(&literals[0])?), function)),
+    }
+}
+
+fn matches_order(ordering: Ordering, function: LeafFunction) -> bool {
+    match function {
+        LeafFunction::Equal => ordering.is_eq(),
+        LeafFunction::NotEqual => !ordering.is_eq(),
+        LeafFunction::LessThan => ordering.is_lt(),
+        LeafFunction::LessOrEqual => !ordering.is_gt(),
+        LeafFunction::GreaterThan => ordering.is_gt(),
+        LeafFunction::GreaterOrEqual => !ordering.is_lt(),
         _ => unreachable!("non-comparison leaf reached compare"),
-    }?;
-    Ok(null_as_false(&result))
+    }
 }
 
 fn compare_values<T: Copy>(
@@ -276,20 +348,7 @@ fn compare_values<T: Copy>(
     compare: impl Fn(T, T) -> Ordering,
 ) -> BooleanArray {
     values
-        .map(|value| {
-            value.is_some_and(|value| {
-                let ordering = compare(value, constant);
-                match function {
-                    LeafFunction::Equal => ordering.is_eq(),
-                    LeafFunction::NotEqual => !ordering.is_eq(),
-                    LeafFunction::LessThan => ordering.is_lt(),
-                    LeafFunction::LessOrEqual => !ordering.is_gt(),
-                    LeafFunction::GreaterThan => ordering.is_gt(),
-                    LeafFunction::GreaterOrEqual => !ordering.is_lt(),
-                    _ => unreachable!("non-comparison leaf reached compare"),
-                }
-            })
-        })
+        .map(|value| value.is_some_and(|value| matches_order(compare(value, constant), function)))
         .collect()
 }
 
@@ -338,10 +397,6 @@ fn matches_string(value: &str, expected: &str, function: LeafFunction) -> bool {
     }
 }
 
-fn null_as_false(mask: &BooleanArray) -> BooleanArray {
-    mask.iter().map(|value| value.unwrap_or(false)).collect()
-}
-
 /// Builds one scalar value, rather than repeating the literal for every input row.
 fn literal_array(literal: &Literal, data_type: &FlussDataType) -> Result<ArrayRef> {
     datum_array(&literal.to_datum(), data_type)
@@ -349,53 +404,11 @@ fn literal_array(literal: &Literal, data_type: &FlussDataType) -> Result<ArrayRe
 
 fn datum_array(datum: &Datum<'_>, data_type: &FlussDataType) -> Result<ArrayRef> {
     let arrow_type = to_arrow_type(data_type)?;
-    // Temporal bounds and partition values use the lossless path instead of
-    // the row writer's narrowing conversions.
+    // Temporal predicates use core values directly, not the row writer's
+    // narrowing conversions.
     let mut builder = make_builder(&arrow_type, 1);
     datum.append_to(builder.as_mut(), data_type, &arrow_type)?;
     Ok(builder.finish())
-}
-
-fn nanos_per_unit(unit: TimeUnit) -> i128 {
-    match unit {
-        TimeUnit::Second => 1_000_000_000,
-        TimeUnit::Millisecond => 1_000_000,
-        TimeUnit::Microsecond => 1_000,
-        TimeUnit::Nanosecond => 1,
-    }
-}
-
-fn compare_temporal(
-    array: &ArrayRef,
-    mut function: LeafFunction,
-    nanos: i128,
-    unit: TimeUnit,
-) -> Result<BooleanArray> {
-    let divisor = nanos_per_unit(unit);
-    // Floor, rather than truncate toward zero, so negative bounds obey the
-    // same rewrite. Only the scalar changes; the column stays in its native unit.
-    let bound = nanos.div_euclid(divisor);
-    if nanos.rem_euclid(divisor) != 0 {
-        function = match function {
-            LeafFunction::Equal => return constant_filter(array, false),
-            LeafFunction::NotEqual => return constant_filter(array, true),
-            LeafFunction::LessThan | LeafFunction::LessOrEqual => LeafFunction::LessOrEqual,
-            LeafFunction::GreaterThan | LeafFunction::GreaterOrEqual => LeafFunction::GreaterThan,
-            _ => unreachable!("non-comparison leaf reached temporal evaluator"),
-        };
-    }
-    let Some(constant) = temporal_scalar(bound, array.data_type())? else {
-        // An out-of-range signed integer is below the minimum iff it is negative.
-        let matches = match function {
-            LeafFunction::Equal => false,
-            LeafFunction::NotEqual => true,
-            LeafFunction::LessThan | LeafFunction::LessOrEqual => bound > 0,
-            LeafFunction::GreaterThan | LeafFunction::GreaterOrEqual => bound < 0,
-            _ => unreachable!("non-comparison leaf reached temporal evaluator"),
-        };
-        return constant_filter(array, matches);
-    };
-    compare_scalar(array, function, constant)
 }
 
 // Constant folding here is for a filter mask, not a nullable SQL expression.
@@ -478,7 +491,11 @@ impl PreparedPredicate {
                 data_type,
                 function,
                 set,
-            } => set.evaluate(predicate_column(batch, field_name, data_type)?, *function),
+            } => set.evaluate(
+                predicate_column(batch, field_name, data_type)?,
+                data_type,
+                *function,
+            ),
             Self::Compound { function, children } => combine_masks(
                 *function,
                 batch.num_rows(),
@@ -506,6 +523,9 @@ fn combine_masks(
 
 #[derive(Debug)]
 enum MembershipSet {
+    Timestamps(HashSet<TimestampNtz>),
+    TimestampsLtz(HashSet<TimestampLtz>),
+    Times(HashSet<i128>),
     Floats(HashSet<u64>),
     Rows {
         converter: RowConverter,
@@ -515,6 +535,25 @@ enum MembershipSet {
 
 impl MembershipSet {
     fn new(literals: &[Literal], data_type: &FlussDataType) -> Result<Self> {
+        macro_rules! core_set {
+            ($literal:ident, $variant:ident, $convert:expr) => {{
+                let values = literals
+                    .iter()
+                    .filter(|literal| !literal.is_null())
+                    .map(|literal| match literal {
+                        Literal::$literal(value) => Ok(($convert)(*value)),
+                        _ => Err(literal_mismatch()),
+                    })
+                    .collect::<Result<HashSet<_>>>()?;
+                return Ok(Self::$variant(values));
+            }};
+        }
+        match data_type {
+            FlussDataType::Timestamp(_) => core_set!(TimestampNtz, Timestamps, |v| v),
+            FlussDataType::TimestampLTz(_) => core_set!(TimestampLtz, TimestampsLtz, |v| v),
+            FlussDataType::Time(_) => core_set!(Time, Times, |v| i128::from(v) * 1_000_000),
+            _ => {}
+        }
         let arrow_type = to_arrow_type(data_type)?;
         if matches!(arrow_type, ArrowDataType::Float32 | ArrowDataType::Float64) {
             let mut values = HashSet::with_capacity(literals.len());
@@ -533,17 +572,41 @@ impl MembershipSet {
         let converter = RowConverter::new(vec![SortField::new(arrow_type)])?;
         let mut values = HashSet::with_capacity(literals.len());
         for literal in literals.iter().filter(|literal| !literal.is_null()) {
-            if let Some(scalar) = membership_scalar(literal, data_type)? {
-                let rows = converter.convert_columns(&[scalar])?;
-                values.insert(rows.row(0).as_ref().into());
-            }
+            let scalar = literal_array(literal, data_type)?;
+            let rows = converter.convert_columns(&[scalar])?;
+            values.insert(rows.row(0).as_ref().into());
         }
         Ok(Self::Rows { converter, values })
     }
 
-    fn evaluate(&self, array: &ArrayRef, function: LeafFunction) -> Result<BooleanArray> {
+    fn evaluate(
+        &self,
+        array: &ArrayRef,
+        data_type: &FlussDataType,
+        function: LeafFunction,
+    ) -> Result<BooleanArray> {
         let negate = function == LeafFunction::NotIn;
         let (converter, values) = match self {
+            Self::Timestamps(values) => {
+                let column = TypedColumn::build(array.as_ref(), data_type)?;
+                return timestamp_mask(array, &column, TypedColumn::get_timestamp_ntz, |value| {
+                    value.is_ok_and(|value| values.contains(&value)) != negate
+                });
+            }
+            Self::TimestampsLtz(values) => {
+                let column = TypedColumn::build(array.as_ref(), data_type)?;
+                return timestamp_mask(array, &column, TypedColumn::get_timestamp_ltz, |value| {
+                    value.is_ok_and(|value| values.contains(&value)) != negate
+                });
+            }
+            Self::Times(values) => {
+                let TypedColumn::Time(time) = TypedColumn::build(array.as_ref(), data_type)? else {
+                    return Err(literal_mismatch());
+                };
+                return Ok((0..array.len())
+                    .map(|i| array.is_valid(i) && (values.contains(&time.get_nanos(i)) != negate))
+                    .collect());
+            }
             Self::Floats(values) => {
                 // Canonicalize only NaNs; signed-zero keys remain distinct.
                 // Probe fixed-size keys without allocating per row or copying a batch.
@@ -582,39 +645,6 @@ impl MembershipSet {
     }
 }
 
-fn membership_scalar(literal: &Literal, data_type: &FlussDataType) -> Result<Option<ArrayRef>> {
-    let arrow_type = to_arrow_type(data_type)?;
-    if let Some(nanos) = temporal_nanos(literal, data_type) {
-        let unit = match arrow_type {
-            ArrowDataType::Timestamp(unit, _)
-            | ArrowDataType::Time32(unit)
-            | ArrowDataType::Time64(unit) => unit,
-            _ => unreachable!("temporal literal without a temporal Arrow type"),
-        };
-        let divisor = nanos_per_unit(unit);
-        if nanos % divisor != 0 {
-            return Ok(None);
-        }
-        return temporal_scalar(nanos / divisor, &arrow_type);
-    }
-    literal_array(literal, data_type).map(Some)
-}
-
-fn temporal_scalar(value: i128, arrow_type: &ArrowDataType) -> Result<Option<ArrayRef>> {
-    let scalar = if matches!(arrow_type, ArrowDataType::Time32(_)) {
-        let Ok(value) = i32::try_from(value) else {
-            return Ok(None);
-        };
-        cast(&Int32Array::from(vec![value]), arrow_type)?
-    } else {
-        let Ok(value) = i64::try_from(value) else {
-            return Ok(None);
-        };
-        cast(&Int64Array::from(vec![value]), arrow_type)?
-    };
-    Ok(Some(scalar))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,8 +653,10 @@ mod tests {
     use crate::predicate::{Literal, Predicate, col, to_pb_predicate};
     use crate::row::{TimestampLtz, TimestampNtz};
     use arrow::array::{
-        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int32Array, StringArray, new_empty_array,
+        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray,
+        new_empty_array,
     };
+    use arrow::compute::cast;
     use arrow::compute::kernels::boolean::not;
     use std::sync::Arc;
 
@@ -708,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_evaluation_rejects_lossy_values_and_preserves_temporal_bounds() {
+    fn partition_evaluation_rejects_invalid_values_and_preserves_temporal_precision() {
         for (data_type, value) in [
             (DataTypes::tinyint(), "128"),
             (DataTypes::boolean(), "invalid"),
@@ -718,39 +750,49 @@ mod tests {
             (DataTypes::date(), "2026-02-30"),
             (DataTypes::time(), "24-00-00_000"),
             (DataTypes::timestamp(), "1970-01-01-00-00-00_1234567890"),
-            (
-                DataTypes::timestamp_with_precision(0),
-                "1970-01-01-00-00-00_0019",
-            ),
-            (DataTypes::timestamp_with_precision(9), "3000-01-01"),
         ] {
             let row_type = RowType::new(vec![DataField::new("p", data_type, None)]);
             let bound = BoundPredicate::bind(Some(&col("p").is_not_null()), &row_type).unwrap();
             assert!(bound.evaluate_partition_value(value).is_err(), "{value}");
         }
         for precision in [0, 3, 6, 9] {
-            let row_type = RowType::new(vec![DataField::new(
-                "p",
-                DataTypes::timestamp_with_precision(precision),
-                None,
-            )]);
-            let bound = BoundPredicate::bind(
-                Some(&col("p").lt(TimestampNtz::from_millis_nanos(1, 900_000).unwrap())),
-                &row_type,
-            )
-            .unwrap();
-            assert!(bound.evaluate_partition_value("1970-01-01").unwrap());
-            if precision > 0 {
-                assert!(
-                    bound
-                        .evaluate_partition_value("1970-01-01-00-00-00_001")
-                        .unwrap()
-                );
-                assert!(
-                    !bound
-                        .evaluate_partition_value("1970-01-01-00-00-00_002")
-                        .unwrap()
-                );
+            for (data_type, literal) in [
+                (
+                    DataTypes::timestamp_with_precision(precision),
+                    Literal::TimestampNtz(TimestampNtz::from_millis_nanos(1, 900_000).unwrap()),
+                ),
+                (
+                    DataTypes::timestamp_ltz_with_precision(precision),
+                    Literal::TimestampLtz(TimestampLtz::from_millis_nanos(1, 900_000).unwrap()),
+                ),
+            ] {
+                let row_type = RowType::new(vec![DataField::new("p", data_type, None)]);
+                for (predicate, expected) in [
+                    (col("p").lt(literal.clone()), [true, false, false, false]),
+                    (col("p").eq(literal.clone()), [false, true, false, false]),
+                    (
+                        col("p").is_in([literal.clone()]),
+                        [false, true, false, false],
+                    ),
+                    (col("p").not_in([literal]), [true, false, true, true]),
+                ] {
+                    let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
+                    for (value, expected) in [
+                        "1970-01-01-00-00-00_001",
+                        "1970-01-01-00-00-00_0019",
+                        "1970-01-01-00-00-00_002",
+                        "3000-01-01",
+                    ]
+                    .into_iter()
+                    .zip(expected)
+                    {
+                        assert_eq!(
+                            bound.evaluate_partition_value(value).unwrap(),
+                            expected,
+                            "{bound:?}: {value}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1192,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn core_converted_scalars_support_arrow_comparison() {
+    fn core_converted_scalars_preserve_comparison_semantics() {
         for (data_type, literal) in [
             (DataTypes::boolean(), Literal::Bool(true)),
             (DataTypes::int(), Literal::Int32(-3)),
@@ -1292,7 +1334,7 @@ mod tests {
                     Arc::new(Int64Array::from(values.clone()))
                 };
                 let array = cast(integers.as_ref(), &arrow_type).unwrap();
-                // Compare in the exact nanosecond domain, independently of the rewrite.
+                // Compare in the exact nanosecond domain, independently of the core timestamp accessors.
                 let orderings = values
                     .iter()
                     .map(|v| v.map(|v| (i128::from(v) * tick_nanos).cmp(&literal_nanos)))
@@ -1303,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn temporal_membership_ignores_unrepresentable_literals() {
+    fn temporal_membership_keeps_exact_literals() {
         let data_type = DataTypes::timestamp_with_precision(0);
         let row_type = RowType::new(vec![DataField::new("c", data_type.clone(), None)]);
         let array = cast(

@@ -187,7 +187,7 @@ fn bind_literal(field: &DataField, literal: &Literal) -> Result<Literal> {
     }
 
     // Numeric bounds are normalized before this point. Temporal bounds keep
-    // their precision until evaluation against the Arrow physical unit.
+    // their precision for comparison using the core timestamp types.
     Ok(match (field.data_type(), literal) {
         (DataType::Boolean(_), Literal::Bool(_))
         | (DataType::Char(_) | DataType::String(_), Literal::String(_))
