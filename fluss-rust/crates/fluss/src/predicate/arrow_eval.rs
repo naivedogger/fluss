@@ -17,19 +17,17 @@
 
 //! Exact Arrow evaluation of schema-bound core predicates.
 
-use super::coercion::validate_leaf_shape;
+use super::coercion::{validate_leaf, validate_leaf_shape};
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
-use crate::metadata::DataType as FlussDataType;
+use crate::metadata::{DataField, DataType as FlussDataType};
 use crate::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use crate::record::to_arrow_type;
 use crate::row::column_vector::{TimestampColumn, TypedColumn};
 use crate::row::{Datum, TimestampLtz, TimestampNtz};
 use crate::util::partition::parse_value_of_type;
 use crate::util::{canonicalize_nan, compare_floats};
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, StringArray, make_builder,
-};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, make_builder};
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, or};
 use arrow::datatypes::{DataType as ArrowDataType, Float32Type, Float64Type};
 use arrow::record_batch::RecordBatch;
@@ -38,17 +36,16 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 impl BoundPredicate {
-    /// Prepares an owned, reusable evaluator, building membership sets once.
+    /// Prepares an owned evaluator, converting constants and building membership sets once.
     ///
-    /// Rejects malformed leaf shapes and errors while preparing membership sets.
-    /// Other literal conversions remain evaluation-time checks. The evaluator is
+    /// Rejects malformed leaf shapes and errors while preparing constants. The evaluator is
     /// immutable and can be shared across batch readers; its buffers
     /// are released when it is dropped. Batch column names and types are checked
     /// on each evaluation. Prefer this over `evaluate_batch` for a stream of batches.
     #[doc(hidden)]
     pub fn into_evaluator(self) -> Result<PredicateEvaluator> {
         Ok(PredicateEvaluator {
-            root: PreparedPredicate::new(self)?,
+            root: PreparedPredicate::new(&self)?,
         })
     }
 
@@ -108,48 +105,11 @@ impl BoundPredicate {
     ///
     /// Returns a non-null filter mask. Except for `IS NULL`, null input values
     /// do not match; `NOT IN` with a null literal matches no rows.
-    /// Membership sets are built per call; use [`Self::into_evaluator`]
-    /// to reuse them across batches.
+    /// Prepares a temporary evaluator per call; use [`Self::into_evaluator`]
+    /// to reuse converted constants and membership sets across batches.
     #[doc(hidden)]
     pub fn evaluate_batch(&self, batch: &RecordBatch) -> Result<BooleanArray> {
-        match self {
-            Self::AlwaysTrue => Ok(BooleanArray::from(vec![true; batch.num_rows()])),
-            Self::Compound { function, children } => combine_masks(
-                *function,
-                batch.num_rows(),
-                children.iter().map(|child| child.evaluate_batch(batch)),
-            ),
-            Self::Leaf {
-                field_name,
-                data_type,
-                function,
-                literals,
-                ..
-            } => evaluate_leaf(batch, field_name, data_type, *function, literals),
-        }
-    }
-}
-
-fn evaluate_leaf(
-    batch: &RecordBatch,
-    field_name: &str,
-    data_type: &FlussDataType,
-    function: LeafFunction,
-    literals: &[Literal],
-) -> Result<BooleanArray> {
-    validate_leaf_shape(function, field_name, literals)?;
-    let array = predicate_column(batch, field_name, data_type)?;
-
-    match function {
-        LeafFunction::IsNull => is_null(array.as_ref()).map_err(Into::into),
-        LeafFunction::IsNotNull => is_not_null(array.as_ref()).map_err(Into::into),
-        LeafFunction::In | LeafFunction::NotIn => {
-            evaluate_membership(array, data_type, function, literals)
-        }
-        LeafFunction::StartsWith | LeafFunction::EndsWith | LeafFunction::Contains => {
-            evaluate_string_function(array, function, &literals[0])
-        }
-        _ => compare(array, function, &literals[0], data_type),
+        PreparedPredicate::new(self)?.evaluate_batch(batch)
     }
 }
 
@@ -176,30 +136,15 @@ fn predicate_column<'a>(
     Ok(array)
 }
 
-fn evaluate_membership(
-    array: &ArrayRef,
-    data_type: &FlussDataType,
-    function: LeafFunction,
-    literals: &[Literal],
-) -> Result<BooleanArray> {
-    if function == LeafFunction::NotIn && literals.iter().any(Literal::is_null) {
-        return constant_filter(array, false);
-    }
-    if literals.is_empty() {
-        return constant_filter(array, function == LeafFunction::NotIn);
-    }
-    MembershipSet::new(literals, data_type)?.evaluate(array, data_type, function)
-}
-
 fn compare(
     array: &ArrayRef,
     function: LeafFunction,
-    literal: &Literal,
+    operand: &Operand,
     data_type: &FlussDataType,
 ) -> Result<BooleanArray> {
     let column = TypedColumn::build(array.as_ref(), data_type)?;
-    match (&column, literal) {
-        (TypedColumn::Timestamp(_), Literal::TimestampNtz(bound)) => {
+    match (&column, operand) {
+        (TypedColumn::Timestamp(_), Operand::Temporal(Literal::TimestampNtz(bound))) => {
             timestamp_mask(array, &column, TypedColumn::get_timestamp_ntz, |value| {
                 matches_order(
                     value.map_or_else(|side| side, |value| value.cmp(bound)),
@@ -207,7 +152,7 @@ fn compare(
                 )
             })
         }
-        (TypedColumn::TimestampLtz(_), Literal::TimestampLtz(bound)) => {
+        (TypedColumn::TimestampLtz(_), Operand::Temporal(Literal::TimestampLtz(bound))) => {
             timestamp_mask(array, &column, TypedColumn::get_timestamp_ltz, |value| {
                 matches_order(
                     value.map_or_else(|side| side, |value| value.cmp(bound)),
@@ -215,21 +160,14 @@ fn compare(
                 )
             })
         }
-        (TypedColumn::Time(time), Literal::Time(bound)) => Ok(compare_values(
+        (TypedColumn::Time(time), Operand::Temporal(Literal::Time(bound))) => Ok(compare_values(
             (0..array.len()).map(|i| array.is_valid(i).then(|| time.get_nanos(i))),
             i128::from(*bound) * 1_000_000,
             function,
             |a, b| a.cmp(&b),
         )),
-        (TypedColumn::Time(_) | TypedColumn::Timestamp(_) | TypedColumn::TimestampLtz(_), _) => {
-            Err(literal_mismatch())
-        }
-        _ => compare_scalar(
-            &column,
-            function,
-            literal_array(literal, data_type)?,
-            data_type,
-        ),
+        (_, Operand::Scalar(constant)) => compare_scalar(&column, function, constant),
+        _ => Err(literal_mismatch()),
     }
 }
 
@@ -242,10 +180,8 @@ fn literal_mismatch() -> crate::error::Error {
 fn compare_scalar(
     column: &TypedColumn,
     function: LeafFunction,
-    constant: ArrayRef,
-    data_type: &FlussDataType,
+    constant: &TypedColumn,
 ) -> Result<BooleanArray> {
-    let constant = TypedColumn::build(constant.as_ref(), data_type)?;
     macro_rules! compare {
         ($array:expr, $bound:expr, $cmp:expr) => {
             compare_values($array.iter(), $bound.value(0), function, $cmp)
@@ -254,7 +190,7 @@ fn compare_scalar(
             compare!($array, $bound, |a, b| a.cmp(&b))
         };
     }
-    Ok(match (column, &constant) {
+    Ok(match (column, constant) {
         (TypedColumn::Boolean(a), TypedColumn::Boolean(b)) => compare!(a, b),
         (TypedColumn::TinyInt(a), TypedColumn::TinyInt(b)) => compare!(a, b),
         (TypedColumn::SmallInt(a), TypedColumn::SmallInt(b)) => compare!(a, b),
@@ -265,7 +201,13 @@ fn compare_scalar(
             compare!(a, b, |a, b| compare_floats(f64::from(a), f64::from(b)))
         }
         (TypedColumn::Double(a), TypedColumn::Double(b)) => compare!(a, b, compare_floats),
-        (TypedColumn::String(a), TypedColumn::String(b)) => compare!(a, b),
+        (TypedColumn::String(a), TypedColumn::String(b)) => match function {
+            LeafFunction::StartsWith | LeafFunction::EndsWith | LeafFunction::Contains => a
+                .iter()
+                .map(|value| value.is_some_and(|value| matches_string(value, b.value(0), function)))
+                .collect(),
+            _ => compare!(a, b),
+        },
         (TypedColumn::Binary(a), TypedColumn::Binary(b)) => compare!(a, b, compare_binary),
         (TypedColumn::Bytes(a), TypedColumn::Bytes(b)) => compare!(a, b, compare_binary),
         // Binding has already aligned the scale. Compare unscaled values rather
@@ -359,35 +301,6 @@ fn compare_binary(left: &[u8], right: &[u8]) -> Ordering {
         .cmp(right.iter().map(|b| *b as i8))
 }
 
-fn evaluate_string_function(
-    array: &ArrayRef,
-    function: LeafFunction,
-    literal: &Literal,
-) -> Result<BooleanArray> {
-    let Literal::String(expected) = literal else {
-        return Err(IllegalArgument {
-            message: "string predicate was not bound to a string literal".to_string(),
-        });
-    };
-    let strings = array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| IllegalArgument {
-            message: format!(
-                "string predicate cannot be evaluated against Arrow type {}",
-                array.data_type()
-            ),
-        })?;
-    Ok(strings
-        .iter()
-        .map(|value| {
-            value
-                .map(|value| matches_string(value, expected, function))
-                .unwrap_or(false)
-        })
-        .collect())
-}
-
 fn matches_string(value: &str, expected: &str, function: LeafFunction) -> bool {
     match function {
         LeafFunction::StartsWith => value.starts_with(expected),
@@ -420,7 +333,7 @@ fn constant_filter(array: &ArrayRef, matches: bool) -> Result<BooleanArray> {
     }
 }
 
-/// An immutable evaluator with membership sets prepared for repeated batches.
+/// An immutable evaluator with constants and membership sets prepared for repeated batches.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct PredicateEvaluator {
@@ -437,12 +350,12 @@ impl PredicateEvaluator {
 
 #[derive(Debug)]
 enum PreparedPredicate {
-    Direct(BoundPredicate),
-    Membership {
+    AlwaysTrue,
+    Leaf {
         field_name: String,
         data_type: FlussDataType,
         function: LeafFunction,
-        set: MembershipSet,
+        operand: Operand,
     },
     Compound {
         function: CompoundFunction,
@@ -451,56 +364,109 @@ enum PreparedPredicate {
 }
 
 impl PreparedPredicate {
-    fn new(predicate: BoundPredicate) -> Result<Self> {
-        match predicate {
-            BoundPredicate::Compound { function, children } => Ok(Self::Compound {
-                function,
-                children: children.into_iter().map(Self::new).collect::<Result<_>>()?,
-            }),
+    fn new(predicate: &BoundPredicate) -> Result<Self> {
+        Ok(match predicate {
+            BoundPredicate::AlwaysTrue => Self::AlwaysTrue,
+            BoundPredicate::Compound { function, children } => Self::Compound {
+                function: *function,
+                children: children.iter().map(Self::new).collect::<Result<_>>()?,
+            },
             BoundPredicate::Leaf {
-                ref field_name,
-                ref data_type,
+                field_name,
+                data_type,
                 function,
-                ref literals,
+                literals,
                 ..
             } => {
-                validate_leaf_shape(function, field_name, literals)?;
-                if matches!(function, LeafFunction::In | LeafFunction::NotIn)
-                    && !literals.is_empty()
-                    && !(function == LeafFunction::NotIn && literals.iter().any(Literal::is_null))
-                {
-                    Ok(Self::Membership {
-                        field_name: field_name.clone(),
-                        data_type: data_type.clone(),
-                        function,
-                        set: MembershipSet::new(literals, data_type)?,
-                    })
-                } else {
-                    Ok(Self::Direct(predicate))
+                validate_leaf(
+                    *function,
+                    &DataField::new(field_name, data_type.clone(), None),
+                    literals,
+                )?;
+                Self::Leaf {
+                    field_name: field_name.clone(),
+                    data_type: data_type.clone(),
+                    function: *function,
+                    operand: Operand::new(*function, literals, data_type)?,
                 }
             }
-            other => Ok(Self::Direct(other)),
-        }
+        })
     }
 
     fn evaluate_batch(&self, batch: &RecordBatch) -> Result<BooleanArray> {
         match self {
-            Self::Direct(predicate) => predicate.evaluate_batch(batch),
-            Self::Membership {
+            Self::AlwaysTrue => Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+            Self::Leaf {
                 field_name,
                 data_type,
                 function,
-                set,
-            } => set.evaluate(
-                predicate_column(batch, field_name, data_type)?,
-                data_type,
-                *function,
-            ),
+                operand,
+            } => {
+                let array = predicate_column(batch, field_name, data_type)?;
+                match function {
+                    LeafFunction::IsNull => is_null(array.as_ref()).map_err(Into::into),
+                    LeafFunction::IsNotNull => is_not_null(array.as_ref()).map_err(Into::into),
+                    _ => match operand {
+                        Operand::Constant(matches) => constant_filter(array, *matches),
+                        Operand::Membership(set) => set.evaluate(array, data_type, *function),
+                        _ => compare(array, *function, operand, data_type),
+                    },
+                }
+            }
             Self::Compound { function, children } => combine_masks(
                 *function,
                 batch.num_rows(),
                 children.iter().map(|child| child.evaluate_batch(batch)),
             ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Operand {
+    None,
+    Constant(bool),
+    Temporal(Literal),
+    Scalar(Box<TypedColumn>),
+    Membership(MembershipSet),
+}
+
+impl Operand {
+    fn new(
+        function: LeafFunction,
+        literals: &[Literal],
+        data_type: &FlussDataType,
+    ) -> Result<Self> {
+        match function {
+            LeafFunction::IsNull | LeafFunction::IsNotNull => return Ok(Self::None),
+            LeafFunction::In | LeafFunction::NotIn => {
+                return Ok(if literals.is_empty() {
+                    Self::Constant(function == LeafFunction::NotIn)
+                } else if function == LeafFunction::NotIn && literals.iter().any(Literal::is_null) {
+                    Self::Constant(false)
+                } else {
+                    Self::Membership(MembershipSet::new(literals, data_type)?)
+                });
+            }
+            _ => {}
+        }
+        let literal = &literals[0];
+        match (data_type, literal) {
+            (FlussDataType::Time(_), Literal::Time(_))
+            | (FlussDataType::Timestamp(_), Literal::TimestampNtz(_))
+            | (FlussDataType::TimestampLTz(_), Literal::TimestampLtz(_)) => {
+                Ok(Self::Temporal(literal.clone()))
+            }
+            (
+                FlussDataType::Time(_)
+                | FlussDataType::Timestamp(_)
+                | FlussDataType::TimestampLTz(_),
+                _,
+            ) => Err(literal_mismatch()),
+            _ => Ok(Self::Scalar(Box::new(TypedColumn::build(
+                literal_array(literal, data_type)?.as_ref(),
+                data_type,
+            )?))),
         }
     }
 }
@@ -903,7 +869,12 @@ mod tests {
     ) -> Result<BooleanArray> {
         let mut result = BooleanArray::from(vec![false; len]);
         for literal in literals.iter().filter(|literal| !literal.is_null()) {
-            let mask = compare(array, LeafFunction::Equal, literal, data_type)?;
+            let operand = Operand::new(
+                LeafFunction::Equal,
+                std::slice::from_ref(literal),
+                data_type,
+            )?;
+            let mask = compare(array, LeafFunction::Equal, &operand, data_type)?;
             result = or(&result, &mask)?;
         }
 
@@ -993,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn manually_constructed_leaves_reject_invalid_literal_counts() {
+    fn manually_constructed_leaves_reject_invalid_shapes_and_types() {
         let batch = RecordBatch::try_from_iter([(
             "c",
             Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
@@ -1041,6 +1012,11 @@ mod tests {
                     .is_err()
             );
         }
+        let mut predicate = leaf(LeafFunction::StartsWith, vec![Literal::Int32(1)]);
+        if let BoundPredicate::Leaf { data_type, .. } = &mut predicate {
+            *data_type = DataTypes::int();
+        }
+        assert!(predicate.into_evaluator().is_err());
     }
 
     fn assert_membership_strategies(
@@ -1171,17 +1147,35 @@ mod tests {
     }
 
     #[test]
-    fn prepared_compound_reuses_membership_and_validates_each_batch() {
+    fn prepared_evaluator_reuses_constants_and_validates_each_batch() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PredicateEvaluator>();
-        let predicate = col("id").is_in(0..128).and(col("name").is_not_null());
+        let predicate = col("id")
+            .is_in(0..128)
+            .and(col("id").ge(1))
+            .and(col("name").starts_with("alpha"))
+            .and(col("name").is_not_null());
         let bound = BoundPredicate::bind(Some(&predicate), &row_type()).unwrap();
         let evaluator = bound.clone().into_evaluator().unwrap();
-        for input in [batch(), batch().slice(1, 2), batch().slice(0, 0)] {
-            assert_eq!(
-                evaluator.evaluate_batch(&input).unwrap(),
-                bound.evaluate_batch(&input).unwrap()
-            );
+        for (input, expected) in [
+            (batch(), vec![true, false, true]),
+            (batch().slice(1, 2), vec![false, true]),
+            (batch().slice(0, 0), vec![]),
+            (
+                RecordBatch::try_from_iter([
+                    ("id", Arc::new(Int32Array::from(vec![0, 2, 3])) as ArrayRef),
+                    (
+                        "name",
+                        Arc::new(StringArray::from(vec!["alpha", "beta", "alpha"])) as ArrayRef,
+                    ),
+                ])
+                .unwrap(),
+                vec![false, false, true],
+            ),
+        ] {
+            let expected = BooleanArray::from(expected);
+            assert_eq!(evaluator.evaluate_batch(&input).unwrap(), expected);
+            assert_eq!(bound.evaluate_batch(&input).unwrap(), expected);
         }
         let missing = RecordBatch::try_from_iter([("name", batch().column(1).clone())]).unwrap();
         let wrong = RecordBatch::try_from_iter([
@@ -1189,9 +1183,18 @@ mod tests {
             ("name", Arc::new(StringArray::from(vec!["a"])) as ArrayRef),
         ])
         .unwrap();
-        for invalid in [missing, wrong] {
-            assert!(bound.evaluate_batch(&invalid).is_err());
-            assert!(evaluator.evaluate_batch(&invalid).is_err());
+        // Constant folding must not bypass validation of the referenced column.
+        for predicate in [
+            predicate,
+            col("id").is_in(Vec::<i32>::new()),
+            col("id").not_in([Literal::Null]),
+        ] {
+            let bound = BoundPredicate::bind(Some(&predicate), &row_type()).unwrap();
+            let evaluator = bound.clone().into_evaluator().unwrap();
+            for invalid in [&missing, &wrong] {
+                assert!(bound.evaluate_batch(invalid).is_err());
+                assert!(evaluator.evaluate_batch(invalid).is_err());
+            }
         }
     }
 
@@ -1215,22 +1218,22 @@ mod tests {
         )])
         .unwrap();
         assert!(bound.evaluate_batch(&batch).is_err());
+        assert!(bound.into_evaluator().is_err());
     }
 
     #[test]
     fn scalar_comparisons_preserve_nulls_and_operators() {
-        let array: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(3)]));
-        for (function, expected) in [
-            (LeafFunction::Equal, [false, false, true, false]),
-            (LeafFunction::NotEqual, [true, false, false, true]),
-            (LeafFunction::LessThan, [true, false, false, false]),
-            (LeafFunction::LessOrEqual, [true, false, true, false]),
-            (LeafFunction::GreaterThan, [false, false, false, true]),
-            (LeafFunction::GreaterOrEqual, [false, false, true, true]),
-        ] {
-            let mask = compare(&array, function, &Literal::Int32(2), &DataTypes::int()).unwrap();
-            assert_eq!(mask.iter().collect::<Vec<_>>(), expected.map(Some));
-        }
+        assert_comparisons(
+            DataTypes::int(),
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(3)])),
+            Literal::Int32(2),
+            vec![
+                Some(Ordering::Less),
+                None,
+                Some(Ordering::Equal),
+                Some(Ordering::Greater),
+            ],
+        );
     }
 
     #[test]
@@ -1251,21 +1254,11 @@ mod tests {
             assert_eq!(scalar.data_type(), &to_arrow_type(&data_type).unwrap());
             let indices = arrow::array::UInt32Array::from(vec![Some(0), None, Some(0)]);
             let array = arrow::compute::take(scalar.as_ref(), &indices, None).unwrap();
-            let mask = compare(&array, LeafFunction::Equal, &literal, &data_type).unwrap();
-            assert_eq!(
-                mask.iter().collect::<Vec<_>>(),
-                [Some(true), Some(false), Some(true)]
-            );
-            assert_eq!(
-                compare(
-                    &array.slice(0, 0),
-                    LeafFunction::Equal,
-                    &literal,
-                    &data_type
-                )
-                .unwrap()
-                .len(),
-                0
+            assert_comparisons(
+                data_type,
+                array,
+                literal,
+                vec![Some(Ordering::Equal), None, Some(Ordering::Equal)],
             );
         }
     }
