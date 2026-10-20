@@ -377,6 +377,70 @@ impl ColumnRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::{DataField, DataType, RowType};
+    use arrow::array::{Array, ArrayRef};
+    use arrow::record_batch::RecordBatch;
+    use std::cmp::Ordering;
+
+    pub(super) fn assert_comparisons(
+        data_type: DataType,
+        array: ArrayRef,
+        literal: Literal,
+        orderings: Vec<Option<Ordering>>,
+    ) {
+        let row_type = RowType::new(vec![DataField::with_field_id("c", data_type, None, 7)]);
+        let batch = RecordBatch::try_from_iter([("c", array)]).unwrap();
+        for function in [
+            LeafFunction::Equal,
+            LeafFunction::NotEqual,
+            LeafFunction::LessThan,
+            LeafFunction::LessOrEqual,
+            LeafFunction::GreaterThan,
+            LeafFunction::GreaterOrEqual,
+            LeafFunction::In,
+            LeafFunction::NotIn,
+        ] {
+            let predicate = Predicate::Leaf {
+                field: "c".into(),
+                function,
+                literals: vec![literal.clone()],
+            };
+            let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
+            let actual = bound.evaluate_batch(&batch).unwrap();
+            let expected: Vec<_> = orderings
+                .iter()
+                .map(|ordering| {
+                    ordering.is_some_and(|ordering| match function {
+                        LeafFunction::Equal | LeafFunction::In => ordering == Ordering::Equal,
+                        LeafFunction::NotEqual | LeafFunction::NotIn => ordering != Ordering::Equal,
+                        LeafFunction::LessThan => ordering == Ordering::Less,
+                        LeafFunction::LessOrEqual => ordering != Ordering::Greater,
+                        LeafFunction::GreaterThan => ordering == Ordering::Greater,
+                        LeafFunction::GreaterOrEqual => ordering != Ordering::Less,
+                        _ => unreachable!(),
+                    })
+                })
+                .collect();
+            assert_eq!(
+                actual.values().iter().collect::<Vec<_>>(),
+                expected,
+                "{predicate:?}, {row_type:?}"
+            );
+            let evaluator = bound.clone().into_evaluator().unwrap();
+            assert_eq!(evaluator.evaluate_batch(&batch).unwrap(), actual);
+            assert_eq!(
+                evaluator.evaluate_batch(&batch.slice(0, 0)).unwrap().len(),
+                0
+            );
+            assert_eq!(actual.null_count(), 0);
+            assert_eq!(bound.evaluate_batch(&batch.slice(0, 0)).unwrap().len(), 0);
+            if let Some(pushdown) = bound.to_pushdown_predicate() {
+                to_pb_predicate(&pushdown, &row_type).unwrap();
+                let rebound = BoundPredicate::bind(Some(&pushdown), &row_type).unwrap();
+                assert_eq!(rebound.evaluate_batch(&batch).unwrap(), actual);
+            }
+        }
+    }
 
     fn leaf(field: &str, function: LeafFunction, literals: Vec<Literal>) -> Predicate {
         Predicate::Leaf {

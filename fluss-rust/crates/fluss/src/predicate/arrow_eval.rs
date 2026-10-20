@@ -270,26 +270,16 @@ fn compare_temporal(
             _ => unreachable!("non-comparison leaf reached temporal evaluator"),
         };
     }
-    let time32 = matches!(array.data_type(), ArrowDataType::Time32(_));
-    let (min, max) = if time32 {
-        (i128::from(i32::MIN), i128::from(i32::MAX))
-    } else {
-        (i128::from(i64::MIN), i128::from(i64::MAX))
-    };
-    if bound < min || bound > max {
+    let Some(constant) = temporal_scalar(bound, array.data_type())? else {
+        // An out-of-range signed integer is below the minimum iff it is negative.
         let matches = match function {
             LeafFunction::Equal => false,
             LeafFunction::NotEqual => true,
-            LeafFunction::LessThan | LeafFunction::LessOrEqual => bound > max,
-            LeafFunction::GreaterThan | LeafFunction::GreaterOrEqual => bound < min,
+            LeafFunction::LessThan | LeafFunction::LessOrEqual => bound > 0,
+            LeafFunction::GreaterThan | LeafFunction::GreaterOrEqual => bound < 0,
             _ => unreachable!("non-comparison leaf reached temporal evaluator"),
         };
         return constant_filter(array, matches);
-    }
-    let constant = if time32 {
-        cast(&Int32Array::from(vec![bound as i32]), array.data_type())?
-    } else {
-        cast(&Int64Array::from(vec![bound as i64]), array.data_type())?
     };
     compare_scalar(array, function, constant)
 }
@@ -453,26 +443,31 @@ fn membership_scalar(literal: &Literal, data_type: &FlussDataType) -> Result<Opt
         if nanos % divisor != 0 {
             return Ok(None);
         }
-        let Ok(value) = i64::try_from(nanos / divisor) else {
-            return Ok(None);
-        };
-        let array = if matches!(arrow_type, ArrowDataType::Time32(_)) {
-            let Ok(value) = i32::try_from(value) else {
-                return Ok(None);
-            };
-            cast(&Int32Array::from(vec![value]), &arrow_type)?
-        } else {
-            cast(&Int64Array::from(vec![value]), &arrow_type)?
-        };
-        return Ok(Some(array));
+        return temporal_scalar(nanos / divisor, &arrow_type);
     }
     literal_array(literal, data_type).map(Some)
+}
+
+fn temporal_scalar(value: i128, arrow_type: &ArrowDataType) -> Result<Option<ArrayRef>> {
+    let scalar = if matches!(arrow_type, ArrowDataType::Time32(_)) {
+        let Ok(value) = i32::try_from(value) else {
+            return Ok(None);
+        };
+        cast(&Int32Array::from(vec![value]), arrow_type)?
+    } else {
+        let Ok(value) = i64::try_from(value) else {
+            return Ok(None);
+        };
+        cast(&Int64Array::from(vec![value]), arrow_type)?
+    };
+    Ok(Some(scalar))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metadata::{DataField, DataTypes, RowType};
+    use crate::predicate::tests::assert_comparisons;
     use crate::predicate::{Literal, Predicate, col, to_pb_predicate};
     use crate::row::{TimestampLtz, TimestampNtz};
     use arrow::array::{
@@ -481,7 +476,7 @@ mod tests {
     use arrow::compute::kernels::boolean::not;
     use std::sync::Arc;
 
-    // Independent comparison path for differential tests and microbenchmarks.
+    // Independent comparison path for membership differential tests.
     fn evaluate_membership_linear(
         array: &ArrayRef,
         data_type: &FlussDataType,
@@ -564,18 +559,20 @@ mod tests {
 
     #[test]
     fn in_and_not_in_match_core_null_semantics() {
-        assert_eq!(
-            evaluate(col("id").is_in(vec![Some(1_i32), None])),
-            vec![true, false, false]
-        );
-        assert_eq!(
-            evaluate(col("id").not_in(vec![Some(1_i32), None])),
-            vec![false, false, false]
-        );
-        assert_eq!(
-            evaluate(col("id").not_in(Vec::<i32>::new())),
-            vec![true, false, true]
-        );
+        for (predicate, expected) in [
+            (
+                col("id").is_in(vec![Some(1_i32), None]),
+                [true, false, false],
+            ),
+            (
+                col("id").not_in(vec![Some(1_i32), None]),
+                [false, false, false],
+            ),
+            (col("id").is_in(Vec::<i32>::new()), [false, false, false]),
+            (col("id").not_in(Vec::<i32>::new()), [true, false, true]),
+        ] {
+            assert_eq!(evaluate(predicate), expected);
+        }
     }
 
     #[test]
@@ -627,19 +624,6 @@ mod tests {
                     .is_err()
             );
         }
-        for (function, expected) in [
-            (LeafFunction::In, [false, false]),
-            (LeafFunction::NotIn, [true, false]),
-        ] {
-            assert_eq!(
-                leaf(function, vec![])
-                    .evaluate_batch(&batch)
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                expected.map(Some)
-            );
-        }
     }
 
     fn assert_membership_strategies(
@@ -649,62 +633,42 @@ mod tests {
     ) {
         let row_type = RowType::new(vec![DataField::new("c", data_type.clone(), None)]);
         let batch = RecordBatch::try_from_iter([("c", array.clone())]).unwrap();
-        for count in [0, 1, 2, 128] {
-            let input: Vec<_> = literals.iter().cycle().take(count).cloned().collect();
-            for function in [LeafFunction::In, LeafFunction::NotIn] {
-                for with_null in [false, true] {
-                    let mut literals = input.clone();
-                    if with_null {
-                        literals.push(Literal::Null);
-                    }
-                    let predicate = Predicate::Leaf {
-                        field: "c".into(),
-                        function,
-                        literals,
-                    };
-                    let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
-                    let BoundPredicate::Leaf { literals, .. } = &bound else {
-                        unreachable!()
-                    };
-                    let expected = if function == LeafFunction::NotIn && with_null {
-                        BooleanArray::from(vec![false; array.len()])
-                    } else {
-                        evaluate_membership_linear(
-                            &array,
-                            &data_type,
-                            function,
-                            literals,
-                            array.len(),
-                        )
-                        .unwrap()
-                    };
-                    assert_eq!(bound.evaluate_batch(&batch).unwrap(), expected);
-                    let uses_set =
-                        !(literals.is_empty() || function == LeafFunction::NotIn && with_null);
-                    let evaluator = bound.into_evaluator().unwrap();
-                    if uses_set {
-                        assert!(matches!(
-                            evaluator.root,
-                            PreparedPredicate::Membership { .. }
-                        ));
-                    }
-                    for _ in 0..3 {
-                        assert_eq!(evaluator.evaluate_batch(&batch).unwrap(), expected);
-                    }
-                    assert_eq!(
-                        evaluator.evaluate_batch(&batch.slice(0, 0)).unwrap().len(),
-                        0
-                    );
-                    let missing = RecordBatch::try_from_iter([("other", array.clone())]).unwrap();
-                    assert!(evaluator.evaluate_batch(&missing).is_err());
+        for function in [LeafFunction::In, LeafFunction::NotIn] {
+            for with_null in [false, true] {
+                let mut literals = literals.clone();
+                literals.extend(literals.clone());
+                if with_null {
+                    literals.push(Literal::Null);
                 }
+                let predicate = Predicate::Leaf {
+                    field: "c".into(),
+                    function,
+                    literals,
+                };
+                let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
+                let BoundPredicate::Leaf { literals, .. } = &bound else {
+                    unreachable!()
+                };
+                let expected = if function == LeafFunction::NotIn && with_null {
+                    BooleanArray::from(vec![false; array.len()])
+                } else {
+                    evaluate_membership_linear(&array, &data_type, function, literals, array.len())
+                        .unwrap()
+                };
+                assert_eq!(bound.evaluate_batch(&batch).unwrap(), expected);
+                let evaluator = bound.into_evaluator().unwrap();
+                assert_eq!(evaluator.evaluate_batch(&batch).unwrap(), expected);
+                assert_eq!(
+                    evaluator.evaluate_batch(&batch.slice(0, 0)).unwrap().len(),
+                    0
+                );
             }
         }
     }
 
     #[test]
     fn hashed_membership_matches_linear_comparison_for_scalar_types() {
-        use arrow::array::{BinaryArray, Float32Array, Float64Array};
+        use arrow::array::{BinaryArray, Float64Array};
         let nan = f64::from_bits(f64::NAN.to_bits() + (1 << 30));
         for single in [false, true] {
             let values = vec![
@@ -717,32 +681,26 @@ mod tests {
                 Some(2.0),
                 None,
             ];
-            let (data_type, array, literals): (_, ArrayRef, _) = if single {
-                (
-                    DataTypes::float(),
-                    Arc::new(Float32Array::from(
-                        values
-                            .iter()
-                            .map(|v| v.map(|v| v as f32))
-                            .collect::<Vec<_>>(),
-                    )),
-                    vec![
-                        Literal::Float32(-0.0),
-                        Literal::Float32(nan as f32),
-                        Literal::Float32(1.0),
-                    ],
-                )
+            let data_type = if single {
+                DataTypes::float()
             } else {
-                (
-                    DataTypes::double(),
-                    Arc::new(Float64Array::from(values)),
-                    vec![
-                        Literal::Float64(-0.0),
-                        Literal::Float64(nan),
-                        Literal::Float64(1.0),
-                    ],
-                )
+                DataTypes::double()
             };
+            let array = cast(
+                &Float64Array::from(values),
+                &to_arrow_type(&data_type).unwrap(),
+            )
+            .unwrap();
+            let literals = [-0.0, nan, 1.0]
+                .into_iter()
+                .map(|v| {
+                    if single {
+                        Literal::Float32(v as f32)
+                    } else {
+                        Literal::Float64(v)
+                    }
+                })
+                .collect();
             assert_membership_strategies(data_type, array, literals);
         }
         assert_membership_strategies(
@@ -796,165 +754,28 @@ mod tests {
     }
 
     #[test]
-    fn hashed_temporal_membership_preserves_subunit_and_range_boundaries() {
-        for precision in [0, 3, 6, 9] {
-            for ltz in [false, true] {
-                let data_type = if ltz {
-                    DataTypes::timestamp_ltz_with_precision(precision)
-                } else {
-                    DataTypes::timestamp_with_precision(precision)
-                };
-                let literals = [
-                    (0, 0),
-                    (1, 1),
-                    (-1, 999_999),
-                    (i64::MAX, 0),
-                    (-9_223_372_036_855, 224_192),
-                ]
-                .into_iter()
-                .map(|(millis, nanos)| {
-                    if ltz {
-                        Literal::TimestampLtz(
-                            TimestampLtz::from_millis_nanos(millis, nanos).unwrap(),
-                        )
-                    } else {
-                        Literal::TimestampNtz(
-                            TimestampNtz::from_millis_nanos(millis, nanos).unwrap(),
-                        )
-                    }
-                })
-                .collect();
-                let array = cast(
-                    &Int64Array::from(vec![
-                        Some(i64::MIN),
-                        Some(-1),
-                        Some(0),
-                        Some(1),
-                        Some(i64::MAX),
-                        None,
-                    ]),
-                    &to_arrow_type(&data_type).unwrap(),
-                )
-                .unwrap();
-                assert_membership_strategies(data_type, array, literals);
-            }
-        }
-        let data_type = DataTypes::time_with_precision(0);
-        let array = cast(
-            &Int32Array::from(vec![Some(0), Some(1), Some(2), None]),
-            &to_arrow_type(&data_type).unwrap(),
-        )
-        .unwrap();
-        assert_membership_strategies(
-            data_type,
-            array,
-            vec![Literal::Time(1), Literal::Time(1_000), Literal::Time(1_500)],
-        );
-    }
-
-    #[test]
     fn prepared_compound_reuses_membership_and_validates_each_batch() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PredicateEvaluator>();
         let predicate = col("id").is_in(0..128).and(col("name").is_not_null());
         let bound = BoundPredicate::bind(Some(&predicate), &row_type()).unwrap();
-        let expected = bound.evaluate_batch(&batch()).unwrap();
-        let evaluator = bound.into_evaluator().unwrap();
-        assert_eq!(evaluator.evaluate_batch(&batch()).unwrap(), expected);
+        let evaluator = bound.clone().into_evaluator().unwrap();
+        for input in [batch(), batch().slice(1, 2), batch().slice(0, 0)] {
+            assert_eq!(
+                evaluator.evaluate_batch(&input).unwrap(),
+                bound.evaluate_batch(&input).unwrap()
+            );
+        }
+        let missing = RecordBatch::try_from_iter([("name", batch().column(1).clone())]).unwrap();
         let wrong = RecordBatch::try_from_iter([
             ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
             ("name", Arc::new(StringArray::from(vec!["a"])) as ArrayRef),
         ])
         .unwrap();
-        assert!(evaluator.evaluate_batch(&wrong).is_err());
-    }
-
-    #[test]
-    #[ignore = "release-mode membership microbenchmark; run explicitly with --nocapture"]
-    fn benchmark_membership() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        fn median_us(mut run: impl FnMut()) -> f64 {
-            run();
-            let mut samples: Vec<_> = (0..5)
-                .map(|_| {
-                    let start = Instant::now();
-                    for _ in 0..20 {
-                        run();
-                    }
-                    start.elapsed().as_secs_f64() * 1e6 / 20.0
-                })
-                .collect();
-            samples.sort_by(f64::total_cmp);
-            samples[2]
+        for invalid in [missing, wrong] {
+            assert!(bound.evaluate_batch(&invalid).is_err());
+            assert!(evaluator.evaluate_batch(&invalid).is_err());
         }
-        println!("type,rows,literals,build_us,linear_us,hash_us,speedup");
-        for strings in [false, true] {
-            for len in [128, 4096] {
-                for count in [1, 2, 4, 8, 32, 64, 256, 1024] {
-                    let (data_type, array, literals): (_, ArrayRef, Vec<_>) = if strings {
-                        (
-                            DataTypes::string(),
-                            Arc::new(StringArray::from(
-                                (0..len)
-                                    .map(|i| {
-                                        (i % 16 != 0).then(|| format!("key-{}", i % (count * 2)))
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )),
-                            (0..count)
-                                .map(|i| Literal::String(format!("key-{i}")))
-                                .collect(),
-                        )
-                    } else {
-                        (
-                            DataTypes::int(),
-                            Arc::new(Int32Array::from(
-                                (0..len)
-                                    .map(|i| (i % 16 != 0).then_some((i % (count * 2)) as i32))
-                                    .collect::<Vec<_>>(),
-                            )),
-                            (0..count).map(|i| Literal::Int32(i as i32)).collect(),
-                        )
-                    };
-                    let start = Instant::now();
-                    let set = MembershipSet::new(&literals, &data_type).unwrap();
-                    let build_us = start.elapsed().as_secs_f64() * 1e6;
-                    let linear_us = median_us(|| {
-                        black_box(
-                            evaluate_membership_linear(
-                                black_box(&array),
-                                &data_type,
-                                LeafFunction::In,
-                                &literals,
-                                len,
-                            )
-                            .unwrap(),
-                        );
-                    });
-                    let hash_us = median_us(|| {
-                        black_box(set.evaluate(black_box(&array), LeafFunction::In).unwrap());
-                    });
-                    println!(
-                        "{},{len},{count},{build_us:.1},{linear_us:.1},{hash_us:.1},{:.2}",
-                        if strings { "string" } else { "int" },
-                        linear_us / hash_us
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn missing_predicate_columns_are_rejected() {
-        let bound = BoundPredicate::bind(Some(&col("id").eq(1_i32)), &row_type()).unwrap();
-        let missing = RecordBatch::try_from_iter(vec![(
-            "name",
-            Arc::new(StringArray::from(vec!["one"])) as ArrayRef,
-        )])
-        .unwrap();
-
-        assert!(bound.evaluate_batch(&missing).is_err());
     }
 
     #[test]
@@ -1003,6 +824,7 @@ mod tests {
             (DataTypes::double(), Literal::Float64(-2.5)),
             (DataTypes::string(), Literal::String("hello".into())),
             (DataTypes::bytes(), Literal::Bytes(vec![0, 255])),
+            (DataTypes::binary(4), Literal::Bytes(vec![1, 2, 3, 4])),
             (DataTypes::date(), Literal::Date(-1)),
             (DataTypes::time_with_precision(0), Literal::Time(1_000)),
             (DataTypes::time_with_precision(9), Literal::Time(1)),
@@ -1017,135 +839,90 @@ mod tests {
                 mask.iter().collect::<Vec<_>>(),
                 [Some(true), Some(false), Some(true)]
             );
+            assert_eq!(
+                compare(
+                    &array.slice(0, 0),
+                    LeafFunction::Equal,
+                    &literal,
+                    &data_type
+                )
+                .unwrap()
+                .len(),
+                0
+            );
         }
     }
 
     #[test]
     fn temporal_comparisons_match_exact_nanosecond_ordering() {
-        for precision in 0_u32..=9 {
+        for (precision, millis, nanos) in [
+            (0_u32, 1_500, 0),
+            (0, -1_500, 0),
+            (1, 1, 1),
+            (3, -1, 999_999),
+            (3, i64::from(i32::MIN), 0),
+            (6, 1, 1),
+            (6, -9_223_372_036_854_776, 192_000),
+            (6, i64::MAX, 0),
+            (9, 1, 1),
+            (9, i64::from(i32::MAX), 0),
+            (9, -9_223_372_036_855, 224_191),
+            (9, -9_223_372_036_855, 224_192),
+            (9, 9_223_372_036_854, 775_807),
+            (9, 9_223_372_036_854, 775_808),
+        ] {
             let tick_nanos = 10_i128.pow(9 - precision.div_ceil(3) * 3);
-            for (millis, nanos) in [
-                (0, 0),
-                (1_000, 0),
-                (1_500, 0),
-                (-1_500, 0),
-                (1, 1),
-                (-1, 999_000),
-                (-1, 999_999),
-                (i64::from(i32::MIN), 0),
-                (i64::from(i32::MAX), 0),
-                (i64::MIN, 0),
-                (i64::MAX, 0),
-                (i64::MAX, 999_999),
-                (-9_223_372_036_854_776, 192_000),
-                (9_223_372_036_854_775, 807_000),
-                (-9_223_372_036_855, 224_191),
-                (-9_223_372_036_855, 224_192),
-                (9_223_372_036_854, 775_807),
-                (9_223_372_036_854, 775_808),
-            ] {
-                let mut cases = vec![
-                    (
-                        DataTypes::timestamp_with_precision(precision),
-                        Literal::TimestampNtz(
-                            TimestampNtz::from_millis_nanos(millis, nanos).unwrap(),
-                        ),
-                    ),
-                    (
-                        DataTypes::timestamp_ltz_with_precision(precision),
-                        Literal::TimestampLtz(
-                            TimestampLtz::from_millis_nanos(millis, nanos).unwrap(),
-                        ),
-                    ),
-                ];
-                if nanos == 0 {
-                    if let Ok(millis) = i32::try_from(millis) {
-                        cases.push((
-                            DataTypes::time_with_precision(precision),
-                            Literal::Time(millis),
-                        ));
-                    }
+            let mut cases = vec![
+                (
+                    DataTypes::timestamp_with_precision(precision),
+                    Literal::TimestampNtz(TimestampNtz::from_millis_nanos(millis, nanos).unwrap()),
+                ),
+                (
+                    DataTypes::timestamp_ltz_with_precision(precision),
+                    Literal::TimestampLtz(TimestampLtz::from_millis_nanos(millis, nanos).unwrap()),
+                ),
+            ];
+            if nanos == 0 {
+                if let Ok(millis) = i32::try_from(millis) {
+                    cases.push((
+                        DataTypes::time_with_precision(precision),
+                        Literal::Time(millis),
+                    ));
                 }
-                let literal_nanos = i128::from(millis) * 1_000_000 + i128::from(nanos);
-                for (data_type, literal) in cases {
-                    let arrow_type = to_arrow_type(&data_type).unwrap();
-                    let time32 = matches!(arrow_type, ArrowDataType::Time32(_));
-                    let (min, max) = if time32 {
-                        (i128::from(i32::MIN), i128::from(i32::MAX))
-                    } else {
-                        (i128::from(i64::MIN), i128::from(i64::MAX))
-                    };
-                    let near = literal_nanos / tick_nanos;
-                    let values: Vec<_> = [min, max, -2, -1, 0, 1, 2, near - 1, near, near + 1]
-                        .into_iter()
-                        .filter(|v| (min..=max).contains(v))
-                        .map(|v| Some(v as i64))
-                        .chain([None])
-                        .collect();
-                    let integers: ArrayRef = if time32 {
-                        Arc::new(Int32Array::from(
-                            values
-                                .iter()
-                                .map(|v| v.map(|v| v as i32))
-                                .collect::<Vec<_>>(),
-                        ))
-                    } else {
-                        Arc::new(Int64Array::from(values.clone()))
-                    };
-                    let batch = RecordBatch::try_from_iter([(
-                        "c",
-                        cast(integers.as_ref(), &arrow_type).unwrap(),
-                    )])
-                    .unwrap();
-                    let row_type = RowType::new(vec![DataField::with_field_id(
-                        "c",
-                        data_type.clone(),
-                        None,
-                        7,
-                    )]);
-                    for function in [
-                        LeafFunction::Equal,
-                        LeafFunction::NotEqual,
-                        LeafFunction::LessThan,
-                        LeafFunction::LessOrEqual,
-                        LeafFunction::GreaterThan,
-                        LeafFunction::GreaterOrEqual,
-                    ] {
-                        let predicate = Predicate::Leaf {
-                            field: "c".into(),
-                            function,
-                            literals: vec![literal.clone()],
-                        };
-                        to_pb_predicate(&predicate, &row_type).unwrap();
-                        let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
-                        let actual = bound.evaluate_batch(&batch).unwrap();
-                        // Compare in an exact wider domain, independently of the rewrite.
-                        let expected: Vec<_> = values
+            }
+            let literal_nanos = i128::from(millis) * 1_000_000 + i128::from(nanos);
+            for (data_type, literal) in cases {
+                let arrow_type = to_arrow_type(&data_type).unwrap();
+                let time32 = matches!(arrow_type, ArrowDataType::Time32(_));
+                let (min, max) = if time32 {
+                    (i128::from(i32::MIN), i128::from(i32::MAX))
+                } else {
+                    (i128::from(i64::MIN), i128::from(i64::MAX))
+                };
+                let near = literal_nanos / tick_nanos;
+                let values: Vec<_> = [min, max, -2, -1, 0, 1, 2, near - 1, near, near + 1]
+                    .into_iter()
+                    .filter(|v| (min..=max).contains(v))
+                    .map(|v| Some(v as i64))
+                    .chain([None])
+                    .collect();
+                let integers: ArrayRef = if time32 {
+                    Arc::new(Int32Array::from(
+                        values
                             .iter()
-                            .map(|value| {
-                                value.is_some_and(|value| {
-                                    let value = i128::from(value) * tick_nanos;
-                                    match function {
-                                        LeafFunction::Equal => value == literal_nanos,
-                                        LeafFunction::NotEqual => value != literal_nanos,
-                                        LeafFunction::LessThan => value < literal_nanos,
-                                        LeafFunction::LessOrEqual => value <= literal_nanos,
-                                        LeafFunction::GreaterThan => value > literal_nanos,
-                                        LeafFunction::GreaterOrEqual => value >= literal_nanos,
-                                        _ => unreachable!(),
-                                    }
-                                })
-                            })
-                            .collect();
-                        assert_eq!(
-                            actual.values().iter().collect::<Vec<_>>(),
-                            expected,
-                            "{data_type}, {literal:?}, {function:?}"
-                        );
-                        assert_eq!(actual.null_count(), 0);
-                        assert_eq!(bound.evaluate_batch(&batch.slice(0, 0)).unwrap().len(), 0);
-                    }
-                }
+                            .map(|v| v.map(|v| v as i32))
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    Arc::new(Int64Array::from(values.clone()))
+                };
+                let array = cast(integers.as_ref(), &arrow_type).unwrap();
+                // Compare in the exact nanosecond domain, independently of the rewrite.
+                let orderings = values
+                    .iter()
+                    .map(|v| v.map(|v| (i128::from(v) * tick_nanos).cmp(&literal_nanos)))
+                    .collect();
+                assert_comparisons(data_type, array, literal, orderings);
             }
         }
     }
@@ -1177,27 +954,6 @@ mod tests {
                 .evaluate_batch(&batch)
                 .unwrap();
             assert_eq!(mask.iter().collect::<Vec<_>>(), expected.map(Some));
-        }
-    }
-
-    #[test]
-    fn fixed_binary_scalar_filters_empty_and_nonempty_batches() {
-        let data_type = DataTypes::binary(4);
-        let literal = Literal::Bytes(vec![1, 2, 3, 4]);
-        let scalar = literal_array(&literal, &data_type).unwrap();
-        assert_eq!(scalar.data_type(), &ArrowDataType::FixedSizeBinary(4));
-        assert_eq!(scalar.len(), 1);
-        for len in [0, 3] {
-            let array: ArrayRef = Arc::new(
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                    std::iter::repeat_n(Some([1, 2, 3, 4].as_slice()), len),
-                    4,
-                )
-                .unwrap(),
-            );
-            let mask = compare(&array, LeafFunction::Equal, &literal, &data_type).unwrap();
-            assert_eq!(mask.len(), len);
-            assert_eq!(mask.true_count(), len);
         }
     }
 

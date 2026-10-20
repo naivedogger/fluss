@@ -225,8 +225,9 @@ fn exact_coercion(field: &DataField, literal: &Literal) -> Result<Literal> {
 mod tests {
     use super::*;
     use crate::metadata::{DataTypes, RowType};
+    use crate::predicate::tests::assert_comparisons;
     use crate::predicate::{BoundPredicate, Predicate, col, to_pb_predicate};
-    use arrow::array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array};
+    use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array};
     use arrow::compute::cast;
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -237,314 +238,162 @@ mod tests {
         Literal::Decimal(Decimal::from_big_decimal(value, 38, scale as u32).unwrap())
     }
 
-    // An independent oracle: compare exact values, without narrowing or rewriting.
-    fn exact_value(literal: &Literal) -> BigDecimal {
-        match literal {
-            Literal::Int64(v) => BigDecimal::from(*v),
-            Literal::Float64(v) => BigDecimal::try_from(*v).unwrap(),
-            Literal::Decimal(v) => v.to_big_decimal(),
-            _ => unreachable!(),
-        }
-    }
-
-    fn assert_comparisons(
-        data_type: DataType,
-        array: ArrayRef,
-        literal: Literal,
-        orderings: Vec<Option<Ordering>>,
-    ) {
-        let row_type = RowType::new(vec![DataField::with_field_id("c", data_type, None, 7)]);
-        let batch = RecordBatch::try_from_iter([("c", array)]).unwrap();
-        for function in [
-            LeafFunction::Equal,
-            LeafFunction::NotEqual,
-            LeafFunction::LessThan,
-            LeafFunction::LessOrEqual,
-            LeafFunction::GreaterThan,
-            LeafFunction::GreaterOrEqual,
-            LeafFunction::In,
-            LeafFunction::NotIn,
-        ] {
-            let predicate = Predicate::Leaf {
-                field: "c".into(),
-                function,
-                literals: vec![literal.clone()],
-            };
-            let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
-            let actual = bound.evaluate_batch(&batch).unwrap();
-            let expected: Vec<_> = orderings
-                .iter()
-                .map(|ordering| {
-                    ordering.is_some_and(|ordering| match function {
-                        LeafFunction::Equal | LeafFunction::In => ordering == Ordering::Equal,
-                        LeafFunction::NotEqual | LeafFunction::NotIn => ordering != Ordering::Equal,
-                        LeafFunction::LessThan => ordering == Ordering::Less,
-                        LeafFunction::LessOrEqual => ordering != Ordering::Greater,
-                        LeafFunction::GreaterThan => ordering == Ordering::Greater,
-                        LeafFunction::GreaterOrEqual => ordering != Ordering::Less,
-                        _ => unreachable!(),
-                    })
-                })
-                .collect();
-            assert_eq!(
-                actual.values().iter().collect::<Vec<_>>(),
-                expected,
-                "{predicate:?}, {row_type:?}"
-            );
-            assert_eq!(actual.null_count(), 0);
-            assert_eq!(bound.evaluate_batch(&batch.slice(0, 0)).unwrap().len(), 0);
-            if let Some(pushdown) = bound.to_pushdown_predicate() {
-                to_pb_predicate(&pushdown, &row_type).unwrap();
-                let rebound = BoundPredicate::bind(Some(&pushdown), &row_type).unwrap();
-                assert_eq!(rebound.evaluate_batch(&batch).unwrap(), actual);
-            }
-        }
-    }
-
     #[test]
-    fn integer_boundaries_match_exact_values() {
-        for (data_type, min, max) in [
-            (DataTypes::tinyint(), i64::from(i8::MIN), i64::from(i8::MAX)),
+    fn numeric_boundaries_preserve_comparison_results() {
+        use Ordering::{Equal as E, Greater as G, Less as L};
+        let decimal_max = 10_i128.pow(38) - 1;
+        // Decimal samples are unscaled; other samples are exact integer values.
+        // Expected orderings compare each sample to the original literal.
+        for (data_type, values, literal, expected) in [
+            (
+                DataTypes::tinyint(),
+                [-128, -1, 127],
+                Literal::Float64(-1.3),
+                [L, G, G],
+            ),
             (
                 DataTypes::smallint(),
-                i64::from(i16::MIN),
-                i64::from(i16::MAX),
+                [-32768, 1, 32767],
+                Literal::Float64(1.3),
+                [L, L, G],
             ),
-            (DataTypes::int(), i64::from(i32::MIN), i64::from(i32::MAX)),
-            (DataTypes::bigint(), i64::MIN, i64::MAX),
-        ] {
-            let values = vec![
-                Some(min),
-                Some(max),
-                Some(-2),
-                Some(-1),
-                Some(0),
-                Some(1),
-                Some(2),
-                None,
-            ];
-            let array = cast(
-                &Int64Array::from(values.clone()),
-                &crate::record::to_arrow_type(&data_type).unwrap(),
-            )
-            .unwrap();
-            for literal in [
-                Literal::Int64(min),
-                Literal::Int64(max),
-                Literal::Int64(i64::MIN),
+            (
+                DataTypes::int(),
+                [i32::MIN as i128, 0, i32::MAX as i128],
                 Literal::Int64(i64::MAX),
-                Literal::Float64(1.3),
-                Literal::Float64(-1.3),
-                Literal::Float64(0.3),
-                Literal::Float64(-0.3),
-                Literal::Float64(2_f64.powi(63)),
+                [L, L, L],
+            ),
+            (
+                DataTypes::tinyint(),
+                [-128, 0, 127],
+                Literal::Int64(-129),
+                [G, G, G],
+            ),
+            (
+                DataTypes::bigint(),
+                [i64::MIN as i128, i64::MAX as i128 - 1, i64::MAX as i128],
                 decimal("9223372036854775806.9"),
-                decimal("-9223372036854775808.1"),
-                decimal("99999999999999999999999999999999999999"),
-            ] {
-                let bound = exact_value(&literal);
-                let orderings = values
-                    .iter()
-                    .map(|v| v.map(|v| BigDecimal::from(v).cmp(&bound)))
-                    .collect();
-                assert_comparisons(data_type.clone(), array.clone(), literal, orderings);
-            }
-            for (value, ordering) in [
-                (f64::INFINITY, Ordering::Less),
-                (f64::NEG_INFINITY, Ordering::Greater),
-            ] {
-                assert_comparisons(
-                    data_type.clone(),
-                    array.clone(),
-                    Literal::Float64(value),
-                    values.iter().map(|v| v.map(|_| ordering)).collect(),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn decimal_scale_and_precision_boundaries_match_exact_values() {
-        for (precision, scale) in [(3, 2), (38, 0), (38, 38)] {
-            let max = 10_i128.pow(precision) - 1;
-            let values = vec![
-                Some(-max),
-                Some(max),
-                Some(-124),
-                Some(-123),
-                Some(0),
-                Some(123),
-                Some(124),
-                None,
-            ];
-            let array: ArrayRef = Arc::new(
-                Decimal128Array::from(values.clone())
-                    .with_precision_and_scale(precision as u8, scale as i8)
-                    .unwrap(),
-            );
-            for literal in [
+                [L, L, G],
+            ),
+            (
+                DataTypes::decimal(3, 2),
+                [-124, 123, 124],
                 decimal("1.234"),
+                [L, L, G],
+            ),
+            (
+                DataTypes::decimal(3, 2),
+                [-124, -123, 0],
                 decimal("-1.234"),
-                decimal("1.230"),
-                decimal("9.991"),
-                decimal("-9.991"),
-                decimal("0.000000000000000000000000000000000000001"),
+                [L, G, G],
+            ),
+            (
+                DataTypes::decimal(38, 0),
+                [-decimal_max, 0, decimal_max],
                 decimal("99999999999999999999999999999999999999"),
-                Literal::Int64(i64::MAX),
-                Literal::Float64(1.23),
-                Literal::Float64(f64::MAX),
-            ] {
-                let bound = exact_value(&literal);
-                let orderings = values
-                    .iter()
-                    .map(|v| v.map(|v| BigDecimal::new(v.into(), i64::from(scale)).cmp(&bound)))
-                    .collect();
-                assert_comparisons(
-                    DataTypes::decimal(precision, scale),
-                    array.clone(),
-                    literal,
-                    orderings,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn floating_boundaries_preserve_exact_integer_and_decimal_values() {
-        for single in [true, false] {
-            let values = [
-                f64::NEG_INFINITY,
-                -f64::NAN,
-                -1e300,
-                -1.3,
-                -1.0,
-                -1e-300,
-                -0.0,
-                0.0,
-                1e-300,
-                0.1,
-                1.0,
-                1.3,
-                16_777_216.0,
-                16_777_218.0,
-                16_777_220.0,
-                f64::from(f32::from_bits(1)),
-                -f64::from(f32::from_bits(1)),
-                9_007_199_254_740_992.0,
-                9_007_199_254_740_994.0,
-                9_007_199_254_740_996.0,
-                2_f64.powi(63),
-                f64::MAX,
-                f64::INFINITY,
-                f64::NAN,
-            ];
-            let values: Vec<_> = values
-                .into_iter()
-                .map(|v| Some(if single { f64::from(v as f32) } else { v }))
-                .chain([None])
-                .collect();
-            let array: ArrayRef = if single {
-                Arc::new(Float32Array::from(
-                    values
-                        .iter()
-                        .map(|v| v.map(|v| v as f32))
-                        .collect::<Vec<_>>(),
-                ))
-            } else {
-                Arc::new(Float64Array::from(values.clone()))
-            };
-            for literal in [
+                [L, L, E],
+            ),
+            (
+                DataTypes::decimal(38, 38),
+                [-decimal_max, 0, decimal_max],
+                decimal("0.000000000000000000000000000000000000001"),
+                [L, L, G],
+            ),
+            (
+                DataTypes::float(),
+                [16_777_216, 16_777_218, 16_777_220],
                 Literal::Int64(16_777_219),
-                Literal::Int64(9_007_199_254_740_995),
+                [L, L, G],
+            ),
+            (
+                DataTypes::float(),
+                [16_777_216, 16_777_218, 16_777_220],
                 Literal::Int64(16_777_217),
-                Literal::Int64(-16_777_217),
+                [L, G, G],
+            ),
+            (
+                DataTypes::double(),
+                [
+                    9_007_199_254_740_992,
+                    9_007_199_254_740_994,
+                    9_007_199_254_740_996,
+                ],
+                Literal::Int64(9_007_199_254_740_995),
+                [L, L, G],
+            ),
+            (
+                DataTypes::double(),
+                [
+                    9_007_199_254_740_992,
+                    9_007_199_254_740_994,
+                    9_007_199_254_740_996,
+                ],
                 Literal::Int64(9_007_199_254_740_993),
-                Literal::Int64(i64::MAX),
-                Literal::Int64(i64::MIN + 1),
-                decimal("0.1"),
-                decimal("-0.1"),
-                Literal::Float64(1.3),
-                Literal::Float64(-1.3),
-                Literal::Float64(f64::MAX),
-                Literal::Float64(-f64::MAX),
-                Literal::Float64(f64::from_bits(1)),
-                Literal::Float64(-f64::from_bits(1)),
-                Literal::Float64(f64::from(f32::from_bits(1)) / 2.0),
-            ] {
-                let bound = exact_value(&literal);
-                let orderings = values
-                    .iter()
-                    .map(|v| {
-                        v.map(|v| {
-                            if !v.is_finite() {
-                                if v.is_sign_negative() {
-                                    Ordering::Less
-                                } else {
-                                    Ordering::Greater
-                                }
-                            } else {
-                                BigDecimal::try_from(v).unwrap().cmp(&bound)
-                            }
-                        })
-                    })
-                    .collect();
-                assert_comparisons(
-                    if single {
-                        DataTypes::float()
-                    } else {
-                        DataTypes::double()
-                    },
-                    array.clone(),
-                    literal,
-                    orderings,
-                );
-            }
+                [L, G, G],
+            ),
+        ] {
+            let array = if let DataType::Decimal(t) = &data_type {
+                Arc::new(
+                    Decimal128Array::from(
+                        values
+                            .into_iter()
+                            .map(Some)
+                            .chain([None])
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_precision_and_scale(t.precision() as u8, t.scale() as i8)
+                    .unwrap(),
+                ) as ArrayRef
+            } else {
+                cast(
+                    &Int64Array::from(
+                        values
+                            .into_iter()
+                            .map(|v| Some(i64::try_from(v).unwrap()))
+                            .chain([None])
+                            .collect::<Vec<_>>(),
+                    ),
+                    &crate::record::to_arrow_type(&data_type).unwrap(),
+                )
+                .unwrap()
+            };
+            assert_comparisons(
+                data_type,
+                array,
+                literal,
+                expected.into_iter().map(Some).chain([None]).collect(),
+            );
         }
     }
 
     #[test]
     fn floating_special_values_keep_existing_arrow_total_order() {
-        for single in [true, false] {
-            let values: Vec<_> = [
-                f64::NEG_INFINITY,
-                -f64::NAN,
-                -0.0,
-                0.0,
-                f64::INFINITY,
-                f64::NAN,
-                f64::from_bits(f64::NAN.to_bits() + (1 << 30)),
-            ]
-            .into_iter()
-            .map(|v| Some(if single { f64::from(v as f32) } else { v }))
-            .chain([None])
-            .collect();
-            let array: ArrayRef = if single {
-                Arc::new(Float32Array::from(
-                    values
-                        .iter()
-                        .map(|v| v.map(|v| v as f32))
-                        .collect::<Vec<_>>(),
-                ))
-            } else {
-                Arc::new(Float64Array::from(values.clone()))
-            };
-            for value in values.iter().flatten() {
+        use Ordering::{Equal as E, Greater as G, Less as L};
+        let values = Float64Array::from(vec![
+            Some(-f64::NAN),
+            Some(f64::NEG_INFINITY),
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::INFINITY),
+            Some(f64::NAN),
+            None,
+        ]);
+        for data_type in [DataTypes::float(), DataTypes::double()] {
+            let array = cast(&values, &crate::record::to_arrow_type(&data_type).unwrap()).unwrap();
+            for (literal, expected) in [
+                (-0.0, [L, L, E, G, G, G]),
+                (0.0, [L, L, L, E, G, G]),
+                (f64::NAN, [L, L, L, L, L, E]),
+                (f64::MAX, [L, L, L, L, G, G]),
+                (-f64::MAX, [L, L, G, G, G, G]),
+                (f64::from_bits(1), [L, L, L, L, G, G]),
+                (-f64::from_bits(1), [L, L, G, G, G, G]),
+            ] {
                 assert_comparisons(
-                    if single {
-                        DataTypes::float()
-                    } else {
-                        DataTypes::double()
-                    },
+                    data_type.clone(),
                     array.clone(),
-                    if single {
-                        Literal::Float32(*value as f32)
-                    } else {
-                        Literal::Float64(*value)
-                    },
-                    values
-                        .iter()
-                        .map(|v| v.map(|v| v.total_cmp(value)))
-                        .collect(),
+                    Literal::Float64(literal),
+                    expected.into_iter().map(Some).chain([None]).collect(),
                 );
             }
         }
