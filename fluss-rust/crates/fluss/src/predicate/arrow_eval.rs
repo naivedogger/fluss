@@ -23,15 +23,20 @@ use crate::error::Result;
 use crate::metadata::DataType as FlussDataType;
 use crate::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use crate::record::to_arrow_type;
+use crate::row::Datum;
+use crate::util::partition::parse_value_of_type;
+use crate::util::{canonicalize_nan, compare_floats};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, Scalar, StringArray, make_builder,
+    Array, ArrayRef, AsArray, BooleanArray, Int32Array, Int64Array, Scalar, StringArray,
+    make_builder,
 };
 use arrow::compute::cast;
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, or};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+use arrow::datatypes::{DataType as ArrowDataType, Float32Type, Float64Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 impl BoundPredicate {
@@ -47,6 +52,42 @@ impl BoundPredicate {
         Ok(PredicateEvaluator {
             root: PreparedPredicate::new(self)?,
         })
+    }
+
+    /// Evaluates a leaf against a non-null, encoded Fluss partition value.
+    ///
+    /// Uses the same exact filter semantics as [`Self::evaluate_batch`]. Returns
+    /// an error for non-leaves, invalid encodings, unsupported types, or values
+    /// that cannot be represented losslessly in the column's Arrow type.
+    /// A pruning caller must retain the partition on error.
+    #[doc(hidden)]
+    pub fn evaluate_partition_value(&self, value: &str) -> Result<bool> {
+        let Self::Leaf {
+            field_name,
+            data_type,
+            ..
+        } = self
+        else {
+            return Err(IllegalArgument {
+                message: "partition value evaluation requires a leaf predicate".into(),
+            });
+        };
+        let datum = parse_value_of_type(value, data_type)?;
+        let temporal = match &datum {
+            Datum::TimestampNtz(value) => Some(Literal::TimestampNtz(*value)),
+            Datum::TimestampLtz(value) => Some(Literal::TimestampLtz(*value)),
+            Datum::Time(value) => Some(Literal::Time(value.get_inner())),
+            _ => None,
+        };
+        let array = if let Some(literal) = temporal {
+            membership_scalar(&literal, data_type)?.ok_or_else(|| IllegalArgument {
+                message: "partition value cannot be represented exactly in its Arrow type".into(),
+            })?
+        } else {
+            datum_array(&datum, data_type)?
+        };
+        let batch = RecordBatch::try_from_iter([(field_name.as_str(), array)])?;
+        Ok(self.evaluate_batch(&batch)?.value(0))
     }
 
     /// Evaluates this predicate exactly against an Arrow record batch.
@@ -176,6 +217,44 @@ fn compare_scalar(
     function: LeafFunction,
     constant: ArrayRef,
 ) -> Result<BooleanArray> {
+    let result = match array.data_type() {
+        ArrowDataType::Float32 => Some(compare_values(
+            array.as_primitive::<Float32Type>().iter(),
+            constant.as_primitive::<Float32Type>().value(0),
+            function,
+            |a, b| compare_floats(f64::from(a), f64::from(b)),
+        )),
+        ArrowDataType::Float64 => Some(compare_values(
+            array.as_primitive::<Float64Type>().iter(),
+            constant.as_primitive::<Float64Type>().value(0),
+            function,
+            compare_floats,
+        )),
+        ArrowDataType::Binary
+            if !matches!(function, LeafFunction::Equal | LeafFunction::NotEqual) =>
+        {
+            Some(compare_values(
+                array.as_binary::<i32>().iter(),
+                constant.as_binary::<i32>().value(0),
+                function,
+                compare_binary,
+            ))
+        }
+        ArrowDataType::FixedSizeBinary(_)
+            if !matches!(function, LeafFunction::Equal | LeafFunction::NotEqual) =>
+        {
+            Some(compare_values(
+                array.as_fixed_size_binary().iter(),
+                constant.as_fixed_size_binary().value(0),
+                function,
+                compare_binary,
+            ))
+        }
+        _ => None,
+    };
+    if let Some(result) = result {
+        return Ok(result);
+    }
     let left: &dyn Array = array.as_ref();
     let right = Scalar::new(constant);
     let result = match function {
@@ -190,14 +269,47 @@ fn compare_scalar(
     Ok(null_as_false(&result))
 }
 
+fn compare_values<T: Copy>(
+    values: impl Iterator<Item = Option<T>>,
+    constant: T,
+    function: LeafFunction,
+    compare: impl Fn(T, T) -> Ordering,
+) -> BooleanArray {
+    values
+        .map(|value| {
+            value.is_some_and(|value| {
+                let ordering = compare(value, constant);
+                match function {
+                    LeafFunction::Equal => ordering.is_eq(),
+                    LeafFunction::NotEqual => !ordering.is_eq(),
+                    LeafFunction::LessThan => ordering.is_lt(),
+                    LeafFunction::LessOrEqual => !ordering.is_gt(),
+                    LeafFunction::GreaterThan => ordering.is_gt(),
+                    LeafFunction::GreaterOrEqual => !ordering.is_lt(),
+                    _ => unreachable!("non-comparison leaf reached compare"),
+                }
+            })
+        })
+        .collect()
+}
+
+fn compare_binary(left: &[u8], right: &[u8]) -> Ordering {
+    // Java byte[] comparison is signed, unlike Arrow's binary ordering.
+    left.iter()
+        .map(|b| *b as i8)
+        .cmp(right.iter().map(|b| *b as i8))
+}
+
 fn evaluate_string_function(
     array: &ArrayRef,
     function: LeafFunction,
     literal: &Literal,
 ) -> Result<BooleanArray> {
-    let expected = literal.as_string().ok_or_else(|| IllegalArgument {
-        message: "string predicate was not bound to a string literal".to_string(),
-    })?;
+    let Literal::String(expected) = literal else {
+        return Err(IllegalArgument {
+            message: "string predicate was not bound to a string literal".to_string(),
+        });
+    };
     let strings = array
         .as_any()
         .downcast_ref::<StringArray>()
@@ -232,13 +344,15 @@ fn null_as_false(mask: &BooleanArray) -> BooleanArray {
 
 /// Builds one scalar value, rather than repeating the literal for every input row.
 fn literal_array(literal: &Literal, data_type: &FlussDataType) -> Result<ArrayRef> {
+    datum_array(&literal.to_datum(), data_type)
+}
+
+fn datum_array(datum: &Datum<'_>, data_type: &FlussDataType) -> Result<ArrayRef> {
     let arrow_type = to_arrow_type(data_type)?;
-    // Binding normalizes literal types and decimal scale. Temporal comparisons
-    // bypass row conversion because narrowing a bound can change the result.
+    // Temporal bounds and partition values use the lossless path instead of
+    // the row writer's narrowing conversions.
     let mut builder = make_builder(&arrow_type, 1);
-    literal
-        .to_datum()
-        .append_to(builder.as_mut(), data_type, &arrow_type)?;
+    datum.append_to(builder.as_mut(), data_type, &arrow_type)?;
     Ok(builder.finish())
 }
 
@@ -391,14 +505,32 @@ fn combine_masks(
 }
 
 #[derive(Debug)]
-struct MembershipSet {
-    converter: RowConverter,
-    values: HashSet<Box<[u8]>>,
+enum MembershipSet {
+    Floats(HashSet<u64>),
+    Rows {
+        converter: RowConverter,
+        values: HashSet<Box<[u8]>>,
+    },
 }
 
 impl MembershipSet {
     fn new(literals: &[Literal], data_type: &FlussDataType) -> Result<Self> {
-        let converter = RowConverter::new(vec![SortField::new(to_arrow_type(data_type)?)])?;
+        let arrow_type = to_arrow_type(data_type)?;
+        if matches!(arrow_type, ArrowDataType::Float32 | ArrowDataType::Float64) {
+            let mut values = HashSet::with_capacity(literals.len());
+            for literal in literals.iter().filter(|literal| !literal.is_null()) {
+                let scalar = literal_array(literal, data_type)?;
+                let value = match arrow_type {
+                    ArrowDataType::Float32 => {
+                        f64::from(scalar.as_primitive::<Float32Type>().value(0))
+                    }
+                    _ => scalar.as_primitive::<Float64Type>().value(0),
+                };
+                values.insert(canonicalize_nan(value).to_bits());
+            }
+            return Ok(Self::Floats(values));
+        }
+        let converter = RowConverter::new(vec![SortField::new(arrow_type)])?;
         let mut values = HashSet::with_capacity(literals.len());
         for literal in literals.iter().filter(|literal| !literal.is_null()) {
             if let Some(scalar) = membership_scalar(literal, data_type)? {
@@ -406,26 +538,46 @@ impl MembershipSet {
                 values.insert(rows.row(0).as_ref().into());
             }
         }
-        Ok(Self { converter, values })
+        Ok(Self::Rows { converter, values })
     }
 
     fn evaluate(&self, array: &ArrayRef, function: LeafFunction) -> Result<BooleanArray> {
-        if self.values.is_empty() {
-            return constant_filter(array, function == LeafFunction::NotIn);
-        }
-        // Arrow row encoding preserves the comparison kernels' totalOrder,
-        // including NaN payloads and signed zero. Rows borrow one batch buffer;
-        // probing does not allocate or encode a separate object per input row.
-        let rows = self
-            .converter
-            .convert_columns(std::slice::from_ref(array))?;
         let negate = function == LeafFunction::NotIn;
+        let (converter, values) = match self {
+            Self::Floats(values) => {
+                // Canonicalize only NaNs; signed-zero keys remain distinct.
+                // Probe fixed-size keys without allocating per row or copying a batch.
+                let matches = |value: Option<f64>| {
+                    value.is_some_and(|value| {
+                        values.contains(&canonicalize_nan(value).to_bits()) != negate
+                    })
+                };
+                return Ok(match array.data_type() {
+                    ArrowDataType::Float32 => array
+                        .as_primitive::<Float32Type>()
+                        .iter()
+                        .map(|value| matches(value.map(f64::from)))
+                        .collect(),
+                    ArrowDataType::Float64 => array
+                        .as_primitive::<Float64Type>()
+                        .iter()
+                        .map(matches)
+                        .collect(),
+                    _ => unreachable!("membership column type was validated"),
+                });
+            }
+            Self::Rows { converter, values } => (converter, values),
+        };
+        if values.is_empty() {
+            return constant_filter(array, negate);
+        }
+        // For non-floats Arrow row encoding has the same equality relation as
+        // Fluss, including byte arrays whose ordering differs from Arrow's.
+        let rows = converter.convert_columns(std::slice::from_ref(array))?;
         Ok(rows
             .iter()
             .enumerate()
-            .map(|(index, row)| {
-                array.is_valid(index) && (self.values.contains(row.as_ref()) != negate)
-            })
+            .map(|(index, row)| array.is_valid(index) && (values.contains(row.as_ref()) != negate))
             .collect())
     }
 }
@@ -475,6 +627,229 @@ mod tests {
     };
     use arrow::compute::kernels::boolean::not;
     use std::sync::Arc;
+
+    #[test]
+    fn partition_values_use_typed_parsing_and_exact_filters() {
+        use crate::util::partition::convert_value_of_type;
+        let cases = [
+            (DataTypes::tinyint(), Literal::Int8(-1), "-1"),
+            (DataTypes::smallint(), Literal::Int16(256), "256"),
+            (DataTypes::int(), Literal::Int32(-1000), "-1000"),
+            (
+                DataTypes::bigint(),
+                Literal::Int64(i64::MAX),
+                "9223372036854775807",
+            ),
+            (DataTypes::boolean(), Literal::Bool(true), "true"),
+            (DataTypes::float(), Literal::Float32(1.5), "1_5"),
+            (DataTypes::double(), Literal::Float64(-1.5), "-1_5"),
+            (DataTypes::double(), Literal::Float64(-0.0), "-0_0"),
+            (DataTypes::float(), Literal::Float32(f32::INFINITY), "Inf"),
+            (DataTypes::float(), Literal::Float32(-f32::NAN), "NaN"),
+            (DataTypes::double(), Literal::Float64(-f64::NAN), "NaN"),
+            (
+                DataTypes::double(),
+                Literal::Float64(f64::NEG_INFINITY),
+                "-Inf",
+            ),
+            (DataTypes::string(), Literal::String("US".into()), "US"),
+            (DataTypes::char(2), Literal::String("US".into()), "US"),
+            (DataTypes::bytes(), Literal::Bytes(vec![0x00, 0xff]), "00ff"),
+            (
+                DataTypes::binary(2),
+                Literal::Bytes(vec![0x00, 0xff]),
+                "00ff",
+            ),
+            (DataTypes::date(), Literal::Date(-1), "1969-12-31"),
+            (DataTypes::date(), Literal::Date(19_782), "2024-02-29"),
+            (
+                DataTypes::time_with_precision(3),
+                Literal::Time(3_723_004),
+                "01-02-03_004",
+            ),
+            (
+                DataTypes::timestamp_with_precision(9),
+                Literal::TimestampNtz(TimestampNtz::from_millis_nanos(-1, 900_000).unwrap()),
+                "1969-12-31-23-59-59_9999",
+            ),
+            (
+                DataTypes::timestamp_ltz_with_precision(9),
+                Literal::TimestampLtz(TimestampLtz::from_millis_nanos(1, 900_000).unwrap()),
+                "1970-01-01-00-00-00_0019",
+            ),
+        ];
+        for (data_type, literal, encoded) in cases {
+            let datum = literal.to_datum();
+            assert_eq!(
+                parse_value_of_type(encoded, &data_type).unwrap(),
+                datum,
+                "{encoded}"
+            );
+            let round_trip = convert_value_of_type(&datum, &data_type).unwrap();
+            let row_type = RowType::new(vec![DataField::new("p", data_type, None)]);
+            for (predicate, expected) in [
+                (col("p").eq(literal.clone()), true),
+                (col("p").ne(literal.clone()), false),
+                (col("p").is_in([literal.clone()]), true),
+                (col("p").not_in([literal.clone(), Literal::Null]), false),
+                (col("p").is_null(), false),
+                (col("p").is_not_null(), true),
+            ] {
+                let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
+                for value in [encoded, round_trip.as_str()] {
+                    assert_eq!(
+                        bound.evaluate_partition_value(value).unwrap(),
+                        expected,
+                        "{bound:?}: {value}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_evaluation_rejects_lossy_values_and_preserves_temporal_bounds() {
+        for (data_type, value) in [
+            (DataTypes::tinyint(), "128"),
+            (DataTypes::boolean(), "invalid"),
+            (DataTypes::bytes(), "0ff"),
+            (DataTypes::binary(2), "ff"),
+            (DataTypes::bytes(), "é"),
+            (DataTypes::date(), "2026-02-30"),
+            (DataTypes::time(), "24-00-00_000"),
+            (DataTypes::timestamp(), "1970-01-01-00-00-00_1234567890"),
+            (
+                DataTypes::timestamp_with_precision(0),
+                "1970-01-01-00-00-00_0019",
+            ),
+            (DataTypes::timestamp_with_precision(9), "3000-01-01"),
+        ] {
+            let row_type = RowType::new(vec![DataField::new("p", data_type, None)]);
+            let bound = BoundPredicate::bind(Some(&col("p").is_not_null()), &row_type).unwrap();
+            assert!(bound.evaluate_partition_value(value).is_err(), "{value}");
+        }
+        for precision in [0, 3, 6, 9] {
+            let row_type = RowType::new(vec![DataField::new(
+                "p",
+                DataTypes::timestamp_with_precision(precision),
+                None,
+            )]);
+            let bound = BoundPredicate::bind(
+                Some(&col("p").lt(TimestampNtz::from_millis_nanos(1, 900_000).unwrap())),
+                &row_type,
+            )
+            .unwrap();
+            assert!(bound.evaluate_partition_value("1970-01-01").unwrap());
+            if precision > 0 {
+                assert!(
+                    bound
+                        .evaluate_partition_value("1970-01-01-00-00-00_001")
+                        .unwrap()
+                );
+                assert!(
+                    !bound
+                        .evaluate_partition_value("1970-01-01-00-00-00_002")
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_comparisons_use_signed_bytes() {
+        use Ordering::{Equal, Greater, Less};
+        use arrow::array::BinaryArray;
+        let bytes: &[Option<&[u8]>] = &[
+            Some(&[0x80]),
+            Some(&[0xff]),
+            Some(&[0]),
+            Some(&[0x7f]),
+            None,
+        ];
+        for (data_type, array) in [
+            (
+                DataTypes::bytes(),
+                std::sync::Arc::new(BinaryArray::from(bytes.to_vec())) as ArrayRef,
+            ),
+            (
+                DataTypes::binary(1),
+                std::sync::Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(bytes.iter().copied(), 1)
+                        .unwrap(),
+                ) as ArrayRef,
+            ),
+        ] {
+            assert_comparisons(
+                data_type,
+                array,
+                Literal::Bytes(vec![0]),
+                vec![Some(Less), Some(Less), Some(Equal), Some(Greater), None],
+            );
+        }
+        assert_comparisons(
+            DataTypes::bytes(),
+            std::sync::Arc::new(BinaryArray::from(vec![
+                Some(&[][..]),
+                Some(&[0][..]),
+                Some(&[0, 0x80][..]),
+                Some(&[0, 0][..]),
+                None,
+            ])),
+            Literal::Bytes(vec![0, 0]),
+            vec![Some(Less), Some(Less), Some(Less), Some(Equal), None],
+        );
+    }
+
+    #[test]
+    fn nan_signs_and_payloads_share_one_equality_class() {
+        use arrow::array::{Float32Array, Float64Array};
+        // Explicit Java expectations, independent of Arrow/total_cmp ordering.
+        let bits = [
+            0x7ff8_0000_0000_0000,
+            0xfff8_0000_0000_0000,
+            0x7ff8_0000_2000_0000,
+            0xfff8_0000_2000_0000,
+            0x7ff0_0000_2000_0000,
+        ];
+        for single in [false, true] {
+            let (data_type, array): (_, ArrayRef) = if single {
+                (
+                    DataTypes::float(),
+                    std::sync::Arc::new(Float32Array::from(
+                        bits.iter()
+                            .map(|bits| Some(f64::from_bits(*bits) as f32))
+                            .chain([None])
+                            .collect::<Vec<_>>(),
+                    )),
+                )
+            } else {
+                (
+                    DataTypes::double(),
+                    std::sync::Arc::new(Float64Array::from(
+                        bits.iter()
+                            .map(|bits| Some(f64::from_bits(*bits)))
+                            .chain([None])
+                            .collect::<Vec<_>>(),
+                    )),
+                )
+            };
+            for literal in [f64::NAN, f64::from_bits(bits[3])] {
+                assert_comparisons(
+                    data_type.clone(),
+                    array.clone(),
+                    Literal::Float64(literal),
+                    vec![
+                        Some(Ordering::Equal),
+                        Some(Ordering::Equal),
+                        Some(Ordering::Equal),
+                        Some(Ordering::Equal),
+                        Some(Ordering::Equal),
+                        None,
+                    ],
+                );
+            }
+        }
+    }
 
     // Independent comparison path for membership differential tests.
     fn evaluate_membership_linear(

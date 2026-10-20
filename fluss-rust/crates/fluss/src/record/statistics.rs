@@ -312,27 +312,17 @@ fn column_bounds(column: &dyn Array, data_type: &DataType) -> Result<Option<Colu
                 .as_any()
                 .downcast_ref::<PrimitiveArray<$arrow_ty>>()
                 .ok_or_else(|| unexpected_array(column, data_type))?;
-            let java_cmp =
-                |a: <$arrow_ty as arrow::datatypes::ArrowPrimitiveType>::Native,
-                 b: <$arrow_ty as arrow::datatypes::ArrowPrimitiveType>::Native| {
-                    match (a.is_nan(), b.is_nan()) {
-                        (true, true) => std::cmp::Ordering::Equal,
-                        (true, false) => std::cmp::Ordering::Greater,
-                        (false, true) => std::cmp::Ordering::Less,
-                        (false, false) => a.total_cmp(&b),
-                    }
-                };
             let mut bounds = None;
             for value in array.iter().flatten() {
                 bounds = Some(match bounds {
                     None => (value, value),
                     Some((min, max)) => (
-                        if java_cmp(value, min).is_lt() {
+                        if crate::util::compare_floats(f64::from(value), f64::from(min)).is_lt() {
                             value
                         } else {
                             min
                         },
-                        if java_cmp(value, max).is_gt() {
+                        if crate::util::compare_floats(f64::from(value), f64::from(max)).is_gt() {
                             value
                         } else {
                             max

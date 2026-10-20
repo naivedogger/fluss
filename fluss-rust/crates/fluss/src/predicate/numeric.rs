@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_special_values_keep_existing_arrow_total_order() {
+    fn floating_special_values_follow_fluss_ordering() {
         use Ordering::{Equal as E, Greater as G, Less as L};
         let values = Float64Array::from(vec![
             Some(-f64::NAN),
@@ -381,13 +381,13 @@ mod tests {
         for data_type in [DataTypes::float(), DataTypes::double()] {
             let array = cast(&values, &crate::record::to_arrow_type(&data_type).unwrap()).unwrap();
             for (literal, expected) in [
-                (-0.0, [L, L, E, G, G, G]),
-                (0.0, [L, L, L, E, G, G]),
-                (f64::NAN, [L, L, L, L, L, E]),
-                (f64::MAX, [L, L, L, L, G, G]),
-                (-f64::MAX, [L, L, G, G, G, G]),
-                (f64::from_bits(1), [L, L, L, L, G, G]),
-                (-f64::from_bits(1), [L, L, G, G, G, G]),
+                (-0.0, [G, L, E, G, G, G]),
+                (0.0, [G, L, L, E, G, G]),
+                (f64::NAN, [E, L, L, L, L, E]),
+                (f64::MAX, [G, L, L, L, G, G]),
+                (-f64::MAX, [G, L, G, G, G, G]),
+                (f64::from_bits(1), [G, L, L, L, G, G]),
+                (-f64::from_bits(1), [G, L, G, G, G, G]),
             ] {
                 assert_comparisons(
                     data_type.clone(),

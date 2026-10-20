@@ -49,8 +49,9 @@ pub enum BoundPredicate {
 impl BoundPredicate {
     /// Binds an optional predicate to `row_type`, rewriting numeric bounds exactly.
     /// Numeric comparisons use the literal's value, not a lossy cast to the column
-    /// type. Floating comparisons retain Arrow's total ordering, including signed
-    /// zeros and NaNs. Other physical representations are checked by the evaluator.
+    /// type. Floating comparisons follow Fluss: all NaNs compare equal and above
+    /// infinity, while signed zeros remain distinct. Other physical representations
+    /// are checked by the evaluator.
     #[doc(hidden)]
     pub fn bind(predicate: Option<&Predicate>, row_type: &RowType) -> Result<Self> {
         match predicate {
@@ -108,9 +109,10 @@ impl BoundPredicate {
     /// Returns a conservative predicate for Fluss log-batch pruning.
     ///
     /// Uses the rewritten bounds, not the original literals. Floating comparisons
-    /// are omitted because backend NaN and signed-zero semantics can differ from
-    /// Arrow. `None` means no pruning; callers must still apply this bound predicate
-    /// to the returned rows. A partially supported `OR` is never pushed down.
+    /// remain excluded from this pushdown path; this method does not negotiate
+    /// backend capabilities. `None` means no pruning; callers must still apply
+    /// this bound predicate to the returned rows. A partially supported `OR` is
+    /// never pushed down.
     #[doc(hidden)]
     pub fn to_pushdown_predicate(&self) -> Option<Predicate> {
         match self {

@@ -99,29 +99,6 @@ impl Literal {
         matches!(self, Self::Null)
     }
 
-    /// Returns an integer value for conservative pruning: dates use epoch days,
-    /// times use milliseconds. Timestamps return `None`; pruning them requires
-    /// an explicit unit and preservation of the sub-millisecond fraction.
-    #[doc(hidden)]
-    pub fn as_integer(&self) -> Option<i128> {
-        match self {
-            Self::Int8(value) => Some(i128::from(*value)),
-            Self::Int16(value) => Some(i128::from(*value)),
-            Self::Int32(value) | Self::Date(value) | Self::Time(value) => Some(i128::from(*value)),
-            Self::Int64(value) => Some(i128::from(*value)),
-            _ => None,
-        }
-    }
-
-    /// Returns the string value useful for conservative pruning.
-    #[doc(hidden)]
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value),
-            _ => None,
-        }
-    }
-
     /// Converts this literal into a Fluss row datum.
     #[doc(hidden)]
     pub fn to_datum(&self) -> Datum<'static> {
@@ -479,28 +456,6 @@ mod tests {
                 ]
             )
         );
-    }
-
-    #[test]
-    fn pruning_integer_conversion_preserves_units_and_rejects_timestamps() {
-        assert_eq!(
-            Literal::Int64(i64::MIN).as_integer(),
-            Some(i128::from(i64::MIN))
-        );
-        assert_eq!(Literal::Date(-1).as_integer(), Some(-1));
-        assert_eq!(Literal::Time(123).as_integer(), Some(123));
-        for (millis, nanos) in [(0, 0), (1, 1), (-1, 999_999), (i64::MAX, 999_999)] {
-            assert_eq!(
-                Literal::TimestampNtz(TimestampNtz::from_millis_nanos(millis, nanos).unwrap())
-                    .as_integer(),
-                None
-            );
-            assert_eq!(
-                Literal::TimestampLtz(TimestampLtz::from_millis_nanos(millis, nanos).unwrap())
-                    .as_integer(),
-                None
-            );
-        }
     }
 
     #[test]
