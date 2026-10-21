@@ -267,12 +267,7 @@ fluss/
 
 ### Rust Client Logging
 
-- Emit shared operations through the Rust core's `log` facade. The embedding application owns logger installation, filtering, output, and retention; bindings should avoid duplicate core events.
-- Use the corresponding Java operation as the level reference: TRACE for sender wakeup, flush, and batch completion; DEBUG for sender/connection lifecycle and writer sequence assignment; INFO for writer close; WARN for write retries, final batch failures, and graceful close timeout; ERROR for fetch failures (including retriable errors), connection setup failures, and unexpected sender failures. Keep retry decisions and returned errors unchanged.
-- Include existing table, bucket, batch, sequence, attempt, offset, or server identifiers as relevant. Batch IDs are local to an accumulator. Keep each retry visible and emit terminal completion only once.
-- Do not log rows, keys, payloads, credentials, tokens, or full configurations. Error text may originate at the server and must also be checked for sensitive values.
-- Keep routine diagnostics at batch/lifecycle boundaries. Pass values directly to logging macros; guard expensive diagnostic-only computation with `log::log_enabled!`. Enabled logs may block through the application's backend.
-- Test useful context and filtering alongside operation results, retry behavior, and metadata invalidation. Use the test-only `LogCapture` helper with synchronous tests or a current-thread Tokio runtime.
+Use the shared `log` facade and the corresponding Java operation as the reference for log levels. Preserve error and retry semantics, avoid logging sensitive data, and leave logger installation and output configuration to the embedding application.
 
 ---
 
