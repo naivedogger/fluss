@@ -126,8 +126,3 @@ CI runs formatting and clippy checks. Run these before submitting a PR:
 cargo fmt --all
 cargo clippy --all-targets --fix --allow-dirty --allow-staged
 ```
-
-## Logging
-
-Follow the [client logging conventions](logging.md) when adding or changing Rust
-client diagnostics, including events used by language bindings.
