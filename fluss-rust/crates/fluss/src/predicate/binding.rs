@@ -108,11 +108,11 @@ impl BoundPredicate {
 
     /// Returns a conservative predicate for Fluss log-batch pruning.
     ///
-    /// Uses the rewritten bounds, not the original literals. Floating comparisons
-    /// remain excluded from this pushdown path; this method does not negotiate
-    /// backend capabilities. `None` means no pruning; callers must still apply
-    /// this bound predicate to the returned rows. A partially supported `OR` is
-    /// never pushed down.
+    /// Uses the rewritten bounds, not the original literals, and excludes filters
+    /// whose server-side statistics semantics may discard matching rows. This
+    /// method does not negotiate backend capabilities. `None` means no pruning;
+    /// callers must still apply this bound predicate to the returned rows.
+    /// A partially supported `OR` is never pushed down.
     #[doc(hidden)]
     pub fn to_pushdown_predicate(&self) -> Option<Predicate> {
         match self {
@@ -124,9 +124,17 @@ impl BoundPredicate {
                 literals,
                 ..
             } => {
-                if matches!(data_type, DataType::Float(_) | DataType::Double(_))
+                // TIME statistics store milliseconds even for finer-precision columns.
+                let null_checks_only =
+                    matches!(data_type, DataType::Float(_) | DataType::Double(_))
+                        || matches!(data_type, DataType::Time(time) if time.precision() > 3);
+                if null_checks_only
                     && !matches!(function, LeafFunction::IsNull | LeafFunction::IsNotNull)
                 {
+                    return None;
+                }
+                // Server prefix pruning uses UTF-16 ordering, unlike UTF-8 min/max.
+                if matches!(function, LeafFunction::StartsWith) {
                     return None;
                 }
                 Some(Predicate::Leaf {
@@ -239,6 +247,122 @@ mod tests {
         let bound = BoundPredicate::bind(Some(&predicate), &row_type()).unwrap();
 
         assert_eq!(bound.referenced_field_indexes(), vec![1, 0]);
+    }
+
+    #[test]
+    fn pushdown_keeps_only_statistics_safe_conditions() {
+        for (data_type, functions, literal, safe) in [
+            (
+                DataTypes::time_with_precision(3),
+                vec![LeafFunction::GreaterThan],
+                Literal::Time(0),
+                true,
+            ),
+            (
+                DataTypes::time_with_precision(6),
+                vec![LeafFunction::GreaterThan],
+                Literal::Time(0),
+                false,
+            ),
+            (
+                DataTypes::time_with_precision(9),
+                vec![
+                    LeafFunction::Equal,
+                    LeafFunction::NotEqual,
+                    LeafFunction::LessThan,
+                    LeafFunction::LessOrEqual,
+                    LeafFunction::GreaterThan,
+                    LeafFunction::GreaterOrEqual,
+                    LeafFunction::In,
+                    LeafFunction::NotIn,
+                ],
+                Literal::Time(0),
+                false,
+            ),
+            (
+                DataTypes::float(),
+                vec![LeafFunction::Equal],
+                Literal::Float32(0.0),
+                false,
+            ),
+            (
+                DataTypes::double(),
+                vec![LeafFunction::Equal],
+                Literal::Float64(0.0),
+                false,
+            ),
+            (
+                DataTypes::string(),
+                vec![LeafFunction::StartsWith],
+                Literal::String("\u{e000}".into()),
+                false,
+            ),
+            (
+                DataTypes::char(4),
+                vec![LeafFunction::StartsWith],
+                Literal::String("A".into()),
+                false,
+            ),
+            (
+                DataTypes::string(),
+                vec![LeafFunction::Equal, LeafFunction::LessThan],
+                Literal::String("A".into()),
+                true,
+            ),
+        ] {
+            let row_type = RowType::new(vec![DataField::new("c", data_type, None)]);
+            let pushdown = |predicate: &Predicate| {
+                BoundPredicate::bind(Some(predicate), &row_type)
+                    .unwrap()
+                    .to_pushdown_predicate()
+            };
+            let not_null = col("c").is_not_null();
+            assert_eq!(pushdown(&not_null), Some(not_null.clone()));
+            assert_eq!(pushdown(&col("c").is_null()), Some(col("c").is_null()));
+            for function in functions {
+                let predicate = Predicate::Leaf {
+                    field: "c".into(),
+                    function,
+                    literals: vec![literal.clone()],
+                };
+                assert_eq!(
+                    pushdown(&predicate),
+                    safe.then(|| predicate.clone()),
+                    "{row_type:?}, {function:?}"
+                );
+                if !safe {
+                    assert_eq!(
+                        pushdown(&predicate.clone().and(not_null.clone())),
+                        Some(not_null.clone())
+                    );
+                    assert_eq!(pushdown(&predicate.or(not_null.clone())), None);
+                }
+            }
+        }
+
+        let row_type = RowType::new(vec![DataField::new("c", DataTypes::string(), None)]);
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+            "c",
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                Some("\u{e000}"),
+                Some("\u{10000}"),
+                None,
+            ])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let bound =
+            BoundPredicate::bind(Some(&col("c").starts_with("\u{e000}")), &row_type).unwrap();
+        assert_eq!(
+            bound
+                .into_evaluator()
+                .unwrap()
+                .evaluate_batch(&batch)
+                .unwrap()
+                .values()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
     }
 
     #[test]
