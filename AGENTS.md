@@ -265,6 +265,13 @@ fluss/
 
 **Error propagation:** Async operations use `ExceptionUtils.wrapAsUnchecked()` to wrap checked exceptions; use `.exceptionally()` for CompletableFuture error handling
 
+### Rust Client Logging
+
+Follow the [client logging conventions](fluss-rust/website/docs/developer-guide/logging.md)
+for Rust core and binding diagnostics. Use the shared `log` facade and the Java
+operation's level as the reference; keep retry/error behavior unchanged. Logger
+installation and output configuration belong to the embedding application.
+
 ---
 
 ## 5. Concurrency & Thread Safety

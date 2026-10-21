@@ -34,7 +34,7 @@ use crate::rpc::message::{
 };
 use crate::rpc::transport::Transport;
 use futures::future::BoxFuture;
-use log::warn;
+use log::{debug, error, warn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt;
@@ -249,10 +249,14 @@ impl RpcClient {
     }
 
     async fn connect(&self, server_node: &ServerNode) -> Result<ServerConnection, Error> {
+        debug!("Creating connection to server {server_node:?}");
         let url = server_node.url();
         let transport = Transport::connect(&url, self.timeout)
             .await
-            .map_err(|error| ConnectionError(error.to_string()))?;
+            .map_err(|error| {
+                error!("Failed to establish connection to server {server_node:?}: {error}");
+                ConnectionError(error.to_string())
+            })?;
 
         let messenger = ServerConnectionInner::new(
             BufStream::new(transport),
@@ -262,12 +266,22 @@ impl RpcClient {
         let connection = ServerConnection::new(messenger);
 
         // Negotiate API versions (must happen before authentication).
-        Self::check_api_versions(&connection, server_node.server_type()).await?;
+        Self::check_api_versions(&connection, server_node.server_type())
+            .await
+            .inspect_err(|e| {
+                error!("API version handshake failed for server {server_node:?}: {e}");
+            })?;
 
         if let Some(ref sasl) = self.sasl_config {
-            Self::authenticate(&connection, &sasl.username, &sasl.password).await?;
+            debug!("Beginning SASL/PLAIN authentication with server {server_node:?}");
+            Self::authenticate(&connection, &sasl.username, &sasl.password)
+                .await
+                .inspect_err(|e| {
+                    error!("Authentication failed for server {server_node:?}: {e}");
+                })?;
         }
 
+        debug!("Connection to server {server_node:?} is ready");
         Ok(connection)
     }
 
@@ -903,6 +917,107 @@ mod tests {
             {
                 return;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle_logs_preserve_errors_and_omit_credentials() {
+        use crate::error::FlussError;
+        use crate::proto::{ApiVersionsResponse, AuthenticateResponse, ErrorResponse};
+        use prost::Message;
+
+        // Fail the version handshake, fail authentication, then establish a connection.
+        for fail_at in [Some(0), Some(1), None] {
+            let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Trace);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for step in 0..2 {
+                    let len = stream.read_i32().await.unwrap() as usize;
+                    let mut request = vec![0; len];
+                    stream.read_exact(&mut request).await.unwrap();
+                    let failed = fail_at == Some(step);
+                    let body = if failed {
+                        ErrorResponse {
+                            error_code: FlussError::AuthenticateException.code(),
+                            error_message: Some("test rejection".to_string()),
+                        }
+                        .encode_to_vec()
+                    } else if step == 0 {
+                        ApiVersionsResponse {
+                            api_versions: vec![PbApiVersion {
+                                api_key: i16::from(ApiKey::Authenticate) as i32,
+                                min_version: 0,
+                                max_version: 0,
+                            }],
+                            server_type: None,
+                        }
+                        .encode_to_vec()
+                    } else {
+                        AuthenticateResponse { challenge: None }.encode_to_vec()
+                    };
+                    let mut response = vec![u8::from(failed)];
+                    response.extend_from_slice(&request[4..8]);
+                    response.extend(body);
+                    stream.write_i32(response.len() as i32).await.unwrap();
+                    stream.write_all(&response).await.unwrap();
+                    stream.flush().await.unwrap();
+                    if failed {
+                        break;
+                    }
+                }
+            });
+            let node = ServerNode::new(
+                7,
+                address.ip().to_string(),
+                address.port() as u32,
+                ServerType::TabletServer,
+            );
+            let result = RpcClient::new()
+                .with_sasl("private-user".to_string(), "private-password".to_string())
+                .connect(&node)
+                .await;
+            server.await.unwrap();
+            match fail_at {
+                Some(step) => {
+                    assert!(matches!(result, Err(Error::FlussAPIError { ref api_error })
+                        if api_error.code == FlussError::AuthenticateException.code()
+                            && api_error.message == "test rejection"));
+                    logs.assert_contains(
+                        log::Level::Error,
+                        &[
+                            if step == 0 {
+                                "API version handshake failed"
+                            } else {
+                                "Authentication failed"
+                            },
+                            "test rejection",
+                            "127.0.0.1",
+                        ],
+                    );
+                    assert!(
+                        !logs
+                            .records()
+                            .iter()
+                            .any(|(_, text)| text.contains("is ready"))
+                    );
+                }
+                None => {
+                    assert!(result.is_ok());
+                    logs.assert_contains(
+                        log::Level::Debug,
+                        &["Connection", "is ready", "127.0.0.1"],
+                    );
+                }
+            }
+            logs.assert_contains(log::Level::Debug, &["Creating connection", "127.0.0.1"]);
+            assert!(
+                logs.records()
+                    .iter()
+                    .all(|(_, text)| !text.contains("private-user")
+                        && !text.contains("private-password"))
+            );
         }
     }
 

@@ -33,7 +33,7 @@ use crate::rpc::message::{InitWriterRequest, ProduceLogRequest, PutKvRequest};
 use crate::{BucketId, PartitionId, TableId};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -195,7 +195,7 @@ impl Sender {
 
     fn maybe_abort_batches(&self, error: &crate::error::Error) {
         if self.accumulator.has_incomplete() {
-            warn!("Aborting write batches due to fatal error: {error}");
+            error!("Aborting write batches due to fatal error: {error}");
             self.accumulator.abort_batches(broadcast::Error::Client {
                 message: format!("Writer ID allocation failed: {error}"),
             });
@@ -618,6 +618,15 @@ impl Sender {
         fluss_error: Option<FlussError>,
         adjust_sequences: bool,
     ) {
+        warn!(
+            "Write batch failed for table {}, bucket {}, batch_id={}, sequence={}, \
+             attempts={}: {error}",
+            ready_write_batch.write_batch.physical_table_path(),
+            ready_write_batch.table_bucket,
+            ready_write_batch.write_batch.batch_id(),
+            ready_write_batch.write_batch.batch_sequence(),
+            ready_write_batch.write_batch.attempts()
+        );
         if self.idempotence_manager.is_enabled()
             && ready_write_batch.write_batch.batch_sequence() != NO_BATCH_SEQUENCE
         {
@@ -733,9 +742,14 @@ impl Sender {
 
         if self.can_retry(&ready_write_batch, error) {
             warn!(
-                "Retrying write batch for {} on bucket {} after error {error:?}: {message}",
+                "Retrying write batch for {} on bucket {}, batch_id={}, \
+                 sequence={} ({} attempts left) after error {error:?}: {message}",
                 physical_table_path.as_ref(),
-                ready_write_batch.table_bucket.bucket_id()
+                ready_write_batch.table_bucket,
+                ready_write_batch.write_batch.batch_id(),
+                ready_write_batch.write_batch.batch_sequence(),
+                self.retries
+                    .saturating_sub(ready_write_batch.write_batch.attempts())
             );
 
             // If idempotence is enabled, only retry if the current writer ID still matches
@@ -1068,6 +1082,7 @@ impl Sender {
     ///   after the previous one ended, so a bucket without a leader is not polled
     ///   as fast as the server answers.
     pub async fn run_with_shutdown(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
+        debug!("Starting Fluss write sender");
         let mut pending: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
         let mut init_futs: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
         let mut meta_futs: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
@@ -1128,7 +1143,7 @@ impl Sender {
                             }
                         }
                         Err(e) => {
-                            warn!("Error in drain cycle: {e}");
+                            error!("Error in drain cycle: {e}");
                         }
                     }
                 }
@@ -1151,7 +1166,7 @@ impl Sender {
                 // Process in-flight send responses.
                 Some(result) = pending.next(), if !pending.is_empty() => {
                     if let Err(e) = result {
-                        warn!("Uncaught error in send request, continuing: {e}");
+                        error!("Uncaught error in send request, continuing: {e}");
                     }
                     need_drain = true;
                 }
@@ -1186,19 +1201,21 @@ impl Sender {
             }
         }
 
+        debug!("Beginning shutdown of Fluss write sender, draining remaining batches");
         // Graceful shutdown: drain remaining batches, then wait for all
         // in-flight sends to complete.
         while self.accumulator.has_undrained() {
             if let Err(e) = self.run_once().await {
-                warn!("Error during shutdown drain, continuing: {e}");
+                error!("Error during shutdown drain, continuing: {e}");
             }
         }
         while let Some(result) = pending.next().await {
             if let Err(e) = result {
-                warn!("Error in send during shutdown, continuing: {e}");
+                error!("Error in send during shutdown, continuing: {e}");
             }
         }
         self.close();
+        debug!("Shutdown of Fluss write sender has completed");
         Ok(())
     }
 
@@ -1331,6 +1348,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_write_batch_error_retries() -> Result<()> {
+        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Info);
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
         let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
@@ -1352,7 +1370,7 @@ mod tests {
             Arc::new(crate::metrics::WriterMetrics::new()),
         );
 
-        let (batch, _handle) =
+        let (batch, handle) =
             build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path.clone())?;
         let mut inflight = HashMap::new();
         inflight.insert(1, vec![batch]);
@@ -1371,9 +1389,29 @@ mod tests {
         let server = cluster.get_tablet_server(1).expect("server");
         let nodes = HashSet::from([server.clone()]);
         let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        sender.add_to_inflight_batches(&batches);
         let mut drained = batches.remove(&1).expect("drained batches");
         let batch = drained.pop().expect("batch");
         assert_eq!(batch.write_batch.attempts(), 1);
+        logs.assert_contains(
+            log::Level::Warn,
+            &["db.tbl", "batch_id=", "sequence=", "timeout"],
+        );
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::RequestTimeOut,
+            "retries exhausted".to_string(),
+            &mut Vec::new(),
+        )?;
+        assert!(matches!(
+            handle.wait().await?,
+            Err(broadcast::Error::WriteFailed { code, .. })
+                if code == FlussError::RequestTimeOut.code()
+        ));
+        logs.assert_contains(
+            log::Level::Warn,
+            &["Write batch failed", "attempts=1", "retries exhausted"],
+        );
         Ok(())
     }
 
@@ -1928,6 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_write_batch_error_fails() -> Result<()> {
+        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Info);
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
         let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
@@ -1963,6 +2002,17 @@ mod tests {
             Err(broadcast::Error::WriteFailed { code, .. })
                 if code == FlussError::InvalidTableException.code()
         ));
+        logs.assert_contains(
+            log::Level::Warn,
+            &[
+                "Write batch failed",
+                "db.tbl",
+                "bucket",
+                "batch_id=",
+                "attempts=0",
+                "invalid",
+            ],
+        );
         Ok(())
     }
 
@@ -2414,6 +2464,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_writer_state_assigned_on_drain() -> Result<()> {
+        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Debug);
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
         let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
         let idempotence = enabled_idempotence();
@@ -2442,6 +2493,10 @@ mod tests {
         let batch = &batch_list[0];
         assert_eq!(batch.write_batch.batch_sequence(), 0);
         assert_eq!(batch.write_batch.writer_id(), 99);
+        logs.assert_contains(
+            log::Level::Debug,
+            &["writer_id=99", "sequence=0", "batch_id=", "bucket"],
+        );
         Ok(())
     }
 

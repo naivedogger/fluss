@@ -99,6 +99,20 @@ impl InnerWriteBatch {
         {
             return false;
         }
+        match &write_result {
+            Ok(()) => log::trace!(
+                "Successfully produced batch_id={} to table {}, table_id={}",
+                self.batch_id,
+                self.physical_table_path,
+                self.table_id
+            ),
+            Err(error) => log::trace!(
+                "Failed to produce batch_id={} to table {}, table_id={}: {error}",
+                self.batch_id,
+                self.physical_table_path,
+                self.table_id
+            ),
+        }
         self.results.broadcast(write_result);
         true
     }
@@ -479,11 +493,40 @@ mod tests {
 
     #[test]
     fn complete_only_once() {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let physical_path = PhysicalTablePath::of(Arc::new(table_path));
-        let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 1, 0);
-        assert!(batch.complete(Ok(())));
-        assert!(!batch.complete(Err(crate::client::broadcast::Error::Dropped)));
+        for level in [log::LevelFilter::Trace, log::LevelFilter::Info] {
+            for fail in [false, true] {
+                let logs = crate::test_utils::log_capture::LogCapture::new(level);
+                let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+                let physical_path = PhysicalTablePath::of(Arc::new(table_path));
+                let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 1, 0);
+                let result = if fail {
+                    Err(crate::client::broadcast::Error::Dropped)
+                } else {
+                    Ok(())
+                };
+                assert!(batch.complete(result));
+                assert!(!batch.complete(Ok(())));
+                assert!(!batch.complete(Err(crate::client::broadcast::Error::Dropped)));
+                if level == log::LevelFilter::Trace {
+                    assert_eq!(logs.records().len(), 1);
+                    logs.assert_contains(
+                        log::Level::Trace,
+                        &[
+                            if fail {
+                                "Failed to produce"
+                            } else {
+                                "Successfully produced"
+                            },
+                            "batch_id=1",
+                            "db.tbl",
+                            "table_id=1",
+                        ],
+                    );
+                } else {
+                    assert!(logs.records().is_empty());
+                }
+            }
+        }
     }
 
     #[test]

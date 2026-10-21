@@ -12,6 +12,7 @@ const sidebars: SidebarsConfig = {
       ],
     },
     'developer-guide/contributing',
+    'developer-guide/logging',
     {
       type: 'category',
       label: 'Release',
