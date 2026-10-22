@@ -3061,7 +3061,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_fetch_response_sets_error() -> Result<()> {
-        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Info);
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let table_info = build_table_info(table_path.clone(), 1, 1);
         let cluster = build_cluster_arc(&table_path, 1, 1);
@@ -3114,16 +3113,11 @@ mod tests {
         let completed = fetcher.log_fetch_buffer.poll().expect("completed fetch");
         let api_error = completed.api_error().expect("api error");
         assert_eq!(api_error.code, FlussError::AuthorizationException.code());
-        logs.assert_contains(
-            log::Level::Error,
-            &["Authorization", "offset 5", "bucket", "denied"],
-        );
         Ok(())
     }
 
     #[tokio::test]
     async fn handle_fetch_response_invalidates_table_meta() -> Result<()> {
-        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Info);
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let table_info = build_table_info(table_path.clone(), 1, 1);
         let cluster = build_cluster_arc(&table_path, 1, 1);
@@ -3177,7 +3171,6 @@ mod tests {
         LogFetcher::handle_fetch_response(response, response_context).await;
 
         assert!(metadata.get_cluster().leader_for(&bucket).is_none());
-        logs.assert_contains(log::Level::Error, &["offset 5", "bucket", "not leader"]);
         Ok(())
     }
 

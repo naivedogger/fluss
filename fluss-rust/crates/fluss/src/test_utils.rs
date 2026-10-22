@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod log_capture;
-
 use crate::client::WriteRecord;
 use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
 use crate::compression::{

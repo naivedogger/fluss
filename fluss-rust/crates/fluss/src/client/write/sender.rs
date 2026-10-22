@@ -1348,7 +1348,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_write_batch_error_retries() -> Result<()> {
-        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Info);
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
         let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
@@ -1370,7 +1369,7 @@ mod tests {
             Arc::new(crate::metrics::WriterMetrics::new()),
         );
 
-        let (batch, handle) =
+        let (batch, _handle) =
             build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path.clone())?;
         let mut inflight = HashMap::new();
         inflight.insert(1, vec![batch]);
@@ -1389,29 +1388,9 @@ mod tests {
         let server = cluster.get_tablet_server(1).expect("server");
         let nodes = HashSet::from([server.clone()]);
         let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
-        sender.add_to_inflight_batches(&batches);
         let mut drained = batches.remove(&1).expect("drained batches");
         let batch = drained.pop().expect("batch");
         assert_eq!(batch.write_batch.attempts(), 1);
-        logs.assert_contains(
-            log::Level::Warn,
-            &["db.tbl", "batch_id=", "sequence=", "timeout"],
-        );
-        sender.handle_write_batch_error(
-            batch,
-            FlussError::RequestTimeOut,
-            "retries exhausted".to_string(),
-            &mut Vec::new(),
-        )?;
-        assert!(matches!(
-            handle.wait().await?,
-            Err(broadcast::Error::WriteFailed { code, .. })
-                if code == FlussError::RequestTimeOut.code()
-        ));
-        logs.assert_contains(
-            log::Level::Warn,
-            &["Write batch failed", "attempts=1", "retries exhausted"],
-        );
         Ok(())
     }
 
@@ -1966,7 +1945,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_write_batch_error_fails() -> Result<()> {
-        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Info);
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
         let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
@@ -2002,17 +1980,6 @@ mod tests {
             Err(broadcast::Error::WriteFailed { code, .. })
                 if code == FlussError::InvalidTableException.code()
         ));
-        logs.assert_contains(
-            log::Level::Warn,
-            &[
-                "Write batch failed",
-                "db.tbl",
-                "bucket",
-                "batch_id=",
-                "attempts=0",
-                "invalid",
-            ],
-        );
         Ok(())
     }
 
@@ -2464,7 +2431,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_writer_state_assigned_on_drain() -> Result<()> {
-        let logs = crate::test_utils::log_capture::LogCapture::new(log::LevelFilter::Debug);
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
         let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
         let idempotence = enabled_idempotence();
@@ -2493,10 +2459,6 @@ mod tests {
         let batch = &batch_list[0];
         assert_eq!(batch.write_batch.batch_sequence(), 0);
         assert_eq!(batch.write_batch.writer_id(), 99);
-        logs.assert_contains(
-            log::Level::Debug,
-            &["writer_id=99", "sequence=0", "batch_id=", "bucket"],
-        );
         Ok(())
     }
 

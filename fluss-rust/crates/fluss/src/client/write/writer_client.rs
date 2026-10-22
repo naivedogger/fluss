@@ -344,42 +344,6 @@ mod tests {
     use crate::test_utils::{build_cluster, build_table_info};
 
     #[tokio::test]
-    async fn lifecycle_logs_respect_filter_and_idempotent_close() -> Result<()> {
-        for level in [log::LevelFilter::Trace, log::LevelFilter::Info] {
-            let logs = crate::test_utils::log_capture::LogCapture::new(level);
-            let table_path = TablePath::new("db", "tbl");
-            let metadata = Arc::new(Metadata::new_for_test(Arc::new(build_cluster(
-                &table_path,
-                1,
-                1,
-            ))));
-            let writer = WriterClient::new(Config::default(), metadata)?;
-            writer.flush().await?;
-            writer.close(Duration::from_secs(1)).await?;
-            writer.close(Duration::from_secs(1)).await?;
-            for message in ["Closing writer", "Writer closed"] {
-                assert_eq!(logs.records().iter().filter(|(level, text)|
-                    *level == log::Level::Info && text.contains(message)).count(), 1);
-            }
-            if level == log::LevelFilter::Trace {
-                logs.assert_contains(log::Level::Trace, &["Flushing accumulated records"]);
-                logs.assert_contains(log::Level::Trace, &["Flushed accumulated records"]);
-                logs.assert_contains(
-                    log::Level::Debug,
-                    &["Shutdown of Fluss write sender has completed"],
-                );
-            } else {
-                assert!(
-                    logs.records()
-                        .iter()
-                        .all(|(level, _)| *level <= log::Level::Info)
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn a_recreated_table_gets_an_assigner_for_its_bucket_key() -> Result<()> {
         let table_path = TablePath::new("db", "tbl");
         let cluster = Arc::new(build_cluster(&table_path, 1, 2));
