@@ -53,20 +53,21 @@ Other build dependencies still need network access or an existing cache.
 ## Compare once per arm
 
 After smoke passes, run `python3 run.py run` in baseline, then in fixed; do not run
-both simultaneously. Review the results and reclaim baseline's test-table storage
+both simultaneously. Each arm sends for five minutes, followed by drain and readback.
+Review the results and reclaim baseline's test-table storage
 before starting fixed if space is limited. Tables are retained; delete them manually.
 
 | Parameter | Smoke | Full run |
 | --- | --- | --- |
 | Processes × writers | 4 × 5 | 4 × 5 |
 | Total target rows/s | 1,000 | 400,000 |
-| Warmup + measurement | 2 + 5 seconds | 120 + 600 seconds |
+| Warmup + measurement | 2 + 5 seconds | 60 + 240 seconds |
 | Payload / buckets | 1 KiB / 32 | 1 KiB / 32 |
 
 Both use one log table, one connection per process, dynamic batches from 256 KiB to
 2 MiB, linger 100 ms, buffer 256 MiB/connection, idempotence, acks=all and 5 inflight
 requests/bucket. Actual batch sizes depend on load. RF=2 full-run replicated payload
-alone is about 549 GiB per arm; check **server** capacity, not the ECS client disk.
+alone is about 229 GiB per arm; check **server** capacity, not the ECS client disk.
 
 ## Results
 
