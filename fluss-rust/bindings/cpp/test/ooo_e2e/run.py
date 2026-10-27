@@ -292,7 +292,7 @@ def main():
         build(args)
         return
     c = config(args.config, args.database)
-    warm, measure, rate = (2, 5, 1000) if args.command == "smoke" else (120, 600, 400000)
+    warm, measure, rate = (2, 5, 1000) if args.command == "smoke" else (60, 240, 400000)
     name = "ooo_" + uuid.uuid4().hex[:12]
     directory = HERE / "runs" / name
     directory.mkdir(parents=True)
