@@ -92,6 +92,37 @@ Keep each writer below 100 million records per run: the harness uses disjoint 32
 ID ranges and stops if a writer exhausts its range (4 million rows/s for five minutes
 with 20 writers targets 60 million records per writer).
 
+## Read an existing run from remote storage
+
+Pull and rebuild the fixed checkout, then reuse a completed run on the **same cluster**:
+
+```bash
+python3 run.py readback --config /root/cpp-test/config.json \
+  --run-dir /root/cpp-test/fluss-ooo-fixed/fluss-rust/bindings/cpp/test/ooo_e2e/runs/ooo_a3d7b880631d
+```
+
+This only scans the original table from offset 0; no setup, writes or deletion.
+Keep the original `manifest.json`, `result.json`, `setup.log` and `counts-0` through
+`counts-3`. The table ID must still match. Payload size comes from that run's manifest,
+not the current config. Results go into a fresh `readback_<id>` subdirectory printed
+as `READBACK_DIR`; original results remain unchanged. The read timeout is one hour.
+
+The command enables `fluss::client::table::remote_log=debug`. After full ID verification,
+`result.json` reports download chunk log observations by URI scheme:
+
+- `ossj_observed` / `oss_observed`: ID verification passed and remote download activity
+  was observed. `ossj://` is handled by Rust's OSS/OpenDAL path, not the native Jindo SDK.
+- `other_remote_observed`: remote activity used another scheme; not OSS coverage.
+- `remote_not_observed` (exit 2): ID verification passed, but remote reads remain unproven.
+- `failed`: scan/verification failed or log evidence was incomplete; inspect `verify.log`
+  and `sdk-logs/` in the new subdirectory.
+
+Remote reads require uploaded segments whose local copies are no longer available;
+exceeding segment size alone is insufficient. No retention settings are changed here.
+The chunk logs are sampled and may include prefetch: they do not measure exact remote
+bytes or consumed offsets. Scan rows/s and payload MiB/s include local/remote reads and
+ID verification, not pure OSS bandwidth. ID checks do not compare payload contents.
+
 ## Results
 
 Each invocation prints `RUN_DIR`, containing:

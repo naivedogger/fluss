@@ -178,11 +178,17 @@ int run(int argc, char** argv) {
         ck("table", c.GetTable(path, table));
 
         if (mode == "verify") {
+            if (!env("OOO_TABLE_ID").empty() &&
+                table.GetTableInfo().table_id != std::stoll(env("OOO_TABLE_ID"))) {
+                throw std::runtime_error("table ID changed since the original run");
+            }
+            const std::string countsDir = env("OOO_COUNTS_DIR", dir.c_str());
             std::vector<int> next(20);
             for (int p = 0; p < 4; p++) {
-                std::ifstream f(dir + "/counts-" + std::to_string(p));
+                std::ifstream f(countsDir + "/counts-" + std::to_string(p));
                 for (int t = 0; t < 5; t++)
-                    if (!(f >> next[p * 5 + t])) throw std::runtime_error("missing counts");
+                    if (!(f >> next[p * 5 + t]) || next[p * 5 + t] < 0 || next[p * 5 + t] > STRIDE)
+                        throw std::runtime_error("missing or invalid counts");
             }
             uint64_t expected = std::accumulate(next.begin(), next.end(), uint64_t{0});
             std::unordered_map<int32_t, int64_t> ends;
@@ -346,7 +352,7 @@ int main(int argc, char** argv) {
         fluss::FileLoggingOptions options;
         options.directory = env("OOO_LOG_DIR");
         if (options.directory.empty()) throw std::runtime_error("OOO_LOG_DIR is required");
-        options.filter = "warn,fluss::client::write::idempotence=debug";
+        options.filter = env("OOO_LOG_FILTER", "warn,fluss::client::write::idempotence=debug");
         options.queue_capacity = 8192;
         options.max_files = 8;
         fluss::Logger logger;
