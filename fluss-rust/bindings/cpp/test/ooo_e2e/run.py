@@ -279,11 +279,116 @@ def aggregate(directory, reports):
     return summary
 
 
+def remote_evidence(directory):
+    # Count chunk observations, not bytes or completed downloads. Only use this readback's logs.
+    schemes = {}
+    for path in (directory / "sdk-logs").rglob("client*.log"):
+        with path.open(errors="replace") as f:
+            for line in f:
+                match = re.search(
+                    r"Remote log streaming download: chunk #\d+ \(([A-Za-z][A-Za-z0-9+.-]*)://",
+                    line,
+                )
+                if match:
+                    scheme = match[1].lower()
+                    schemes[scheme] = schemes.get(scheme, 0) + 1
+    return schemes
+
+
+def readback(args, c):
+    if args.run_dir is None:
+        raise ValueError("readback requires --run-dir pointing to the original run")
+    source = args.run_dir.resolve()
+    original = json.loads((source / "manifest.json").read_text())
+    previous = json.loads((source / "result.json").read_text())
+    if previous.get("status") != "completed":
+        raise ValueError("use a completed original run with intact counts files")
+    if c["database"] != original["database"]:
+        raise ValueError("database differs from original run; use --database")
+    setup = records(source / "setup.log", "META ")
+    if len(setup) != 1:
+        raise ValueError("original setup.log with table ID is required")
+    for i in range(4):
+        counts = [int(n) for n in (source / f"counts-{i}").read_text().split()]
+        if len(counts) != 5 or any(n < 0 or n > 100000000 for n in counts):
+            raise ValueError("invalid original counts file")
+    directory = source / ("readback_" + uuid.uuid4().hex[:12])
+    directory.mkdir()
+    revision = sp.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
+    write_json(
+        directory / "manifest.json",
+        dict(
+            mode="readback",
+            source_run=str(source),
+            table=original["table"],
+            database=original["database"],
+            table_id=setup[0]["tableId"],
+            payload_bytes=original["payload_bytes"],
+            checkout_sha=revision,
+            source_checkout_sha=original.get("checkout_sha"),
+            start_utc=dt.datetime.now(dt.timezone.utc).isoformat(),
+        ),
+    )
+    # The current config's workload may have changed since the table was written.
+    c = dict(c, payload_bytes=original["payload_bytes"])
+    env = env_for(c, directory, 0, 0, 1)
+    env.update(
+        OOO_COUNTS_DIR=str(source),
+        OOO_TABLE_ID=str(setup[0]["tableId"]),
+        OOO_LOG_FILTER="warn,fluss::client::write::idempotence=debug,"
+        "fluss::client::table::remote_log=debug",
+    )
+    print("READBACK_DIR", directory, flush=True)
+    result = dict(status="failed")
+    try:
+        call("verify", original["table"], directory, env, 3610)
+        verify = records(directory / "verify.log", "VERIFY ")
+        if len(verify) != 1 or not verify[0]["success"]:
+            raise RuntimeError("readback failed; inspect verify.log")
+        result["verify"] = verify[0]
+        seconds = verify[0]["seconds"]
+        result["scan_rows_per_second"] = verify[0]["read"] / seconds if seconds else None
+        result["scan_payload_mib_per_second"] = (
+            verify[0]["read"] * original["payload_bytes"] / seconds / 1024**2 if seconds else None
+        )
+        logs = logger_summary(directory)
+        if len(logs["stats"]) != 1 or logs["possible_retention_loss"]:
+            raise RuntimeError("readback log evidence incomplete")
+        stats = logs["stats"][0]
+        if (
+            any(stats[k] for k in ("dropped", "truncated", "write_errors"))
+            or stats["accepted"] != stats["written"]
+        ):
+            raise RuntimeError("readback logger lost records")
+        schemes = remote_evidence(directory)
+        if schemes.get("ossj"):
+            result["status"] = "ossj_observed"
+        elif schemes.get("oss"):
+            result["status"] = "oss_observed"
+        else:
+            result["status"] = "other_remote_observed" if schemes else "remote_not_observed"
+    finally:
+        result["verify_records"] = records(directory / "verify.log", "VERIFY ")
+        result["logs"] = logger_summary(directory)
+        result["download_chunk_log_lines_by_scheme"] = remote_evidence(directory)
+        result["note"] = (
+            "Chunk logs prove download activity, not exact remote bytes or consumed offsets. "
+            "Scan rates include mixed local/remote readback and ID verification; not pure OSS bandwidth."
+        )
+        write_json(directory / "result.json", result)
+    print(json.dumps(result, indent=2), flush=True)
+    if result["status"] == "remote_not_observed":
+        print("INCONCLUSIVE: ID readback passed, but no remote download was observed.")
+        raise SystemExit(2)
+    print("DONE: ID readback passed; observed scheme:", result["status"])
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build", "check", "smoke", "run"])
+    parser.add_argument("command", choices=["build", "check", "smoke", "run", "readback"])
     parser.add_argument("--config", type=Path, default=HERE / "config.json")
+    parser.add_argument("--run-dir", type=Path, help="original completed run for readback")
     parser.add_argument(
         "--database", help="existing database; defaults to config.database or fluss"
     )
@@ -298,6 +403,9 @@ def main():
         build(args)
         return
     c = config(args.config, args.database)
+    if args.command == "readback":
+        readback(args, c)
+        return
     warm, measure, rate = (
         (2, 5, 1000) if args.command == "smoke" else (60, 240, c["target_rows_per_second"])
     )
