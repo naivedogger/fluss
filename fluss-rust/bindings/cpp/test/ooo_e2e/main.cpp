@@ -108,7 +108,9 @@ int run(int argc, char** argv) {
         if (argc != 5) throw std::runtime_error("mode table control-dir process-id");
         std::string mode = argv[1], name = argv[2], dir = argv[3];
         int proc = std::stoi(argv[4]);
-        constexpr int buckets = 32, threads = 5, bytes = 1024;
+        constexpr int buckets = 32, threads = 5;
+        const int bytes = number("OOO_PAYLOAD_BYTES", 1024);
+        if (bytes <= 0) throw std::runtime_error("OOO_PAYLOAD_BYTES must be positive");
         fluss::Configuration cfg;
         cfg.bootstrap_servers = env("OOO_ENDPOINT");
         cfg.security_protocol = env("OOO_SECURITY_PROTOCOL");
@@ -225,6 +227,10 @@ int run(int argc, char** argv) {
         }
         if (mode != "producer" || proc < 0 || proc >= 4)
             throw std::runtime_error("invalid mode/process");
+        const int rate = number("OOO_RATE", 400000);
+        if (rate <= 0) throw std::runtime_error("OOO_RATE must be positive");
+        std::cout << "WORKLOAD payload_bytes=" << bytes << " target_rows_per_second_total=" << rate
+                  << std::endl;
         std::vector<fluss::AppendWriter> writers(threads);
         std::vector<std::vector<fluss::GenericRow>> pools(threads);
         std::vector<std::shared_ptr<Stats>> warm, measured;
@@ -264,7 +270,6 @@ int run(int argc, char** argv) {
                     std::this_thread::sleep_until(start);
                     auto tick = start;
                     int quota = 0;
-                    const int rate = number("OOO_RATE", 400000);
                     try {
                         while (!failed && Clock::now() < stop) {
                             if (quota == 0) {

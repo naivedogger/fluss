@@ -43,7 +43,12 @@ def config(path, database=None):
         password=old.get("password", ""),
         database=database or old.get("database", "fluss"),
         replication_factor=old.get("replication_factor", 2),
+        payload_bytes=old.get("payload_bytes", 1024),
+        target_rows_per_second=old.get("target_rows_per_second", 400000),
     )
+    for key in ("payload_bytes", "target_rows_per_second"):
+        if type(c[key]) is not int or not 0 < c[key] <= 2147483647:
+            raise ValueError(key + " must be a positive 32-bit integer")
     return c
 
 
@@ -176,6 +181,7 @@ def env_for(c, directory, warm, measure, rate):
         OOO_WARMUP_SECONDS=str(warm),
         OOO_MEASURE_SECONDS=str(measure),
         OOO_RATE=str(rate),
+        OOO_PAYLOAD_BYTES=str(c["payload_bytes"]),
         OOO_VERIFY_SECONDS="3600",
     )
     return e
@@ -292,7 +298,9 @@ def main():
         build(args)
         return
     c = config(args.config, args.database)
-    warm, measure, rate = (2, 5, 1000) if args.command == "smoke" else (60, 240, 400000)
+    warm, measure, rate = (
+        (2, 5, 1000) if args.command == "smoke" else (60, 240, c["target_rows_per_second"])
+    )
     name = "ooo_" + uuid.uuid4().hex[:12]
     directory = HERE / "runs" / name
     directory.mkdir(parents=True)
@@ -307,7 +315,7 @@ def main():
             start_utc=dt.datetime.now(dt.timezone.utc).isoformat(),
             processes=4,
             writers_per_process=5,
-            payload_bytes=1024,
+            payload_bytes=c["payload_bytes"],
             buckets=32,
             replication_factor=c["replication_factor"],
             warmup_seconds=warm,

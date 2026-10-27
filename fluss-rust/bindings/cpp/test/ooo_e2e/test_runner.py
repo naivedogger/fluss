@@ -47,9 +47,33 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(result["endpoint"], original["endpoint"])
         self.assertEqual(result["password"], original["password"])
         self.assertEqual(result["database"], "benchmark")
+        self.assertEqual(result["payload_bytes"], 1024)
+        self.assertEqual(result["target_rows_per_second"], 400000)
         self.assertNotIn("target_rate", result)
         self.assertEqual(run.config(link, "another")["database"], "another")
         self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_configured_workload_reaches_child_environment(self):
+        path = self.root / "config.json"
+        path.write_text(
+            json.dumps(
+                dict(endpoint="test.invalid:9123", payload_bytes=100, target_rows_per_second=4000000)
+            )
+        )
+        c = run.config(path)
+        env = run.env_for(c, self.root, 60, 240, c["target_rows_per_second"])
+        self.assertEqual(env["OOO_PAYLOAD_BYTES"], "100")
+        self.assertEqual(env["OOO_RATE"], "4000000")
+        self.assertEqual(run.env_for(c, self.root, 2, 5, 1000)["OOO_RATE"], "1000")
+
+    def test_workload_rejects_invalid_numbers(self):
+        path = self.root / "config.json"
+        for key in ("payload_bytes", "target_rows_per_second"):
+            for value in (0, -1, True, 1.5, "100", 2147483648):
+                with self.subTest(key=key, value=value):
+                    path.write_text(json.dumps(dict(endpoint="test.invalid:9123", **{key: value})))
+                    with self.assertRaises(ValueError):
+                        run.config(path)
 
     def test_logger_summary_counts_keywords_and_numeric_code_and_warns_on_retention(self):
         log = self.root / "sdk-logs" / "group"
