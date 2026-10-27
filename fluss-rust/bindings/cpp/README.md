@@ -33,6 +33,49 @@ bazel build //...
 `ci.sh` defaults to optimized builds via `-c opt` (override with `BAZEL_BUILD_FLAGS` if needed).
 See [ci.sh](ci.sh) for the CI build sequence.
 
+## Optional file logging
+
+Build with the `file-logging` Cargo feature. For CMake, add
+`-DCARGO_BUILD_FLAGS=--features=file-logging` to the configure command. This enables
+an optional log4rs backend; it does not install a logger automatically.
+
+```cpp
+fluss::FileLoggingOptions options;
+options.directory = "/data/fluss-client-logs";
+options.filter = "warn,fluss::client::write::idempotence=debug";
+fluss::Logger logger;
+auto result = fluss::Logger::InitFile(options, logger);
+if (!result.Ok()) {
+    throw std::runtime_error(result.error_message);
+}
+std::cout << "Log file: " << logger.Path() << std::endl;
+// Create connections, run the workload, flush writers and destroy connections.
+result = logger.Shutdown(5000);
+auto stats = logger.Stats();
+// Check result and stats.dropped / stats.truncated / stats.write_errors.
+```
+
+The default filter is WARN, the queue holds 1024 messages, each message is capped
+at 8192 bytes, and files rotate after 64 MiB with four archives retained. A file
+can exceed its threshold by one message. Formatting occurs on the caller; file
+writes, rotation and expiration run on a dedicated worker. Full or contended
+queues drop events and increment `dropped`, rather than blocking SDK requests.
+`Flush`/`Shutdown` success alone does not imply complete logs: inspect all loss
+counters. Flush is not an fsync/durability guarantee. A shutdown timeout cannot
+cancel an OS write already in progress; the worker may outlive the call.
+
+Every initialization creates `fluss-<pid>-<time>/client.log` under the chosen
+parent, with archives `client.0.log`, etc. Run directories are private on Unix.
+Retention affects only this run's files; applications must clean up older run
+directories. Multiple processes do not share or delete one another's files.
+
+Initialization is explicit and process-wide, before any connections are created.
+An installed Rust logger is never replaced, and reinitialization after shutdown
+is not supported. Without the build feature, `InitFile` returns an explicit error.
+`RUST_LOG` is not read; pass level/module rules through `options.filter`. Logging
+does not change retries or error propagation. Avoid global TRACE during throughput
+measurements, and preserve the same logging configuration in both A/B variants.
+
 ## Log filter pushdown
 
 `TableScan::Filter()` pushes a predicate to Arrow log scans for server-side

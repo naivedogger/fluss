@@ -43,6 +43,7 @@ class DataType;
 namespace fluss {
 
 namespace ffi {
+struct LogHandle;
 struct Connection;
 struct Admin;
 struct Table;
@@ -569,6 +570,62 @@ struct Result {
     /// write had no effect or that application resubmission is duplicate-safe.
     /// Client-side errors always return false.
     bool IsRetriable() const { return ErrorCode::IsRetriable(error_code); }
+};
+
+/// Opt-in file logger settings. Retention is per process/run, not for the parent directory.
+struct FileLoggingOptions {
+    /// Parent directory; each initialization creates a private, unique run directory.
+    std::string directory{"logs"};
+    /// Comma-separated levels/module overrides; only fluss targets are collected.
+    std::string filter{"warn"};
+    /// Rotation threshold, at least 8192 bytes; may be exceeded by one 8192-byte event.
+    uint64_t max_file_size{64 * 1024 * 1024};
+    /// Archives retained per run, excluding the active file (1..1000).
+    uint32_t max_files{4};
+    /// Bounded queue capacity (1..65536); full/contended queues drop and count events.
+    size_t queue_capacity{1024};
+};
+
+/// Concurrent snapshots may span multiple events. Check loss counters even after Flush succeeds.
+struct LoggingStats {
+    uint64_t accepted{0};
+    uint64_t written{0};
+    uint64_t dropped{0};
+    uint64_t truncated{0};
+    uint64_t write_errors{0};
+};
+
+/// Owns the optional, process-wide Rust file logger. No automatic initialization.
+/// Call InitFile before creating connections; close them before Shutdown. Requires
+/// the file-logging Cargo feature. An existing Rust logger is never replaced.
+/// Destruction stops acceptance without waiting for I/O; explicitly Shutdown to
+/// drain. The global logger cannot be reinitialized even after destruction.
+/// Const operations are thread-safe; move/destruction require exclusive ownership.
+class Logger {
+   public:
+    Logger() noexcept = default;
+    ~Logger() noexcept;
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+    Logger(Logger&& other) noexcept;
+    Logger& operator=(Logger&& other) noexcept;
+
+    /// Creates a unique run directory and installs the logger once. Returns a client
+    /// error for invalid configuration, a disabled feature, or an installed logger.
+    static Result InitFile(const FileLoggingOptions& options, Logger& out);
+    /// Active file path, or empty for an uninitialized/moved-from handle.
+    std::string Path() const;
+    /// Cumulative counters, or zeros for an uninitialized/moved-from handle.
+    LoggingStats Stats() const;
+    /// Flushes accepted events without stopping producers. May fail on a full queue,
+    /// timeout or output error. Does not fsync; dropped/truncated events are separate.
+    Result Flush(uint64_t timeout_ms) const;
+    /// Stops logging, drains and flushes with a bounded wait. Safe to repeat after
+    /// timeout. A blocked OS write may outlive the call; inspect Stats for lost logs.
+    Result Shutdown(uint64_t timeout_ms) const;
+
+   private:
+    ffi::LogHandle* handle_{nullptr};
 };
 
 /// Write-specific completion metadata. The reference passed to a callback is valid

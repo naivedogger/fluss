@@ -26,6 +26,9 @@ publish = false
 [lib]
 crate-type = ["staticlib"]
 
+[features]
+file-logging = ["fluss/file-logging"]
+
 [dependencies]
 anyhow = "1.0"
 arrow = { workspace = true, features = ["ffi"] }

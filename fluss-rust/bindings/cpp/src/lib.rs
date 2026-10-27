@@ -99,6 +99,22 @@ mod ffi {
         lookup_max_retries: i32,
     }
 
+    struct FfiLogOptions {
+        directory: String,
+        filter: String,
+        max_file_size: u64,
+        max_files: u32,
+        queue_capacity: usize,
+    }
+
+    struct FfiLogStats {
+        accepted: u64,
+        written: u64,
+        dropped: u64,
+        truncated: u64,
+        write_errors: u64,
+    }
+
     struct FfiResult {
         error_code: i32,
         error_message: String,
@@ -439,6 +455,14 @@ mod ffi {
         type ArrayWriterInner;
         type MapWriterInner;
         type ValueInner;
+
+        type LogHandle;
+        fn init_file_logging(options: &FfiLogOptions) -> FfiPtrResult;
+        fn logging_path(handle: &LogHandle) -> String;
+        fn logging_stats(handle: &LogHandle) -> FfiLogStats;
+        fn logging_flush(handle: &LogHandle, timeout_ms: u64) -> FfiResult;
+        fn logging_shutdown(handle: &LogHandle, timeout_ms: u64) -> FfiResult;
+        unsafe fn delete_log_handle(handle: *mut LogHandle);
 
         // Connection
         fn new_connection(config: &FfiConfig) -> FfiPtrResult;
@@ -1168,6 +1192,56 @@ fn empty_bounded_read_result(result: ffi::FfiResult, status: i32) -> ffi::FfiBou
         result,
         arrow_batches: ffi::FfiArrowRecordBatches { batches: vec![] },
         status,
+    }
+}
+
+struct LogHandle(fluss::logging::LogHandle);
+
+fn init_file_logging(options: &ffi::FfiLogOptions) -> ffi::FfiPtrResult {
+    let options = fluss::logging::FileLogOptions {
+        directory: options.directory.clone().into(),
+        filter: options.filter.clone(),
+        max_file_size: options.max_file_size,
+        max_files: options.max_files,
+        queue_capacity: options.queue_capacity,
+    };
+    match fluss::logging::init_file_logging(options) {
+        Ok(handle) => ok_ptr(Box::into_raw(Box::new(LogHandle(handle))) as usize),
+        Err(error) => ffi::FfiPtrResult {
+            result: client_err(error.to_string()),
+            ptr: 0,
+        },
+    }
+}
+
+fn logging_path(handle: &LogHandle) -> String {
+    handle.0.path().to_string_lossy().into_owned()
+}
+fn logging_stats(handle: &LogHandle) -> ffi::FfiLogStats {
+    let stats = handle.0.stats();
+    ffi::FfiLogStats {
+        accepted: stats.accepted,
+        written: stats.written,
+        dropped: stats.dropped,
+        truncated: stats.truncated,
+        write_errors: stats.write_errors,
+    }
+}
+fn logging_flush(handle: &LogHandle, timeout_ms: u64) -> ffi::FfiResult {
+    match handle.0.flush(Duration::from_millis(timeout_ms)) {
+        Ok(()) => ok_result(),
+        Err(error) => client_err(error.to_string()),
+    }
+}
+fn logging_shutdown(handle: &LogHandle, timeout_ms: u64) -> ffi::FfiResult {
+    match handle.0.shutdown(Duration::from_millis(timeout_ms)) {
+        Ok(()) => ok_result(),
+        Err(error) => client_err(error.to_string()),
+    }
+}
+unsafe fn delete_log_handle(handle: *mut LogHandle) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
     }
 }
 
