@@ -33,6 +33,7 @@ documentation = "https://docs.rs/fluss-rs"
 name = "fluss"
 
 [features]
+file-logging = ["dep:log4rs"]
 default = ["storage-memory", "storage-fs"]
 storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-oss"]
 
@@ -43,6 +44,7 @@ storage-oss = ["opendal/services-oss"]
 integration_tests = []
 
 [dependencies]
+log4rs = { version = "1.4.0", optional = true, default-features = false, features = ["rolling_file_appender", "compound_policy", "size_trigger", "fixed_window_roller", "pattern_encoder"] }
 arrow = { workspace = true }
 arrow-schema = "59.0.0"
 bitvec = "1"
