@@ -37,7 +37,8 @@ python3 run.py smoke
 
 The config link is only needed once. `config*.json`, build outputs and results are
 Git-ignored. The existing config is read-only: `endpoint`, `security_protocol`,
-`sasl_mechanism`, `username`, `password`, `database` and `replication_factor` are used;
+`sasl_mechanism`, `username`, `password`, `database`, `replication_factor`,
+`payload_bytes` and `target_rows_per_second` are used;
 unrelated benchmark options are ignored. No credentials enter commands or manifests.
 Logs may contain connection context; redact before sharing.
 
@@ -60,14 +61,36 @@ before starting fixed if space is limited. Tables are retained; delete them manu
 | Parameter | Smoke | Full run |
 | --- | --- | --- |
 | Processes × writers | 4 × 5 | 4 × 5 |
-| Total target rows/s | 1,000 | 400,000 |
+| Total target rows/s | 1,000 | config, default 400,000 |
 | Warmup + measurement | 2 + 5 seconds | 60 + 240 seconds |
-| Payload / buckets | 1 KiB / 32 | 1 KiB / 32 |
+| Payload / buckets | config, default 1 KiB / 32 | config, default 1 KiB / 32 |
 
 Both use one log table, one connection per process, dynamic batches from 256 KiB to
 2 MiB, linger 100 ms, buffer 256 MiB/connection, idempotence, acks=all and 5 inflight
-requests/bucket. Actual batch sizes depend on load. RF=2 full-run replicated payload
-alone is about 229 GiB per arm; check **server** capacity, not the ECS client disk.
+requests/bucket. Actual batch sizes depend on load. With the defaults, RF=2 full-run
+replicated payload alone is about 229 GiB per arm; check **server** capacity, not the
+ECS client disk.
+
+For 100-byte payloads at a total target of 4 million rows/s, add these fields to the
+existing config (preserve the connection/authentication fields):
+
+```json
+{
+  "payload_bytes": 100,
+  "target_rows_per_second": 4000000
+}
+```
+
+Rebuild both checkouts once to pick up payload configuration; subsequent config
+changes do not require compilation. Smoke uses the configured payload at 1,000 rows/s.
+The size is the string payload, excluding the ID and encoding overhead. At this target,
+payload traffic is about 381 MiB/s, similar to the default 391 MiB/s, but per-record
+CPU work and readback counts can grow tenfold. Full-run replicated payload alone is
+about 224 GiB at RF=2. Compare actual throughput; this target is not a capacity claim.
+Each producer prints a `WORKLOAD` line with the effective payload size and total rate.
+Keep each writer below 100 million records per run: the harness uses disjoint 32-bit
+ID ranges and stops if a writer exhausts its range (4 million rows/s for five minutes
+with 20 writers targets 60 million records per writer).
 
 ## Results
 
