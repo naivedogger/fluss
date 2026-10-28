@@ -23,3 +23,6 @@ get_filename_component(SDK "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 add_subdirectory("${SDK}/bindings/cpp" sdk)
 add_executable(ooo_bench main.cpp)
 target_link_libraries(ooo_bench PRIVATE fluss_cpp)
+
+add_executable(upgrade_bench upgrade.cpp)
+target_link_libraries(upgrade_bench PRIVATE fluss_cpp)

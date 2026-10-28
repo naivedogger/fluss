@@ -52,7 +52,7 @@ def config(path, database=None):
     return c
 
 
-def build(args):
+def build(args, target="ooo_bench"):
     env = dict(os.environ, CARGO_BUILD_JOBS=str(args.jobs))
     env.pop("CARGO_TARGET_DIR", None)
     sp.run(
@@ -71,7 +71,7 @@ def build(args):
         check=True,
     )
     sp.run(
-        ["cmake", "--build", str(HERE / "build"), "--target", "ooo_bench", "-j" + str(args.jobs)],
+        ["cmake", "--build", str(HERE / "build"), "--target", target, "-j" + str(args.jobs)],
         env=env,
         check=True,
     )

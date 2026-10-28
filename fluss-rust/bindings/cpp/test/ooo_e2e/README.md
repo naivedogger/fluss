@@ -146,3 +146,82 @@ prove zero server errors. Failed/timed-out runs preserve logs and tables and are
 valid zero-error results. No automatic retry or repeat rounds.
 
 Local runner tests: `python3 -m unittest -v test_runner.py`.
+
+## Nonstop read/write during a cloud upgrade
+
+`upgrade.py` creates a separate workload; it does not change the OOO comparison.
+Run it on a three-TabletServer test cluster with **server min ISR already set to 2**
+(`log.replica.min-in-sync-replicas-number`). The script sets RF=3 and acks=all, waits
+for bucket leaders, and retains all tables. Confirm full ISR=3 and healthy OSS
+offloading in the cloud console before spending the cluster's upgrade opportunity.
+
+| Parameter | Default |
+| --- | --- |
+| Main log table | 64 buckets, RF=3 |
+| Auxiliary empty log tables | 30 tables × 20 buckets × RF=3 |
+| Total replicas | 1,992 |
+| Writers / readers | 4 processes × 5 writers / 4 processes |
+| Payload / ACKed preload | 1 KiB / 1 TiB |
+| Target write / read rate | 500 / 300 MiB/s of uncompressed payload |
+| Before / after upgrade | 10 / 15 minutes |
+| Load limits | 4 hours or 4 TiB accepted payload, including preload |
+
+The same writer processes and connections continue from preload through recovery,
+without phase-boundary flushes. At the target rate preload takes about 35 minutes.
+Readers start at offset 0 after preload and keep their scanners across the upgrade;
+their lag intentionally grows because reads are slower than writes. Actual rates
+depend on client and cluster capacity. Logical payload rates do not imply a fixed
+compression ratio or server disk/OSS bandwidth; monitor those separately. RF=3 data
+can exceed the three 900-GB local disks, so OSS upload and local eviction must work.
+Keep the table's total retention long enough for the entire run and final scan.
+
+From this directory, reuse only the connection/authentication/database fields in
+the existing config; workload defaults above override its old payload/rate/RF:
+
+```bash
+python3 upgrade.py build
+nohup python3 -u upgrade.py run --config /root/cpp-test/config.json \
+  > /root/cpp-test/upgrade-test.log 2>&1 < /dev/null &
+tail -f /root/cpp-test/upgrade-test.log
+```
+
+Wait for `STAGE ready_for_upgrade`. Writing and reading continue while waiting.
+Start the upgrade in the cloud console, then record its start in another shell:
+
+```bash
+python3 upgrade.py mark-start
+```
+
+When the cloud upgrade completes:
+
+```bash
+python3 upgrade.py mark-done
+```
+
+The runner continues for 15 minutes, drains writers, then scans the entire main
+table to check all generated 64-bit IDs, duplicates, missing rows, payload length
+and final offsets. Full verification has a two-hour timeout and can take time on
+TiB-scale data. It does not compare payload contents. No table is deleted.
+
+`status`, `mark-start` and `mark-done` default to this checkout's latest upgrade run;
+use `--run-dir /absolute/path` to select one explicitly. `--source-version` and
+`--target-version` on `run` record operator-supplied version labels. Other workload
+overrides are listed in `python3 upgrade.py --help`.
+
+Results are under `runs/upgrade_<id>/`:
+
+- `metrics.jsonl`: one-second ACK/read rates, pending rows, errors and ACK stalls.
+  Console rates average about ten seconds; `recent_*_p99_ms` uses the latest
+  histogram from each client process, rather than the whole phase.
+- `writer-*.log` / `reader-*.log`: sampled callback latency / Poll wall-time
+  histograms. Reader data age includes the intentional backlog, not just fetch time.
+- `result.json`: phase throughput/P50/P99, final ID verification and log statistics.
+  Short phases without two samples report no rate rather than zero.
+- `events.json`, `manifest.json`, `tables.json`: marker times, workload/SHA and
+  created table names/IDs. `sdk-logs/` retains rotating client diagnostics.
+
+`completed` means the clients finished and final ID verification passed. Cloud
+version, ISR recovery, disk/OSS health and acceptable performance still need review.
+Log drops reduce diagnostic coverage but do not fail successful ID verification.
+
+Runner tests: `python3 -m unittest -v test_runner.py test_upgrade.py`.
