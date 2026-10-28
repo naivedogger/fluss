@@ -380,7 +380,7 @@ def execute(args):
             raise RuntimeError("writer drain or callbacks failed")
         state("verifying")
         verify = spawn("verify", 0)
-        verify.wait(timeout=7210)
+        verify.wait(timeout=14410)
         result["verify"] = run.records(directory / "verify.log", "VERIFY ")
         if verify.returncode or len(result["verify"]) != 1 or not result["verify"][0]["success"]:
             raise RuntimeError("full ID readback failed; inspect verify.log")

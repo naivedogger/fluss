@@ -200,7 +200,7 @@ python3 upgrade.py mark-done
 
 The runner continues for 15 minutes, drains writers, then scans the entire main
 table to check all generated 64-bit IDs, duplicates, missing rows, payload length
-and final offsets. Full verification has a two-hour timeout and can take time on
+and final offsets. Full verification has a four-hour timeout and can take time on
 TiB-scale data. It does not compare payload contents. No table is deleted.
 
 `status`, `mark-start` and `mark-done` default to this checkout's latest upgrade run;

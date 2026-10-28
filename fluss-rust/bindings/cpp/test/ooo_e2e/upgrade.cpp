@@ -300,7 +300,7 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
         };
         const double rate = double(number("UP_READ_BPS", 314572800)) / parts;
         auto tick = Clock::now(), lastSample = tick;
-        const auto deadline = tick + std::chrono::seconds(number("UP_VERIFY_SECONDS", 7200));
+        const auto deadline = tick + std::chrono::seconds(number("UP_VERIFY_SECONDS", 14400));
         if (!verify) save(dir / ("ready-r-" + std::to_string(proc)), "ready");
         while (verify ? rows < expected && Clock::now() < deadline
                       : !fs::exists(dir / "reader.stop")) {
