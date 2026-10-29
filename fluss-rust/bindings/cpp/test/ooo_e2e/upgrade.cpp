@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "fluss.hpp"
+#include "upgrade_rate.hpp"
 
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
@@ -177,26 +178,21 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
                 row.SetString(2, text);
             }
         }
-        save(dir / ("ready-w-" + std::to_string(proc)), "ready");
+        save(dir / ("ready-w-" + std::to_string(proc)), "ready rate-control-v1");
         while (!fs::exists(dir / "start"))
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        const double laneRate = double(number("UP_WRITE_BPS", 524288000)) / payload / LANES;
+        std::atomic<int64_t> writeBps{number("UP_WRITE_BPS", 524288000)};
+        int64_t rateRequest = 0;
         std::vector<std::thread> workers;
         for (int t = 0; t < THREADS; t++)
             workers.emplace_back([&, t, stats] {
                 try {
-                    auto tick = Clock::now();
-                    const int quotaSize = std::max(1, int(laneRate / 1000));
-                    int quota = 0;
+                    WritePacer pacer(payload, LANES);
                     while (!stop && !fatal) {
-                        if (!quota) {
-                            std::this_thread::sleep_until(tick);
-                            quota = quotaSize;
-                            tick =
-                                std::max(tick, Clock::now()) +
-                                std::chrono::microseconds(int64_t(quotaSize * 1000000 / laneRate));
+                        if (!pacer.acquire(writeBps)) {
+                            std::this_thread::sleep_until(pacer.wakeup(Clock::now()));
+                            continue;
                         }
-                        --quota;
                         uint64_t seq = counts[t];
                         auto& row = pools[t][seq % pools[t].size()];
                         row.SetInt64(0, seq * LANES + proc * THREADS + t);
@@ -241,22 +237,39 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
         int64_t lastAck = wall();
         auto sample = [&] {
             auto a = stats->accepted.load(), c = stats->completed.load(), f = stats->failed.load();
-            if (c != previous) {
-                lastAck = wall();
+            const auto now = wall();
+            if (c != previous || (writeBps.load(std::memory_order_relaxed) == 0 && a == c + f)) {
+                lastAck = now;
                 previous = c;
             }
             std::string value =
-                "{\"unix_ms\":" + std::to_string(wall()) + ",\"accepted\":" + std::to_string(a) +
+                "{\"unix_ms\":" + std::to_string(now) + ",\"accepted\":" + std::to_string(a) +
                 ",\"completed\":" + std::to_string(c) + ",\"errors\":" + std::to_string(f) +
                 ",\"rejected_appends\":" + std::to_string(stats->rejected.load()) +
                 ",\"pending\":" + std::to_string(a > c + f ? a - c - f : 0) +
-                ",\"no_ack_ms\":" + std::to_string(wall() - lastAck) +
+                ",\"target_write_mib\":" + std::to_string(writeBps.load() / 1024 / 1024) +
+                ",\"rate_request_id\":" + std::to_string(rateRequest) +
+                ",\"no_ack_ms\":" + std::to_string(now - lastAck) +
                 ",\"latency_hist_ms\":" + stats->latency.take() + "}";
             save(dir / ("writer-" + std::to_string(proc) + ".json"), value);
             std::cout << "SAMPLE " << value << std::endl;
         };
         while (!fs::exists(dir / "stop") && !fatal) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Atomic file replacement by set-rate prevents observing a partial command.
+            std::ifstream control(dir / "write-rate");
+            int64_t request, mib;
+            std::string extra;
+            if (control >> request >> mib) {
+                if (!(control >> extra) && request > 0 && request != rateRequest && mib >= 0 &&
+                    mib <= 1024 * 1024) {
+                    writeBps.store(mib * 1024 * 1024, std::memory_order_relaxed);
+                    rateRequest = request;
+                    std::cout << "RATE_APPLIED {\"unix_ms\":" << wall()
+                              << ",\"request_id\":" << request << ",\"write_mib\":" << mib << "}"
+                              << std::endl;
+                }
+            }
             sample();
         }
         stop = true;

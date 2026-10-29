@@ -24,6 +24,45 @@ import upgrade
 
 
 class UpgradeTest(unittest.TestCase):
+    def test_live_rate_pause_resume_and_request_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            upgrade.write_json(root / "manifest.json", dict(rate_control_version=1))
+            upgrade.write_json(root / "state.json", dict(stage="upgrading"))
+            for rate in (100, 0, 500):
+                upgrade.set_rate(root, rate)
+                request, actual = map(int, (root / "write-rate").read_text().split())
+                history = [
+                    json.loads(line)
+                    for line in (root / "rate-changes.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(actual, rate)
+                self.assertEqual(history[-1]["request_id"], request)
+                self.assertEqual(history[-1]["write_mib"], rate)
+            self.assertEqual([r["write_mib"] for r in history], [100, 0, 500])
+            self.assertFalse((root / "write-rate.tmp").exists())
+
+    def test_rate_command_rejects_old_runs_invalid_rates_and_inactive_stages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            upgrade.write_json(root / "state.json", dict(stage="upgrading"))
+            upgrade.write_json(root / "manifest.json", {})
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                upgrade.set_rate(root, 100)
+            upgrade.write_json(root / "manifest.json", dict(rate_control_version=1))
+            for rate in (None, -1, 1048577, 1.5):
+                with self.subTest(rate=rate), self.assertRaises(ValueError):
+                    upgrade.set_rate(root, rate)
+            for stage in ("setup", "draining", "verifying", "completed", "failed"):
+                upgrade.write_json(root / "state.json", dict(stage=stage))
+                with self.subTest(stage=stage), self.assertRaises(ValueError):
+                    upgrade.set_rate(root, 100)
+            upgrade.write_json(root / "state.json", dict(stage="upgrading"))
+            (root / "stop").touch()
+            with self.assertRaises(ValueError):
+                upgrade.set_rate(root, 100)
+            self.assertFalse((root / "write-rate").exists())
+
     def test_phase_rates_histograms_and_stall_are_windowed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

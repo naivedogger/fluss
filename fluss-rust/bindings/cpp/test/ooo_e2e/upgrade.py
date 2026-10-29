@@ -18,6 +18,7 @@
 
 """High-load upgrade test. The operator starts/finishes the cloud upgrade manually."""
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -128,7 +129,47 @@ def mark(directory, name):
     print("Marked", name, flush=True)
 
 
+RATE_STAGES = {"prefill", "baseline", "ready_for_upgrade", "upgrading", "recovery"}
+MAX_WRITE_MIB = 1024 * 1024
+
+
+def set_rate(directory, mib):
+    if not isinstance(mib, int) or not 0 <= mib <= MAX_WRITE_MIB:
+        raise ValueError("--write-mib must be an integer between 0 and 1048576")
+    directory = directory.resolve()
+    with (directory / "rate.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        if manifest.get("rate_control_version") != 1:
+            raise ValueError(
+                "this run does not support live rate control; rebuild and start a new run"
+            )
+        state = json.loads((directory / "state.json").read_text())
+        if state["stage"] not in RATE_STAGES or (directory / "stop").exists():
+            raise ValueError("rate changes are not allowed in stage " + state["stage"])
+        request_id = time.time_ns()
+        temp = directory / "write-rate.tmp"
+        temp.write_text(f"{request_id} {mib}\n")
+        with (directory / "rate-changes.jsonl").open("a") as log:
+            log.write(
+                json.dumps(
+                    dict(request_id=request_id, unix_ms=int(time.time() * 1000), write_mib=mib)
+                )
+                + "\n"
+            )
+        temp.replace(directory / "write-rate")
+    print(
+        f"Requested aggregate write rate {mib} MiB/s; request_id={request_id}. "
+        "Writers poll once per second; pending writes still drain.",
+        flush=True,
+    )
+
+
 def execute(args):
+    if args.write_mib is None:
+        args.write_mib = 500
+    if args.write_mib > MAX_WRITE_MIB:
+        raise ValueError("--write-mib must not exceed 1048576")
     if (
         min(
             args.prefill_gib,
@@ -162,6 +203,7 @@ def execute(args):
             table=name,
             database=c["database"],
             mode="upgrade",
+            rate_control_version=1,
             payload_bytes=args.payload_bytes,
             checkout_sha=sp.check_output(
                 ["git", "-C", str(run.REPO), "rev-parse", "HEAD"], text=True
@@ -253,6 +295,9 @@ def execute(args):
         for i in range(4):
             spawn("writer", i)
         wait_ready("w", 4)
+        for i in range(4):
+            if (directory / f"ready-w-{i}").read_text().strip() != "ready rate-control-v1":
+                raise RuntimeError("outdated upgrade_bench; run upgrade.py build first")
         events["started"] = int(time.time() * 1000)
         (directory / "start").touch()
         state("prefill")
@@ -314,6 +359,8 @@ def execute(args):
                 / 1024**2
                 / interval,
                 read_mib_per_second=(read_bytes - previous_read) / 1024**2 / interval,
+                applied_write_mib_by_process=[s.get("target_write_mib") for s in writes],
+                rate_request_ids=[s.get("rate_request_id") for s in writes],
                 pending=sum(s["pending"] for s in writes),
                 write_errors=sum(s["errors"] for s in writes),
                 rejected_appends=sum(s["rejected_appends"] for s in writes),
@@ -344,6 +391,8 @@ def execute(args):
                     round((read_bytes - print_read) / 1024**2 / elapsed, 1),
                     "ACK_GiB",
                     round(metrics["ack_gib"], 2),
+                    "targets_MiB/s",
+                    metrics["applied_write_mib_by_process"],
                     "pending",
                     metrics["pending"],
                     "errors",
@@ -408,7 +457,9 @@ def execute(args):
             "MiB/s counts uncompressed payload. Callback latency is sampled every 256 rows; "
             "read latency is Poll wall time. 60001ms histogram bin is overflow. Data age includes backlog. "
             "Cloud version, ISR and disk/OSS health require server-side confirmation. "
-            "Log drops affect diagnostic completeness, not the ID verification outcome."
+            "Log drops affect diagnostic completeness, not the ID verification outcome. "
+            "Phases may contain multiple target rates; use rate-changes.jsonl and per-process "
+            "RATE_APPLIED/SAMPLE records to identify effective rate windows."
         )
         write_json(directory / "result.json", result)
         print("RESULT", directory / "result.json", flush=True)
@@ -418,7 +469,9 @@ def execute(args):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build", "run", "mark-start", "mark-done", "status"])
+    parser.add_argument(
+        "command", choices=["build", "run", "mark-start", "mark-done", "status", "set-rate"]
+    )
     parser.add_argument("--config", type=Path, default=Path("/root/cpp-test/config.json"))
     parser.add_argument("--database")
     parser.add_argument("--run-dir", type=Path)
@@ -434,7 +487,7 @@ def main():
     parser.add_argument("--aux-buckets", type=int, default=20)
     parser.add_argument("--buckets", type=int, default=64)
     parser.add_argument("--readers", type=int, default=4)
-    parser.add_argument("--write-mib", type=int, default=500)
+    parser.add_argument("--write-mib", type=int, help="aggregate MiB/s; run defaults to 500")
     parser.add_argument("--read-mib", type=int, default=300)
     parser.add_argument("--baseline-seconds", type=int, default=600)
     parser.add_argument("--recovery-seconds", type=int, default=900)
@@ -457,9 +510,20 @@ def main():
         directory = args.run_dir
         if directory is None:
             directory = Path(json.loads((HERE / "runs/latest-upgrade.json").read_text())["run_dir"])
-        if args.command == "status":
+        if args.command == "set-rate":
+            set_rate(directory, args.write_mib)
+        elif args.command == "status":
             print("RUN_DIR", directory)
             print((directory / "state.json").read_text())
+            for path in sorted(directory.glob("writer-*.json")):
+                snapshot = json.loads(path.read_text())
+                print(
+                    path.stem,
+                    "target_MiB/s",
+                    snapshot.get("target_write_mib"),
+                    "request_id",
+                    snapshot.get("rate_request_id"),
+                )
             if (directory / "result.json").exists():
                 print((directory / "result.json").read_text())
         else:

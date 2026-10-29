@@ -225,3 +225,46 @@ version, ISR recovery, disk/OSS health and acceptable performance still need rev
 Log drops reduce diagnostic coverage but do not fail successful ID verification.
 
 Runner tests: `python3 -m unittest -v test_runner.py test_upgrade.py`.
+
+## Live write-rate control during an upgrade test
+
+Pull the test branch and rebuild with `python3 upgrade.py build` before starting
+an upgrade run. The initial aggregate write target remains 500 MiB/s unless
+`run --write-mib N` is specified. Existing running binaries cannot be updated live.
+
+While the run is in prefill, baseline, waiting-for-upgrade, upgrade or recovery:
+
+```bash
+# Set RUN_DIR to the UPGRADE_RUN_DIR printed by the active run.
+python3 upgrade.py set-rate --run-dir "$RUN_DIR" --write-mib 100
+python3 upgrade.py set-rate --run-dir "$RUN_DIR" --write-mib 0    # pause new appends
+python3 upgrade.py set-rate --run-dir "$RUN_DIR" --write-mib 500  # resume
+python3 upgrade.py status --run-dir "$RUN_DIR"
+```
+
+The target is uncompressed payload MiB/s **across all four writer processes**, not
+per process. Each process reads the command once per second and publishes it to
+its five existing writers. A writer finishes its current pacing quota before
+adopting the new target; pending appends still drain. Processes do not switch in
+lockstep. Writers, connections and ID sequences are preserved; readers are unchanged.
+Rapid commands can supersede one another before a process observes them.
+
+`rate-changes.jsonl` records requested rates and timestamps. `RATE_APPLIED` in each
+writer log, and `target_write_mib`/`rate_request_id` in its snapshots, record when
+that process publishes the rate. All four reported targets must converge; these
+are aggregate targets, so do not sum the four values. `metrics.jsonl` retains
+actual ACK throughput, pending writes and the four reported targets. A pause with
+no pending callbacks reports zero `no_ack_ms`; a stuck pending write still counts.
+Stage summaries can mix rates: use the timestamps and per-second metrics for
+high/low-load comparisons. Pausing does not suspend stage timers or safety limits.
+
+Local rate-controller checks (no cluster required), from the repository root:
+
+```bash
+mkdir -p target/review-probes/rate-control
+c++ -std=c++17 -Wall -Wextra -Werror \
+  fluss-rust/bindings/cpp/test/ooo_e2e/test_upgrade_rate.cpp \
+  -o target/review-probes/rate-control/test_upgrade_rate
+target/review-probes/rate-control/test_upgrade_rate
+python3 -m unittest discover -s fluss-rust/bindings/cpp/test/ooo_e2e -p 'test_*.py'
+```
