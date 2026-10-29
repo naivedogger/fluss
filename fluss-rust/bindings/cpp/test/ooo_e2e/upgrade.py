@@ -19,6 +19,7 @@
 """High-load upgrade test. The operator starts/finishes the cloud upgrade manually."""
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -165,14 +166,74 @@ def set_rate(directory, mib):
     )
 
 
+def reuse_input(directory, database):
+    directory = directory.resolve()
+    manifest = json.loads((directory / "manifest.json").read_text())
+    result = json.loads((directory / "result.json").read_text())
+    state = json.loads((directory / "state.json").read_text())
+    if manifest.get("mode") != "upgrade" or manifest["database"] != database:
+        raise ValueError("reuse requires an upgrade run in the same database")
+    if state["stage"] not in ("completed", "failed"):
+        raise ValueError("previous run is still active")
+    writers = result.get("writers", [])
+    if len(writers) != 4 or any(w["errors"] or w["accepted"] != w["completed"] for w in writers):
+        raise ValueError("previous writers must have drained successfully")
+    counts = []
+    for i, writer in enumerate(writers):
+        values = [int(v) for v in (directory / f"counts-{i}").read_text().split()]
+        if len(values) != 5 or min(values) < 0 or sum(values) != writer["accepted"]:
+            raise ValueError("invalid final writer counts")
+        counts.extend(values)
+    old_base = manifest.get("id_base", 0)
+    if not isinstance(old_base, int) or not 0 <= old_base <= 2**63 - 20:
+        raise ValueError("invalid previous record ID base")
+    base = old_base + max(counts) * 20
+    if not 0 <= base <= 2**63 - 20:
+        raise ValueError("record ID range exhausted")
+    tables = json.loads((directory / "tables.json").read_text())
+    if len(tables) != manifest["auxiliary_tables"] + 1 or tables[0]["name"] != manifest["table"]:
+        raise ValueError("previous table inventory is incomplete")
+    for table in tables:
+        if not table["name"] or any(c.isspace() for c in table["name"]) or table["buckets"] < 1:
+            raise ValueError("invalid table inventory")
+    starts = directory / "start-offsets"
+    if manifest.get("reuse_run") and not starts.exists():
+        raise ValueError("previous reused run is missing its start offsets")
+    offsets = (
+        [int(v) for v in starts.read_text().split()]
+        if starts.exists()
+        else [0] * manifest["buckets"]
+    )
+    if len(offsets) != manifest["buckets"] or min(offsets) < 0:
+        raise ValueError("invalid previous start offsets")
+    return dict(
+        manifest=manifest, tables=tables, id_base=base, expected_end=sum(offsets) + sum(counts)
+    )
+
+
+def resolve_layout(args, previous):
+    defaults = dict(payload_bytes=1024, buckets=64, aux_tables=30, aux_buckets=20)
+    keys = dict(aux_tables="auxiliary_tables", aux_buckets="auxiliary_buckets")
+    for name, default in defaults.items():
+        expected = previous["manifest"][keys.get(name, name)] if previous else default
+        actual = getattr(args, name)
+        if previous and actual is not None and actual != expected:
+            raise ValueError("--" + name.replace("_", "-") + " conflicts with the reused run")
+        setattr(args, name, expected if actual is None else actual)
+    if args.prefill_gib is None:
+        args.prefill_gib = 0 if previous else 1024
+
+
 def execute(args):
+    c = run.config(args.config, args.database)
+    previous = reuse_input(args.reuse_run, c["database"]) if args.reuse_run else None
+    resolve_layout(args, previous)
     if args.write_mib is None:
         args.write_mib = 500
     if args.write_mib > MAX_WRITE_MIB:
         raise ValueError("--write-mib must not exceed 1048576")
     if (
         min(
-            args.prefill_gib,
             args.write_mib,
             args.read_mib,
             args.baseline_seconds,
@@ -185,16 +246,18 @@ def execute(args):
         )
         <= 0
         or args.aux_tables < 0
+        or args.prefill_gib < 0
     ):
         raise ValueError("sizes, rates and durations must be positive")
     if args.readers < 1 or args.readers > args.buckets:
         raise ValueError("readers must be between 1 and buckets")
     if args.max_gib <= args.prefill_gib:
         raise ValueError("max-gib must leave room beyond prefill-gib")
-    c = run.config(args.config, args.database)
     c.update(payload_bytes=args.payload_bytes, replication_factor=3)
-    name = "upgrade_" + uuid.uuid4().hex[:12]
-    directory = HERE / "runs" / name
+    run_name = "upgrade_" + uuid.uuid4().hex[:12]
+    name = previous["manifest"]["table"] if previous else run_name
+    id_base = previous["id_base"] if previous else 0
+    directory = HERE / "runs" / run_name
     directory.mkdir(parents=True)
     write_json(HERE / "runs" / "latest-upgrade.json", dict(run_dir=str(directory)))
     write_json(
@@ -204,6 +267,9 @@ def execute(args):
             database=c["database"],
             mode="upgrade",
             rate_control_version=1,
+            reuse_run=str(args.reuse_run.resolve()) if previous else None,
+            id_base=id_base,
+            verification_scope="records appended during this run",
             payload_bytes=args.payload_bytes,
             checkout_sha=sp.check_output(
                 ["git", "-C", str(run.REPO), "rev-parse", "HEAD"], text=True
@@ -235,11 +301,13 @@ def execute(args):
         UP_WRITE_BPS=str(args.write_mib * 1024**2),
         UP_READ_BPS=str(args.read_mib * 1024**2),
         UP_READERS=str(args.readers),
+        UP_ID_BASE=str(id_base),
     )
     children, handles = [], []
     events = {}
     result = dict(status="failed")
     stage = "setup"
+    table_lock = None
 
     def state(value):
         nonlocal stage
@@ -283,20 +351,45 @@ def execute(args):
         flush=True,
     )
     try:
+        lock_key = hashlib.sha256(
+            (c["endpoint"] + "\n" + c["database"] + "\n" + name).encode()
+        ).hexdigest()
+        table_lock = (HERE / "runs" / ("table-" + lock_key + ".lock")).open("a")
+        fcntl.flock(table_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         state("setup")
-        spawn("setup", 0).wait(timeout=(args.aux_tables + 1) * 330)
-        if children[-1][2].returncode:
-            raise RuntimeError("setup failed; inspect setup.log; partially created tables retained")
-        tables = run.records(directory / "setup.log", "TABLE ")
+        if previous:
+            tables = previous["tables"]
+        else:
+            spawn("setup", 0).wait(timeout=(args.aux_tables + 1) * 330)
+            if children[-1][2].returncode:
+                raise RuntimeError(
+                    "setup failed; inspect setup.log; partially created tables retained"
+                )
+            tables = run.records(directory / "setup.log", "TABLE ")
         write_json(directory / "tables.json", tables)
         if len(tables) != args.aux_tables + 1:
             raise RuntimeError("setup table list incomplete")
         env["UP_TABLE_ID"] = str(tables[0]["id"])
+        (directory / "expected-tables").write_text(
+            "".join(f"{t['name']} {t['id']} {t['buckets']}\n" for t in tables)
+        )
+        prepare = spawn("prepare", 0)
+        prepare.wait(timeout=330)
+        snapshots = run.records(directory / "prepare.log", "PREPARED ")
+        if prepare.returncode or len(snapshots) != 1:
+            raise RuntimeError("table/offset inspection failed; inspect prepare.log")
+        snapshot = snapshots[0]
+        write_json(directory / "offsets-before.json", snapshot)
+        expected_end = previous["expected_end"] if previous else 0
+        if sum(snapshot["start_offsets"]) != expected_end:
+            raise RuntimeError(
+                "table offsets changed since the previous drained run; use the latest run and stop other writers"
+            )
         for i in range(4):
             spawn("writer", i)
         wait_ready("w", 4)
         for i in range(4):
-            if (directory / f"ready-w-{i}").read_text().strip() != "ready rate-control-v1":
+            if (directory / f"ready-w-{i}").read_text().strip() != "ready rate-control-v1 reuse-v1":
                 raise RuntimeError("outdated upgrade_bench; run upgrade.py build first")
         events["started"] = int(time.time() * 1000)
         (directory / "start").touch()
@@ -447,7 +540,10 @@ def execute(args):
             run.terminate(p)
         for h in handles:
             h.close()
+        if table_lock is not None:
+            table_lock.close()
         write_json(directory / "events.json", events)
+        result["verification_scope"] = "records appended during this run"
         result["phases"] = summarize(directory, events, args.payload_bytes)
         result["processes"] = [
             {"mode": m, "index": i, "exit_code": p.returncode} for m, i, p in children
@@ -463,7 +559,7 @@ def execute(args):
         )
         write_json(directory / "result.json", result)
         print("RESULT", directory / "result.json", flush=True)
-        print("Tables retained; names and IDs are in setup.log/tables.json.", flush=True)
+        print("Tables retained; names and IDs are in tables.json.", flush=True)
 
 
 def main():
@@ -476,16 +572,19 @@ def main():
     parser.add_argument("--database")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument(
+        "--reuse-run", type=Path, help="reuse a drained upgrade run; default prefill is zero"
+    )
+    parser.add_argument(
         "--arrow",
         type=Path,
         default=Path("/root/cpp-test/deps/arrow/19.0.1/apache-arrow-19.0.1.tar.gz"),
     )
     parser.add_argument("-j", "--jobs", type=int, default=4)
-    parser.add_argument("--payload-bytes", type=int, default=1024)
-    parser.add_argument("--prefill-gib", type=float, default=1024)
-    parser.add_argument("--aux-tables", type=int, default=30)
-    parser.add_argument("--aux-buckets", type=int, default=20)
-    parser.add_argument("--buckets", type=int, default=64)
+    parser.add_argument("--payload-bytes", type=int)
+    parser.add_argument("--prefill-gib", type=float)
+    parser.add_argument("--aux-tables", type=int)
+    parser.add_argument("--aux-buckets", type=int)
+    parser.add_argument("--buckets", type=int)
     parser.add_argument("--readers", type=int, default=4)
     parser.add_argument("--write-mib", type=int, help="aggregate MiB/s; run defaults to 500")
     parser.add_argument("--read-mib", type=int, default=300)

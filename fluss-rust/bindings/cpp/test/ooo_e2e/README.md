@@ -168,7 +168,8 @@ offloading in the cloud console before spending the cluster's upgrade opportunit
 
 The same writer processes and connections continue from preload through recovery,
 without phase-boundary flushes. At the target rate preload takes about 35 minutes.
-Readers start at offset 0 after preload and keep their scanners across the upgrade;
+Readers start at the captured earliest retained offsets after preload and keep their
+scanners across the upgrade;
 their lag intentionally grows because reads are slower than writes. Actual rates
 depend on client and cluster capacity. Logical payload rates do not imply a fixed
 compression ratio or server disk/OSS bandwidth; monitor those separately. RF=3 data
@@ -225,6 +226,42 @@ version, ISR recovery, disk/OSS health and acceptable performance still need rev
 Log drops reduce diagnostic coverage but do not fail successful ID verification.
 
 Runner tests: `python3 -m unittest -v test_runner.py test_upgrade.py`.
+
+## Reuse tables for the next upgrade
+
+Rebuild once, then supply the **latest drained upgrade run on the same cluster**:
+
+```bash
+python3 upgrade.py build
+nohup python3 -u upgrade.py run --config /root/cpp-test/config.json \
+  --reuse-run /absolute/path/to/runs/upgrade_previous \
+  --source-version 0.9-ali-7.1 --target-version 0.9-ali-7.2 \
+  > /root/cpp-test/upgrade-71-to-72.log 2>&1 < /dev/null &
+```
+
+This creates a new result directory, reuses all table names/IDs, and restores the
+original payload and bucket layout. No tables are created. Preload defaults to
+zero; the 10-minute baseline, upgrade markers and 15-minute recovery remain.
+The 4-hour/4-TiB load limits count this run only. Without `--reuse-run`, the original
+new-table and 1-TiB preload defaults remain unchanged.
+
+Keep the source run's manifest, result, state, table inventory, lane counts and
+any offset snapshots. All four writers must have drained without errors. A failed
+historical readback is allowed if writers drained; reuse does not certify old data.
+Table identities/schema/RF and current offsets are checked before writers start.
+Stop all other writers to this table. A local lock prevents simultaneous reuse in
+this checkout, but does not coordinate other checkouts or hosts.
+
+New IDs start beyond the previous run's allocated range. Load readers scan retained
+history, while final verification scans only the range appended by this run,
+checking IDs, duplicates, missing records and payload length. `start-offsets`,
+`end-offsets` and `offsets-before.json` retain the boundaries; `offsetDelta` in
+`result.json` must equal this run's accepted rows. Expired new data fails verification.
+
+For the following upgrade, use this new run's directory as `--reuse-run`, not its
+ancestor. Stale sources are rejected when current offsets no longer match.
+`mark-start` and `mark-done` are still required to advance stages; server logs can
+refine the upgrade timeline afterward, but do not advance the runner automatically.
 
 ## Live write-rate control during an upgrade test
 

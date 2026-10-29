@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <thread>
@@ -97,6 +98,16 @@ fluss::Configuration configuration() {
     return c;
 }
 
+std::vector<int64_t> readOffsets(const fs::path& path, int buckets) {
+    std::ifstream input(path);
+    std::vector<int64_t> offsets(buckets);
+    for (auto& offset : offsets)
+        if (!(input >> offset) || offset < 0) throw std::runtime_error("invalid " + path.string());
+    std::string extra;
+    if (input >> extra) throw std::runtime_error("extra offsets in " + path.string());
+    return offsets;
+}
+
 int execute(const std::string& mode, const std::string& name, const fs::path& dir, int proc) {
     fluss::Connection connection;
     ck("connection", fluss::Connection::Create(configuration(), connection));
@@ -104,6 +115,9 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
     ck("admin", connection.GetAdmin(admin));
     const int buckets = number("UP_BUCKETS", 64);
     const int payload = number("UP_PAYLOAD", 1024);
+    const int64_t idBase = number("UP_ID_BASE", 0);
+    if (idBase < 0 || idBase > std::numeric_limits<int64_t>::max() - LANES)
+        throw std::runtime_error("invalid record ID base");
     fluss::TablePath path(env("OOO_DATABASE"), name);
     std::vector<int32_t> ids(buckets);
     std::iota(ids.begin(), ids.end(), 0);
@@ -151,6 +165,53 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
     if (table.GetTableInfo().table_id != number("UP_TABLE_ID", -1))
         throw std::runtime_error("table ID mismatch");
 
+    if (mode == "prepare") {
+        std::ifstream inventory(dir / "expected-tables");
+        std::string tableName;
+        int64_t tableId;
+        int n, checked = 0;
+        while (inventory >> tableName >> tableId >> n) {
+            fluss::TableInfo info;
+            ck("inspect table",
+               admin.GetTableInfo(fluss::TablePath(path.database_name, tableName), info));
+            const auto& columns = info.schema.columns;
+            if (info.table_id != tableId || info.num_buckets != n || info.has_primary_key ||
+                info.is_partitioned || info.bucket_keys != std::vector<std::string>{"id"} ||
+                columns.size() != 3 || columns[0].name != "id" || columns[1].name != "sent_ms" ||
+                columns[2].name != "value" || columns[0].data_type.id() != fluss::TypeId::BigInt ||
+                columns[1].data_type.id() != fluss::TypeId::BigInt ||
+                columns[2].data_type.id() != fluss::TypeId::String ||
+                info.properties["table.replication.factor"] != "3")
+                throw std::runtime_error("table schema, identity or RF mismatch: " + tableName);
+            if (checked == 0 && (tableName != name || n != buckets))
+                throw std::runtime_error("main table inventory mismatch");
+            ++checked;
+        }
+        if (checked != number("UP_AUX_TABLES", 30) + 1)
+            throw std::runtime_error("incomplete expected table inventory");
+        std::unordered_map<int32_t, int64_t> starts, earliest;
+        ck("latest offsets", admin.ListOffsets(path, ids, fluss::OffsetSpec::Latest(), starts));
+        ck("earliest offsets",
+           admin.ListOffsets(path, ids, fluss::OffsetSpec::Earliest(), earliest));
+        if (starts.size() != ids.size() || earliest.size() != ids.size())
+            throw std::runtime_error("incomplete offsets");
+        std::string startText, readText, startJson = "[", readJson = "[";
+        for (int b : ids) {
+            auto start = starts.at(b), first = earliest.at(b);
+            if (first < 0 || start < first) throw std::runtime_error("invalid offset range");
+            startText += std::to_string(start) + " ";
+            readText += std::to_string(first) + " ";
+            startJson += (b ? "," : "") + std::to_string(start);
+            readJson += (b ? "," : "") + std::to_string(first);
+        }
+        save(dir / "start-offsets", startText);
+        save(dir / "read-offsets", readText);
+        std::cout << "PREPARED {\"table_id\":" << table.GetTableInfo().table_id
+                  << ",\"start_offsets\":" << startJson << "],\"read_offsets\":" << readJson << "]}"
+                  << std::endl;
+        return 0;
+    }
+
     if (mode == "write") {
         struct Stats {
             std::atomic<uint64_t> accepted{0}, completed{0}, failed{0}, rejected{0};
@@ -178,7 +239,7 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
                 row.SetString(2, text);
             }
         }
-        save(dir / ("ready-w-" + std::to_string(proc)), "ready rate-control-v1");
+        save(dir / ("ready-w-" + std::to_string(proc)), "ready rate-control-v1 reuse-v1");
         while (!fs::exists(dir / "start"))
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         std::atomic<int64_t> writeBps{number("UP_WRITE_BPS", 524288000)};
@@ -188,14 +249,19 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
             workers.emplace_back([&, t, stats] {
                 try {
                     WritePacer pacer(payload, LANES);
+                    const int lane = proc * THREADS + t;
+                    const uint64_t maxSequence =
+                        (std::numeric_limits<int64_t>::max() - idBase - lane) / LANES;
                     while (!stop && !fatal) {
                         if (!pacer.acquire(writeBps)) {
                             std::this_thread::sleep_until(pacer.wakeup(Clock::now()));
                             continue;
                         }
                         uint64_t seq = counts[t];
+                        if (seq > maxSequence)
+                            throw std::runtime_error("record ID range exhausted");
                         auto& row = pools[t][seq % pools[t].size()];
-                        row.SetInt64(0, seq * LANES + proc * THREADS + t);
+                        row.SetInt64(0, idBase + seq * LANES + lane);
                         row.SetInt64(1, wall());
                         bool sample = seq % 256 == 0;
                         auto begin = sample ? Clock::now() : Clock::time_point{};
@@ -297,10 +363,33 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
                 }
             }
         }
+        const auto starts = readOffsets(dir / (verify ? "start-offsets" : "read-offsets"), buckets);
+        std::unordered_map<int32_t, int64_t> ends;
+        int64_t offsetDelta = 0, total = 0;
+        if (verify) {
+            ck("end offsets", admin.ListOffsets(path, ids, fluss::OffsetSpec::Latest(), ends));
+            std::unordered_map<int32_t, int64_t> earliest;
+            ck("verify earliest offsets",
+               admin.ListOffsets(path, ids, fluss::OffsetSpec::Earliest(), earliest));
+            std::string endText;
+            for (int b : ids) {
+                auto end = ends.at(b);
+                if (end < starts[b] || (end > starts[b] && earliest.at(b) > starts[b]))
+                    throw std::runtime_error("verification range truncated or expired");
+                offsetDelta += end - starts[b];
+                total += end;
+                endText += std::to_string(end) + " ";
+            }
+            save(dir / "end-offsets", endText);
+            if (offsetDelta != int64_t(expected))
+                throw std::runtime_error(
+                    "offset delta differs from accepted rows; unexpected writes or missing data");
+        }
         fluss::LogScanner scanner;
         ck("scanner", table.NewScan().CreateLogScanner(scanner));
         for (int b : ids)
-            if (verify || b % parts == proc) ck("subscribe", scanner.Subscribe(b, 0));
+            if (verify ? ends.at(b) > starts[b] : b % parts == proc)
+                ck("subscribe", scanner.Subscribe(b, starts[b]));
         uint64_t rows = 0, bytes = 0, invalid = 0, duplicates = 0;
         Histogram pollLatency, age;
         auto sample = [&] {
@@ -324,22 +413,29 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - begin)
                     .count());
             uint64_t batchBytes = 0;
-            for (const auto& r : records) {
-                if (verify) {
-                    int64_t id = r.row.GetInt64(0);
-                    int lane = id % LANES;
-                    uint64_t seq = id / LANES;
-                    if (id < 0 || seq >= seen[lane].size() ||
-                        r.row.GetString(2).size() != size_t(payload))
-                        invalid++;
-                    else if (seen[lane][seq])
-                        duplicates++;
-                    else
-                        seen[lane][seq] = true;
-                } else if (rows % 256 == 0)
-                    age.add(wall() - r.row.GetInt64(1));
-                rows++;
-                batchBytes += payload;
+            for (size_t i = 0; i < records.BucketCount(); ++i) {
+                auto bucket = records.BucketAt(i);
+                const int b = bucket.Bucket().bucket_id;
+                for (const auto& r : bucket) {
+                    if (verify) {
+                        int64_t id = r.row.GetInt64(0);
+                        // Subtract before decoding lanes: each run owns a disjoint ID range.
+                        uint64_t relative = id >= idBase ? uint64_t(id - idBase) : 0;
+                        int lane = relative % LANES;
+                        uint64_t seq = relative / LANES;
+                        if (id < idBase || r.offset < starts.at(b) || r.offset >= ends.at(b) ||
+                            seq >= seen[lane].size() ||
+                            r.row.GetString(2).size() != size_t(payload))
+                            invalid++;
+                        else if (seen[lane][seq])
+                            duplicates++;
+                        else
+                            seen[lane][seq] = true;
+                    } else if (rows % 256 == 0)
+                        age.add(wall() - r.row.GetInt64(1));
+                    rows++;
+                    batchBytes += payload;
+                }
             }
             bytes += batchBytes;
             if (!verify) {
@@ -358,14 +454,14 @@ int execute(const std::string& mode, const std::string& name, const fs::path& di
         }
         uint64_t missing = 0;
         for (const auto& lane : seen) missing += std::count(lane.begin(), lane.end(), false);
-        std::unordered_map<int32_t, int64_t> ends;
-        ck("end offsets", admin.ListOffsets(path, ids, fluss::OffsetSpec::Latest(), ends));
-        int64_t total = 0;
-        for (const auto& end : ends) total += end.second;
-        bool success = ends.size() == ids.size() && total == int64_t(expected) &&
-                       rows == expected && !invalid && !duplicates && !missing;
+        std::unordered_map<int32_t, int64_t> currentEnds;
+        ck("stable end offsets",
+           admin.ListOffsets(path, ids, fluss::OffsetSpec::Latest(), currentEnds));
+        bool success =
+            currentEnds == ends && rows == expected && !invalid && !duplicates && !missing;
         std::cout << "VERIFY {\"expected\":" << expected << ",\"read\":" << rows
-                  << ",\"endOffsets\":" << total << ",\"missing\":" << missing
+                  << ",\"endOffsets\":" << total << ",\"offsetDelta\":" << offsetDelta
+                  << ",\"idBase\":" << idBase << ",\"missing\":" << missing
                   << ",\"duplicates\":" << duplicates << ",\"invalid\":" << invalid
                   << ",\"success\":" << (success ? "true" : "false") << "}" << std::endl;
         return success ? 0 : 2;

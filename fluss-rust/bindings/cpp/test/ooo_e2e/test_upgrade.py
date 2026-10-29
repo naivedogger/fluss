@@ -19,11 +19,105 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import upgrade
 
 
 class UpgradeTest(unittest.TestCase):
+    def old_run(self, root, base=0, start=0):
+        counts = [1, 2, 3, 4, 5]
+        upgrade.write_json(
+            root / "manifest.json",
+            dict(
+                mode="upgrade",
+                database="fluss",
+                table="old",
+                payload_bytes=1024,
+                buckets=4,
+                auxiliary_tables=0,
+                auxiliary_buckets=20,
+                id_base=base,
+                reuse_run="previous" if base else None,
+            ),
+        )
+        upgrade.write_json(root / "state.json", dict(stage="completed"))
+        upgrade.write_json(
+            root / "result.json",
+            dict(
+                writers=[
+                    dict(accepted=sum(counts), completed=sum(counts), errors=0) for _ in range(4)
+                ]
+            ),
+        )
+        upgrade.write_json(root / "tables.json", [dict(name="old", id=7, buckets=4)])
+        for i in range(4):
+            (root / f"counts-{i}").write_text(" ".join(map(str, counts)))
+        if base:
+            (root / "start-offsets").write_text(" ".join([str(start)] * 4))
+
+    def test_reuse_legacy_and_chained_run_reserve_disjoint_ids(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for base, start in ((0, 0), (100, 15)):
+                self.old_run(root, base, start)
+                old = upgrade.reuse_input(root, "fluss")
+                self.assertEqual(old["id_base"], base + 100)
+                self.assertEqual(old["expected_end"], start * 4 + 60)
+                args = SimpleNamespace(
+                    payload_bytes=None,
+                    buckets=None,
+                    aux_tables=None,
+                    aux_buckets=None,
+                    prefill_gib=None,
+                )
+                upgrade.resolve_layout(args, old)
+                self.assertEqual((args.buckets, args.aux_tables, args.prefill_gib), (4, 0, 0))
+                args.buckets = 8
+                with self.assertRaisesRegex(ValueError, "conflicts"):
+                    upgrade.resolve_layout(args, old)
+            fresh = SimpleNamespace(
+                payload_bytes=None,
+                buckets=None,
+                aux_tables=None,
+                aux_buckets=None,
+                prefill_gib=None,
+            )
+            upgrade.resolve_layout(fresh, None)
+            self.assertEqual((fresh.buckets, fresh.aux_tables, fresh.prefill_gib), (64, 30, 1024))
+
+    def test_reuse_rejects_active_undrained_and_incomplete_runs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.old_run(root)
+            with self.assertRaisesRegex(ValueError, "same database"):
+                upgrade.reuse_input(root, "other")
+            upgrade.write_json(root / "state.json", dict(stage="upgrading"))
+            with self.assertRaisesRegex(ValueError, "still active"):
+                upgrade.reuse_input(root, "fluss")
+            # A failed historical readback need not block reuse if writers drained.
+            upgrade.write_json(root / "state.json", dict(stage="failed"))
+            self.assertEqual(upgrade.reuse_input(root, "fluss")["id_base"], 100)
+            result = json.loads((root / "result.json").read_text())
+            result["writers"][0]["errors"] = 1
+            upgrade.write_json(root / "result.json", result)
+            with self.assertRaisesRegex(ValueError, "drained"):
+                upgrade.reuse_input(root, "fluss")
+            self.old_run(root)
+            (root / "counts-2").write_text("1 2 3 4")
+            with self.assertRaisesRegex(ValueError, "counts"):
+                upgrade.reuse_input(root, "fluss")
+            self.old_run(root, 100, 15)
+            (root / "start-offsets").unlink()
+            with self.assertRaisesRegex(ValueError, "missing its start"):
+                upgrade.reuse_input(root, "fluss")
+            self.old_run(root, -20, 15)
+            with self.assertRaisesRegex(ValueError, "invalid previous"):
+                upgrade.reuse_input(root, "fluss")
+            self.old_run(root, 2**63 - 20, 15)
+            with self.assertRaisesRegex(ValueError, "exhausted"):
+                upgrade.reuse_input(root, "fluss")
+
     def test_live_rate_pause_resume_and_request_history(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
