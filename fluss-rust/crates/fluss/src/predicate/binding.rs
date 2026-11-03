@@ -17,10 +17,7 @@
 
 //! Schema-bound predicates for local evaluation and conservative pruning.
 
-use super::coercion::{
-    compound_name, float32, float64, integer_in_range, integer_value, mismatch, rescale,
-    resolve_field, unsupported_column, validate_leaf,
-};
+use super::coercion::{compound_name, mismatch, resolve_field, unsupported_column, validate_leaf};
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
 use crate::metadata::{DataField, DataType, RowType};
@@ -50,8 +47,11 @@ pub enum BoundPredicate {
 }
 
 impl BoundPredicate {
-    /// Binds an optional predicate to `row_type` using Fluss literal coercion rules.
-    /// Consumers validate backend-specific physical representations separately.
+    /// Binds an optional predicate to `row_type`, rewriting numeric bounds exactly.
+    /// Numeric comparisons use the literal's value, not a lossy cast to the column
+    /// type. Floating comparisons follow Fluss: all NaNs compare equal and above
+    /// infinity, while signed zeros remain distinct. Other physical representations
+    /// are checked by the evaluator.
     #[doc(hidden)]
     pub fn bind(predicate: Option<&Predicate>, row_type: &RowType) -> Result<Self> {
         match predicate {
@@ -69,16 +69,24 @@ impl BoundPredicate {
             } => {
                 let (field_index, data_field) = resolve_field(row_type, field)?;
                 validate_leaf(*function, data_field, literals)?;
+                let (function, literals) =
+                    match super::numeric::bind(data_field, *function, literals)? {
+                        Some(rewritten) => rewritten,
+                        None => (
+                            *function,
+                            literals
+                                .iter()
+                                .map(|literal| bind_literal(data_field, literal))
+                                .collect::<Result<Vec<_>>>()?,
+                        ),
+                    };
                 Ok(Self::Leaf {
                     field_index,
                     field_name: field.clone(),
                     field_id: data_field.field_id(),
                     data_type: data_field.data_type().clone(),
-                    function: *function,
-                    literals: literals
-                        .iter()
-                        .map(|literal| bind_literal(data_field, literal))
-                        .collect::<Result<Vec<_>>>()?,
+                    function,
+                    literals,
                 })
             }
             Predicate::Compound { function, children } => {
@@ -95,6 +103,59 @@ impl BoundPredicate {
                         .collect::<Result<Vec<_>>>()?,
                 })
             }
+        }
+    }
+
+    /// Returns a conservative predicate for Fluss log-batch pruning.
+    ///
+    /// Uses the rewritten bounds, not the original literals, and excludes filters
+    /// whose server-side statistics semantics may discard matching rows. This
+    /// method does not negotiate backend capabilities. `None` means no pruning;
+    /// callers must still apply this bound predicate to the returned rows.
+    /// A partially supported `OR` is never pushed down.
+    #[doc(hidden)]
+    pub fn to_pushdown_predicate(&self) -> Option<Predicate> {
+        match self {
+            Self::AlwaysTrue => None,
+            Self::Leaf {
+                field_name,
+                data_type,
+                function,
+                literals,
+                ..
+            } => {
+                // TIME statistics store milliseconds even for finer-precision columns.
+                let null_checks_only =
+                    matches!(data_type, DataType::Float(_) | DataType::Double(_))
+                        || matches!(data_type, DataType::Time(time) if time.precision() > 3);
+                if null_checks_only
+                    && !matches!(function, LeafFunction::IsNull | LeafFunction::IsNotNull)
+                {
+                    return None;
+                }
+                // Server prefix pruning uses UTF-16 ordering, unlike UTF-8 min/max.
+                if matches!(function, LeafFunction::StartsWith) {
+                    return None;
+                }
+                Some(Predicate::Leaf {
+                    field: field_name.clone(),
+                    function: *function,
+                    literals: literals.clone(),
+                })
+            }
+            Self::Compound {
+                function: CompoundFunction::And,
+                children,
+            } => Predicate::and_all(children.iter().filter_map(Self::to_pushdown_predicate)),
+            Self::Compound {
+                function: CompoundFunction::Or,
+                children,
+            } => Predicate::or_all(
+                children
+                    .iter()
+                    .map(Self::to_pushdown_predicate)
+                    .collect::<Option<Vec<_>>>()?,
+            ),
         }
     }
 
@@ -133,27 +194,9 @@ fn bind_literal(field: &DataField, literal: &Literal) -> Result<Literal> {
         return Ok(Literal::Null);
     }
 
-    // The coercion rules are shared with the existing protobuf encoder.
-    // Arrow physical-width checks belong to the evaluator, not the wire format.
+    // Numeric bounds are normalized before this point. Temporal bounds keep
+    // their precision for comparison using the core timestamp types.
     Ok(match (field.data_type(), literal) {
-        (DataType::TinyInt(_), _) => {
-            Literal::Int8(integer_in_range(field, literal, i8::MAX as i64)? as i8)
-        }
-        (DataType::SmallInt(_), _) => {
-            Literal::Int16(integer_in_range(field, literal, i16::MAX as i64)? as i16)
-        }
-        (DataType::Int(_), _) => {
-            Literal::Int32(integer_in_range(field, literal, i32::MAX as i64)? as i32)
-        }
-        (DataType::BigInt(_), _) => Literal::Int64(integer_value(field, literal)?),
-        (DataType::Float(_), _) => Literal::Float32(float32(field, literal)?),
-        (DataType::Double(_), _) => Literal::Float64(float64(field, literal)?),
-        (DataType::Decimal(decimal_type), Literal::Decimal(value)) => Literal::Decimal(rescale(
-            field,
-            value,
-            decimal_type.precision(),
-            decimal_type.scale(),
-        )?),
         (DataType::Boolean(_), Literal::Bool(_))
         | (DataType::Char(_) | DataType::String(_), Literal::String(_))
         | (DataType::Binary(_) | DataType::Bytes(_), Literal::Bytes(_))
@@ -207,6 +250,122 @@ mod tests {
     }
 
     #[test]
+    fn pushdown_keeps_only_statistics_safe_conditions() {
+        for (data_type, functions, literal, safe) in [
+            (
+                DataTypes::time_with_precision(3),
+                vec![LeafFunction::GreaterThan],
+                Literal::Time(0),
+                true,
+            ),
+            (
+                DataTypes::time_with_precision(6),
+                vec![LeafFunction::GreaterThan],
+                Literal::Time(0),
+                false,
+            ),
+            (
+                DataTypes::time_with_precision(9),
+                vec![
+                    LeafFunction::Equal,
+                    LeafFunction::NotEqual,
+                    LeafFunction::LessThan,
+                    LeafFunction::LessOrEqual,
+                    LeafFunction::GreaterThan,
+                    LeafFunction::GreaterOrEqual,
+                    LeafFunction::In,
+                    LeafFunction::NotIn,
+                ],
+                Literal::Time(0),
+                false,
+            ),
+            (
+                DataTypes::float(),
+                vec![LeafFunction::Equal],
+                Literal::Float32(0.0),
+                false,
+            ),
+            (
+                DataTypes::double(),
+                vec![LeafFunction::Equal],
+                Literal::Float64(0.0),
+                false,
+            ),
+            (
+                DataTypes::string(),
+                vec![LeafFunction::StartsWith],
+                Literal::String("\u{e000}".into()),
+                false,
+            ),
+            (
+                DataTypes::char(4),
+                vec![LeafFunction::StartsWith],
+                Literal::String("A".into()),
+                false,
+            ),
+            (
+                DataTypes::string(),
+                vec![LeafFunction::Equal, LeafFunction::LessThan],
+                Literal::String("A".into()),
+                true,
+            ),
+        ] {
+            let row_type = RowType::new(vec![DataField::new("c", data_type, None)]);
+            let pushdown = |predicate: &Predicate| {
+                BoundPredicate::bind(Some(predicate), &row_type)
+                    .unwrap()
+                    .to_pushdown_predicate()
+            };
+            let not_null = col("c").is_not_null();
+            assert_eq!(pushdown(&not_null), Some(not_null.clone()));
+            assert_eq!(pushdown(&col("c").is_null()), Some(col("c").is_null()));
+            for function in functions {
+                let predicate = Predicate::Leaf {
+                    field: "c".into(),
+                    function,
+                    literals: vec![literal.clone()],
+                };
+                assert_eq!(
+                    pushdown(&predicate),
+                    safe.then(|| predicate.clone()),
+                    "{row_type:?}, {function:?}"
+                );
+                if !safe {
+                    assert_eq!(
+                        pushdown(&predicate.clone().and(not_null.clone())),
+                        Some(not_null.clone())
+                    );
+                    assert_eq!(pushdown(&predicate.or(not_null.clone())), None);
+                }
+            }
+        }
+
+        let row_type = RowType::new(vec![DataField::new("c", DataTypes::string(), None)]);
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+            "c",
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                Some("\u{e000}"),
+                Some("\u{10000}"),
+                None,
+            ])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let bound =
+            BoundPredicate::bind(Some(&col("c").starts_with("\u{e000}")), &row_type).unwrap();
+        assert_eq!(
+            bound
+                .into_evaluator()
+                .unwrap()
+                .evaluate_batch(&batch)
+                .unwrap()
+                .values()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+    }
+
+    #[test]
     fn rejects_invalid_shape_before_any_consumer_uses_the_predicate() {
         let predicate = Predicate::Leaf {
             field: "id".to_string(),
@@ -232,10 +391,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_integer_literals_that_round_when_bound_to_double() {
+    fn folds_unrepresentable_integer_equality_without_rounding() {
         let row_type = RowType::new(vec![DataField::new("value", DataTypes::double(), None)]);
 
-        assert!(BoundPredicate::bind(Some(&col("value").eq(i64::MAX)), &row_type).is_err());
+        let bound = BoundPredicate::bind(Some(&col("value").eq(i64::MAX)), &row_type).unwrap();
+        assert!(
+            matches!(bound, BoundPredicate::Leaf { function: LeafFunction::In, literals, .. } if literals.is_empty())
+        );
         BoundPredicate::bind(Some(&col("value").eq(9_007_199_254_740_994_i64)), &row_type).unwrap();
     }
 }

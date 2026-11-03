@@ -73,9 +73,11 @@ pub struct LakeSplit {
     pub estimated_rows: Option<usize>,
     /// Estimated input size in bytes; `None` means unknown, not zero.
     pub estimated_size: Option<usize>,
-    /// Nonzero, format-owned payload version, independent of kernel split versions.
+    /// Nonzero, format-owned payload version interpreted by the matching LakeSource.
     pub payload_version: u32,
     /// Nonempty task description decoded only by a compatible lake source.
+    /// Preserve snapshot-specific deletion files and their data-file associations;
+    /// readers applying position-based deletion vectors must preserve row positions.
     /// Must not contain storage credentials or other runtime secrets.
     pub payload: Vec<u8>,
 }
@@ -117,7 +119,7 @@ impl Debug for LakeSplit {
 
 /// Immutable input to lake planning. The snapshot must never be refreshed.
 pub struct LakePlannerContext<'a> {
-    /// Logical Fluss table metadata used to resolve the lake mapping and layout.
+    /// Frozen Fluss schema and layout, with runtime lake properties supplied locally.
     pub table_info: &'a TableInfo,
     /// Lake snapshot to plan; the source must not substitute a newer snapshot.
     pub snapshot_id: i64,
@@ -133,7 +135,7 @@ pub struct LakePlannerContext<'a> {
 
 /// Immutable lake-reader input from frozen tasks and the execution-side scan settings.
 pub struct LakeReaderContext<'a> {
-    /// Logical Fluss table metadata compatible with the frozen tasks.
+    /// Frozen Fluss schema and layout, with runtime lake properties supplied locally.
     pub table_info: &'a TableInfo,
     /// Frozen lake snapshot shared by every supplied task.
     pub snapshot_id: i64,

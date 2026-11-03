@@ -20,7 +20,7 @@
 use crate::FlussLakePartitionIdentity;
 #[cfg(test)]
 use fluss::metadata::ResolvedPartitionSpec;
-use fluss::metadata::RowType;
+use fluss::metadata::{DataType, PartitionSpec, RowType};
 use fluss::predicate::{BoundPredicate, CompoundFunction, LeafFunction, Literal};
 use std::collections::HashMap;
 
@@ -55,6 +55,36 @@ impl PartitionPruner {
             partition_fields,
             predicate: predicate.clone(),
         }
+    }
+
+    /// Extracts a scope implied by the filter, not a replacement for that filter.
+    /// String equality uses metadata values verbatim. Other types may have
+    /// multiple encodings of an equal value; keep them for metadata-aware pruning.
+    pub(crate) fn partition_scope(&self) -> PartitionSpec {
+        let mut scope = HashMap::new();
+        let mut pending = vec![&self.predicate];
+        while let Some(predicate) = pending.pop() {
+            match predicate {
+                BoundPredicate::Compound {
+                    function: CompoundFunction::And,
+                    children,
+                } => pending.extend(children),
+                BoundPredicate::Leaf {
+                    field_index,
+                    field_name,
+                    data_type: DataType::String(_),
+                    function: LeafFunction::Equal,
+                    literals,
+                    ..
+                } if self.partition_fields.get(field_index) == Some(field_name) => {
+                    if let [Literal::String(value)] = literals.as_slice() {
+                        scope.insert(field_name.clone(), value.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        PartitionSpec::new(scope)
     }
 
     #[cfg(test)]
@@ -120,8 +150,6 @@ impl PartitionPruner {
             BoundPredicate::Leaf {
                 field_index,
                 field_name,
-                function,
-                literals,
                 ..
             } => {
                 let Some(partition_key) = self.partition_fields.get(field_index) else {
@@ -133,115 +161,13 @@ impl PartitionPruner {
                 let Some(value) = partition_values.get(partition_key.as_str()).copied() else {
                     return TruthValue::Unknown;
                 };
-                evaluate_leaf(value, *function, literals)
-            }
-        }
-    }
-}
-
-fn evaluate_leaf(
-    partition_value: &str,
-    function: LeafFunction,
-    literals: &[Literal],
-) -> TruthValue {
-    match function {
-        LeafFunction::IsNull | LeafFunction::IsNotNull => TruthValue::Unknown,
-        LeafFunction::In | LeafFunction::NotIn => {
-            if literals.is_empty() {
-                return if function == LeafFunction::In {
-                    TruthValue::False
-                } else {
-                    TruthValue::True
-                };
-            }
-            let mut result = TruthValue::False;
-            for literal in literals {
-                match literal_equals(partition_value, literal) {
-                    Some(true) => {
-                        return if function == LeafFunction::In {
-                            TruthValue::True
-                        } else {
-                            TruthValue::False
-                        };
-                    }
-                    Some(false) => {}
-                    None => result = TruthValue::Unknown,
+                match predicate.evaluate_partition_value(value) {
+                    Ok(true) => TruthValue::True,
+                    Ok(false) => TruthValue::False,
+                    Err(_) => TruthValue::Unknown,
                 }
             }
-            if function == LeafFunction::NotIn {
-                match result {
-                    TruthValue::False => TruthValue::True,
-                    other => other,
-                }
-            } else {
-                result
-            }
         }
-        LeafFunction::StartsWith | LeafFunction::EndsWith | LeafFunction::Contains => {
-            let Some(expected) = literals.first().and_then(Literal::as_string) else {
-                return TruthValue::Unknown;
-            };
-            let matches = match function {
-                LeafFunction::StartsWith => partition_value.starts_with(expected),
-                LeafFunction::EndsWith => partition_value.ends_with(expected),
-                LeafFunction::Contains => partition_value.contains(expected),
-                _ => unreachable!(),
-            };
-            truth(matches)
-        }
-        _ => evaluate_comparison(partition_value, function, &literals[0]),
-    }
-}
-
-fn evaluate_comparison(
-    partition_value: &str,
-    function: LeafFunction,
-    literal: &Literal,
-) -> TruthValue {
-    if let Some(expected) = literal.as_string() {
-        return truth(match function {
-            LeafFunction::Equal => partition_value == expected,
-            LeafFunction::NotEqual => partition_value != expected,
-            LeafFunction::LessThan => partition_value < expected,
-            LeafFunction::LessOrEqual => partition_value <= expected,
-            LeafFunction::GreaterThan => partition_value > expected,
-            LeafFunction::GreaterOrEqual => partition_value >= expected,
-            _ => return TruthValue::Unknown,
-        });
-    }
-    let Some(expected) = literal.as_integer() else {
-        return TruthValue::Unknown;
-    };
-    let Ok(actual) = partition_value.parse::<i128>() else {
-        return TruthValue::Unknown;
-    };
-    truth(match function {
-        LeafFunction::Equal => actual == expected,
-        LeafFunction::NotEqual => actual != expected,
-        LeafFunction::LessThan => actual < expected,
-        LeafFunction::LessOrEqual => actual <= expected,
-        LeafFunction::GreaterThan => actual > expected,
-        LeafFunction::GreaterOrEqual => actual >= expected,
-        _ => return TruthValue::Unknown,
-    })
-}
-
-fn literal_equals(partition_value: &str, literal: &Literal) -> Option<bool> {
-    if let Some(expected) = literal.as_string() {
-        return Some(partition_value == expected);
-    }
-    let expected = literal.as_integer()?;
-    partition_value
-        .parse::<i128>()
-        .ok()
-        .map(|actual| actual == expected)
-}
-
-fn truth(value: bool) -> TruthValue {
-    if value {
-        TruthValue::True
-    } else {
-        TruthValue::False
     }
 }
 
@@ -249,7 +175,7 @@ fn truth(value: bool) -> TruthValue {
 mod tests {
     use super::*;
     use fluss::metadata::{DataField, DataTypes};
-    use fluss::predicate::{Predicate, col};
+    use fluss::predicate::{Literal, Predicate, col};
     use std::sync::Arc;
 
     fn row_type() -> RowType {
@@ -279,12 +205,79 @@ mod tests {
     }
 
     #[test]
+    fn capture_scope_uses_only_implied_string_partition_equalities() {
+        for (predicate, region) in [
+            (col("region").eq("US").and(col("id").eq(42_i32)), Some("US")),
+            (col("region").eq("US").or(col("id").eq(42_i32)), None),
+            (col("region").ge("US").and(col("day").eq(2_i32)), None),
+            (
+                col("region")
+                    .eq("US")
+                    .and(col("day").eq(1_i32).or(col("day").eq(2_i32))),
+                Some("US"),
+            ),
+        ] {
+            let scope = pruner(predicate).partition_scope();
+            let expected = region
+                .map(|value| HashMap::from([("region".to_string(), value.to_string())]))
+                .unwrap_or_default();
+            assert_eq!(scope.get_spec_map(), &expected);
+        }
+    }
+
+    #[test]
     fn prunes_equal_range_and_in_predicates() {
         assert!(!pruner(col("region").eq("US")).partition_may_match(&partition("EU", "2")));
         assert!(!pruner(col("day").ge(10_i32)).partition_may_match(&partition("US", "9")));
         assert!(
             !pruner(col("region").is_in(["US", "CN"])).partition_may_match(&partition("EU", "2"))
         );
+    }
+
+    #[test]
+    fn fractional_numeric_bounds_do_not_prune_matching_partitions() {
+        let filter = pruner(col("day").lt(1.3));
+        assert!(filter.partition_may_match(&partition("EU", "1")));
+        assert!(!filter.partition_may_match(&partition("EU", "2")));
+        assert!(!pruner(col("day").eq(1.3)).partition_may_match(&partition("EU", "1")));
+        assert!(pruner(col("day").ge(-1.3)).partition_may_match(&partition("EU", "-1")));
+    }
+
+    #[test]
+    fn timestamp_partitions_preserve_sub_millisecond_precision() {
+        for ltz in [false, true] {
+            let data_type = if ltz {
+                DataTypes::timestamp_ltz_with_precision(9)
+            } else {
+                DataTypes::timestamp_with_precision(9)
+            };
+            let literal = if ltz {
+                Literal::TimestampLtz(
+                    fluss::row::TimestampLtz::from_millis_nanos(1, 900_000).unwrap(),
+                )
+            } else {
+                Literal::TimestampNtz(
+                    fluss::row::TimestampNtz::from_millis_nanos(1, 900_000).unwrap(),
+                )
+            };
+            let row_type = RowType::new(vec![DataField::new("ts", data_type, None)]);
+            for (predicate, expected) in [
+                (col("ts").lt(literal.clone()), [true, false, false]),
+                (col("ts").eq(literal.clone()), [false, true, false]),
+                (col("ts").is_in([literal.clone()]), [false, true, false]),
+                (col("ts").not_in([literal]), [true, false, true]),
+            ] {
+                let bound = BoundPredicate::bind(Some(&predicate), &row_type).unwrap();
+                let pruner = PartitionPruner::new(&row_type, &["ts".into()], &bound);
+                for (fraction, expected) in ["001", "0019", "002"].into_iter().zip(expected) {
+                    let partition = FlussLakePartitionIdentity::KeyValues(vec![(
+                        "ts".into(),
+                        format!("1970-01-01-00-00-00_{fraction}"),
+                    )]);
+                    assert_eq!(pruner.partition_identity_may_match(&partition), expected);
+                }
+            }
+        }
     }
 
     #[test]

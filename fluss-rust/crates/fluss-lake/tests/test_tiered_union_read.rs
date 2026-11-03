@@ -26,9 +26,8 @@ use fluss::config::Config;
 use fluss::metadata::TablePath;
 use fluss::predicate::col;
 use fluss_lake::{
-    FlussLakeReadContext, FlussLakeReadSplit, FlussLakeScan, FlussLakeTable, LakePlannerContext,
-    LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource,
-    RecordBatchStream,
+    FlussLakeReadSplit, FlussLakeScan, FlussLakeTable, LakePlannerContext, LakeReadSemantics,
+    LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource, RecordBatchStream,
 };
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
@@ -48,7 +47,6 @@ struct DelegatingLakeSource {
     plans: AtomicUsize,
     reads: AtomicUsize,
     lake_gate: Option<Arc<Semaphore>>,
-    read_only: bool,
 }
 
 impl LakeSource for DelegatingLakeSource {
@@ -59,7 +57,6 @@ impl LakeSource for DelegatingLakeSource {
         &'a self,
         context: LakePlannerContext<'a>,
     ) -> BoxFuture<'a, fluss_lake::Result<Vec<LakeSplit>>> {
-        assert!(!self.read_only, "worker must not invoke lake planning");
         self.plans.fetch_add(1, Ordering::Relaxed);
         self.inner.plan(context)
     }
@@ -108,7 +105,6 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
 async fn read_batches(scan: FlussLakeScan, splits: &[FlussLakeReadSplit]) -> Vec<RecordBatch> {
     scan.new_reader()
         .read_splits(splits)
-        .await
         .unwrap()
         .try_collect()
         .await
@@ -159,7 +155,6 @@ async fn verify() {
         plans: AtomicUsize::new(0),
         reads: AtomicUsize::new(0),
         lake_gate: lake_gate.clone(),
-        read_only: false,
     });
     let table = FlussLakeTable::open_with_properties(connection, &path, properties.clone())
         .await
@@ -170,7 +165,7 @@ async fn verify() {
     }
     let scan = table.new_scan().with_batch_size(1);
     let plan = scan.plan().await.unwrap();
-    let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
+    let context = plan.read_context().clone();
     assert!(
         context.lake_snapshot_id().is_some(),
         "must read a real lake snapshot"
@@ -191,8 +186,7 @@ async fn verify() {
             "lake and log must be separate tasks"
         );
     }
-    let splits: Vec<FlussLakeReadSplit> =
-        serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
+    let splits: Vec<FlussLakeReadSplit> = plan.splits().to_vec();
     let expected = if scenario == "pk" {
         vec![(1, "tail-new"), (3, "lake-keep"), (4, "tail-insert")]
     } else {
@@ -214,7 +208,6 @@ async fn verify() {
     for &concurrency in concurrencies {
         let batches = reader
             .read_splits_with_concurrency(&splits, concurrency)
-            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -222,49 +215,13 @@ async fn verify() {
         assert_eq!(
             rows(&batches),
             expected,
-            "serial and concurrent transported reads must preserve the current view"
+            "serial and concurrent retained reads must preserve the current view"
         );
         assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
     }
     drop(reader);
     drop(plan);
     drop(scan);
-    // Restore only the scan configuration and transported tasks on a fresh
-    // connection. The worker backend must read, never enumerate lake files.
-    let worker_source = Arc::new(DelegatingLakeSource {
-        inner: PaimonLakeSource::new(&info, &properties).unwrap(),
-        plans: AtomicUsize::new(0),
-        reads: AtomicUsize::new(0),
-        lake_gate: None,
-        read_only: true,
-    });
-    let worker_connection = Arc::new(
-        FlussConnection::new(Config {
-            bootstrap_servers: required_env("FLUSS_RUST_UNION_READ_BOOTSTRAP_SERVERS"),
-            ..Default::default()
-        })
-        .await
-        .unwrap(),
-    );
-    let worker_table = FlussLakeTable::open_with_properties(worker_connection, &path, properties)
-        .await
-        .unwrap();
-    let worker = worker_table
-        .new_scan()
-        .with_batch_size(1)
-        .with_lake_source(worker_source.clone())
-        .new_reader();
-    let batches = worker
-        .read_splits(&splits)
-        .await
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-    assert_eq!(rows(&batches), expected);
-    assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
-    assert_eq!(worker_source.plans.load(Ordering::Relaxed), 0);
-    assert!(worker_source.reads.load(Ordering::Relaxed) > 0);
     let lake_scan = table.new_scan().with_lake_only(true);
     let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
     let baseline = read_batches(lake_scan, lake_plan.splits()).await;
@@ -284,8 +241,7 @@ async fn verify() {
             .with_projection(vec![])
             .with_batch_size(2);
         let count_plan = count_scan.plan_with_context(&context).await.unwrap();
-        let count_splits: Vec<FlussLakeReadSplit> =
-            serde_json::from_slice(&serde_json::to_vec(count_plan.splits()).unwrap()).unwrap();
+        let count_splits: Vec<FlussLakeReadSplit> = count_plan.splits().to_vec();
         drop(count_plan);
         let batches = read_batches(count_scan, &count_splits).await;
         assert!(
@@ -303,7 +259,6 @@ async fn verify() {
     let mut stream = custom_scan
         .new_reader()
         .read_splits_with_concurrency(custom_plan.splits(), custom_plan.split_count())
-        .await
         .unwrap();
     let mut batches = Vec::new();
     if let Some(gate) = lake_gate {
@@ -361,12 +316,11 @@ async fn verify() {
             let plan = scan.plan_with_context(&context).await.unwrap();
             assert!(!plan.splits().is_empty(), "must exercise a real log task");
             assert!(context.log_ranges().iter().any(|range| !range.is_empty()));
-            let splits: Vec<FlussLakeReadSplit> =
-                serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
+            let splits: Vec<FlussLakeReadSplit> = plan.splits().to_vec();
             drop(plan);
             let reader = scan.new_reader();
             drop(scan);
-            let stream = reader.read_splits(&splits).await.unwrap();
+            let stream = reader.read_splits(&splits).unwrap();
             let batches =
                 tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
                     .await
@@ -411,13 +365,15 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
     };
     let primary_key = scenario.starts_with("pk");
     let plan = table.new_scan().plan().await.unwrap();
-    let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
+    let context = plan.read_context().clone();
     assert_eq!(context.num_buckets(), new_count);
     assert_eq!(context.log_ranges().len(), (old_count + new_count) as usize);
     assert!(context.lake_snapshot_id().is_some());
     let mut has_tail = false;
     for range in context.log_ranges() {
-        let fluss_lake::FlussLakePartitionIdentity::KeyValues(values) = range.partition_identity()
+        let fluss_lake::FlussLakeLogPartition::Ordinary(
+            fluss_lake::FlussLakePartitionIdentity::KeyValues(values),
+        ) = range.partition()
         else {
             panic!("partitioned fixture")
         };
@@ -465,13 +421,12 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
     }
     baseline.sort_unstable();
     expected.sort_unstable();
-    let transported: Vec<FlussLakeReadSplit> =
-        serde_json::from_slice(&serde_json::to_vec(plan.splits()).unwrap()).unwrap();
+    let retained: Vec<FlussLakeReadSplit> = plan.splits().to_vec();
     drop(plan);
     let read = |scan: fluss_lake::FlussLakeScan, plan: fluss_lake::FlussLakeReadPlan| async move {
         partition_rows(&read_batches(scan, plan.splits()).await)
     };
-    let batches = read_batches(table.new_scan(), &transported).await;
+    let batches = read_batches(table.new_scan(), &retained).await;
     assert_eq!(partition_rows(&batches), expected);
     let lake_scan = table.new_scan().with_lake_only(true);
     let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
@@ -499,6 +454,23 @@ async fn verify_partition_layouts(table: &FlussLakeTable, scenario: &str) {
             read(filtered, plan).await,
             wanted,
             "partition pruning {partition}"
+        );
+        let scan = table.new_scan().with_filter(col("region").eq(partition));
+        let plan = scan.plan().await.unwrap();
+        assert_eq!(
+            plan.read_context()
+                .partition_filter()
+                .get("region")
+                .map(String::as_str),
+            Some(partition)
+        );
+        if partition == "expired" {
+            assert!(plan.read_context().log_ranges().is_empty());
+        }
+        assert_eq!(
+            read(scan, plan).await,
+            wanted,
+            "automatic scope {partition}"
         );
     }
     if primary_key {

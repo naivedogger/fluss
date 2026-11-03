@@ -40,7 +40,7 @@ fn append_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
 }
 
 #[tokio::test]
-async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
+async fn append_log_plan_uses_frozen_stop_offset_after_planning() {
     let cluster = support::get_shared_cluster();
     let connection = Arc::new(cluster.get_fluss_connection().await);
     let admin = connection.get_admin().expect("Failed to get Fluss admin");
@@ -53,8 +53,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
                 .build()
                 .expect("Failed to build UnionRead integration test schema"),
         )
-        .property("table.datalake.enabled", "true")
-        .property("table.datalake.format", "paimon")
         .build()
         .expect("Failed to build UnionRead integration test table descriptor");
     support::create_table(&admin, &table_path, &table_descriptor).await;
@@ -93,11 +91,8 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
     assert_eq!(plan.schema().fields().len(), 1);
     assert_eq!(plan.schema().field(0).name(), "name");
     assert_eq!(plan.splits().len(), 1);
-    let transported_split: FlussLakeReadSplit = serde_json::from_slice(
-        &serde_json::to_vec(&plan.splits()[0]).expect("Failed to encode UnionRead split"),
-    )
-    .expect("Failed to decode transported UnionRead split");
-    let context = FlussLakeReadContext::from_json(&plan.read_context().to_json().unwrap()).unwrap();
+    let retained_split = plan.splits()[0].clone();
+    let context = plan.read_context().clone();
 
     writer
         .append_arrow_batch(append_batch(vec![4, 5], vec!["after-4", "after-5"]))
@@ -113,40 +108,29 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
     let ids_scan = lake_table.new_scan().with_projection(vec![0]);
     let reused_plan = ids_scan.plan_with_context(&context).await.unwrap();
     assert_eq!(
-        reused_plan.read_context().to_json().unwrap(),
-        context.to_json().unwrap()
+        reused_plan.read_context().log_ranges(),
+        context.log_ranges()
     );
-    let ids_splits: Vec<FlussLakeReadSplit> =
-        serde_json::from_slice(&serde_json::to_vec(reused_plan.splits()).unwrap()).unwrap();
+    let ids_splits: Vec<FlussLakeReadSplit> = reused_plan.splits().to_vec();
     drop(reused_plan);
-    // A worker has only the original tasks and matching scan settings. It must
-    // not replan and include the rows written after the frozen stop offset.
+    // Cloned local tasks retain their boundaries after the plan is dropped.
     let ids_reader = lake_table.new_scan().with_projection(vec![0]).new_reader();
     assert!(
         ids_reader
             .read_splits(&[ids_splits[0].clone(), ids_splits[0].clone()])
-            .await
             .is_err()
     );
     assert!(
         ids_reader
             .read_splits_with_concurrency(&ids_splits, 0)
-            .await
             .is_err()
     );
-    let mut incompatible = ids_splits[0].clone();
-    incompatible.descriptor_version += 1;
-    assert!(matches!(
-        ids_reader.read_split(&incompatible).await,
-        Err(FlussLakeError::IncompatibleSplitVersion(_))
-    ));
     assert!(
         lake_table
             .new_scan()
             .with_batch_size(0)
             .new_reader()
             .read_splits(&[])
-            .await
             .is_err()
     );
     let mut ids: Vec<i32> = Vec::new();
@@ -155,7 +139,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
             Duration::from_secs(10),
             ids_reader
                 .read_split(split)
-                .await
                 .unwrap()
                 .try_collect::<Vec<_>>(),
         )
@@ -176,7 +159,7 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
     }
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2, 3]);
-    let later_context = lake_table.prepare().await.unwrap();
+    let later_context = lake_table.capture_read_context().await.unwrap();
     assert!(
         later_context
             .log_ranges()
@@ -197,32 +180,17 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         Err(FlussLakeError::InvalidReadContext(_))
     ));
     assert!(matches!(
-        other
-            .new_scan()
-            .new_reader()
-            .read_split(&ids_splits[0])
-            .await,
+        other.new_scan().new_reader().read_split(&ids_splits[0]),
         Err(FlussLakeError::PlanningFailed(_))
     ));
-    // Inject captured retention evidence through public transport to verify
-    // mode-specific planning. This does not simulate server-side truncation.
-    let mut gap = serde_json::to_value(&context).unwrap();
-    gap["log_ranges"][0]["earliest_offset"] = serde_json::json!(1);
-    let gap = FlussLakeReadContext::from_json(&serde_json::to_vec(&gap).unwrap()).unwrap();
     assert!(matches!(
-        ids_scan.plan_with_context(&gap).await,
-        Err(FlussLakeError::DataUnavailable(_))
-    ));
-    assert!(
         lake_table
             .new_scan()
             .with_lake_only(true)
-            .plan_with_context(&gap)
-            .await
-            .unwrap()
-            .splits()
-            .is_empty()
-    );
+            .plan_with_context(&context)
+            .await,
+        Err(FlussLakeError::NotLakeReadable(_))
+    ));
 
     // A reader captures immutable settings. Configuring another clone must not
     // change its filter or projection, even after dropping the plan.
@@ -236,8 +204,7 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
     let local_batches = tokio::time::timeout(
         Duration::from_secs(10),
         local_reader
-            .read_split(&transported_split)
-            .await
+            .read_split(&retained_split)
             .unwrap()
             .try_collect::<Vec<_>>(),
     )
@@ -268,42 +235,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
         })
         .collect::<Vec<_>>();
     assert_eq!(local_names, vec!["before-2"]);
-    // A worker can independently restore the same scan settings.
-    let read = lake_table
-        .new_scan()
-        .with_projection(vec![1])
-        .with_filter(col("id").eq(2_i32))
-        .new_reader();
-    let stream = read
-        .read_split(&transported_split)
-        .await
-        .expect("Failed to execute append-log UnionRead split");
-    let batches = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-        .await
-        .expect("Timed out waiting for bounded UnionRead stream to finish")
-        .expect("Failed to collect bounded UnionRead output");
-
-    assert!(!batches.is_empty());
-    assert!(batches.iter().all(|batch| batch.num_columns() == 1));
-    let names: Vec<String> = batches
-        .iter()
-        .flat_map(|batch| {
-            let names = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Projected name column should be a StringArray");
-            (0..names.len()).map(|row| names.value(row).to_string())
-        })
-        .collect();
-    assert_eq!(names, vec!["before-2"]);
-    assert!(batches.iter().all(|batch| {
-        batch
-            .columns()
-            .iter()
-            .all(|column| !column.as_any().is::<Int32Array>())
-    }));
-
     drop(writer);
     admin
         .drop_table(&table_path, false)
@@ -316,7 +247,7 @@ async fn append_log_plan_uses_frozen_stop_offset_after_transport() {
 }
 
 #[tokio::test]
-async fn stale_schema_split_is_rejected_after_alter_table() {
+async fn frozen_schema_survives_alter_table_after_planning() {
     let cluster = support::get_shared_cluster();
     let connection = Arc::new(cluster.get_fluss_connection().await);
     let admin = connection.get_admin().expect("Failed to get Fluss admin");
@@ -339,6 +270,7 @@ async fn stale_schema_split_is_rejected_after_alter_table() {
         .get_table(&table_path)
         .await
         .expect("Failed to open UnionRead integration test table");
+    let frozen_info = table.get_table_info().clone();
     let writer = table
         .new_append()
         .expect("Failed to create append operation")
@@ -386,37 +318,163 @@ async fn stale_schema_split_is_rejected_after_alter_table() {
         .await
         .expect("Failed to alter UnionRead integration test table");
 
-    assert!(matches!(
-        scan.plan_with_context(plan.read_context()).await,
-        Err(FlussLakeError::SchemaIncompatible(_))
-    ));
-
-    // `read_split` is asynchronous and lazy: schema drift is an environment
-    // failure, so it surfaces as the first item of the returned stream.
-    let read = scan.new_reader();
+    let replanned = scan.plan_with_context(plan.read_context()).await.unwrap();
+    assert_eq!(replanned.schema(), plan.schema());
+    let retained = stale_split.clone();
+    let expected_schema = plan.schema().clone();
     drop(plan);
     drop(scan);
-    let stream = read
-        .read_split(&stale_split)
+    let reopened_table = FlussLakeTable::open(connection.clone(), &table_path)
         .await
-        .expect("Opening a stale-schema split stream must not fail structurally");
-    let result = tokio::time::timeout(Duration::from_secs(10), stream.try_collect::<Vec<_>>())
-        .await
-        .expect("Timed out waiting for the stale-schema split to fail");
-    match result {
-        Err(FlussLakeError::SchemaIncompatible(message)) => {
-            assert!(
-                message.contains("schema id"),
-                "unexpected schema error: {message}"
-            );
-        }
-        Err(other) => panic!("expected a schema-incompatible error, got: {other}"),
-        Ok(_) => panic!("stale-schema split must not execute after alter table"),
-    }
+        .unwrap();
+    let batches = tokio::time::timeout(Duration::from_secs(10), async {
+        reopened_table
+            .new_scan()
+            .new_reader()
+            .read_split(&retained)?
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.schema() == expected_schema)
+    );
 
+    // The schema may also change during capture: old schema, newer stop.
+    let live_table = connection.get_table(&table_path).await.unwrap();
+    let live_writer = live_table.new_append().unwrap().create_writer().unwrap();
+    live_writer
+        .append_arrow_batch(
+            RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int32Array::from(vec![3])) as ArrayRef),
+                ("name", Arc::new(StringArray::from(vec!["c"])) as ArrayRef),
+                ("age", Arc::new(Int32Array::from(vec![30])) as ArrayRef),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    live_writer.flush().await.unwrap();
+    let later = reopened_table.capture_read_context().await.unwrap();
+    let mixed =
+        FlussLakeReadContext::from_boundary(&frozen_info, None, later.log_ranges().to_vec())
+            .unwrap();
+    let reopened_scan = reopened_table.new_scan().with_filter(col("id").eq(3_i32));
+    let mixed_plan = reopened_scan.plan_with_context(&mixed).await.unwrap();
+    let batches: Vec<_> = reopened_scan
+        .new_reader()
+        .read_splits(mixed_plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(batches[0].schema(), expected_schema);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+    assert_eq!(
+        batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "c"
+    );
+    drop(live_writer);
     drop(writer);
     admin
         .drop_table(&table_path, false)
         .await
         .expect("Failed to drop UnionRead integration test table");
+}
+
+#[tokio::test]
+async fn shared_read_metadata_does_not_outlive_the_read_attempt() {
+    let cluster = support::get_shared_cluster();
+    let connection = Arc::new(cluster.get_fluss_connection().await);
+    let admin = connection.get_admin().unwrap();
+    let path = TablePath::new("fluss", "test_union_read_metadata_session");
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .build()
+                .unwrap(),
+        )
+        .distributed_by(Some(2), vec!["id".into()])
+        .build()
+        .unwrap();
+    support::create_table(&admin, &path, &descriptor).await;
+    let lake_table = FlussLakeTable::open(connection.clone(), &path)
+        .await
+        .unwrap();
+    let scan = lake_table.new_scan();
+    let reader = scan.new_reader();
+    let mut previous_splits = None;
+
+    for generation in 0..2 {
+        if generation > 0 {
+            admin.drop_table(&path, false).await.unwrap();
+            support::create_table(&admin, &path, &descriptor).await;
+            // Reusing the reader must still reject tasks for the dropped table.
+            let result = reader
+                .read_splits(previous_splits.as_deref().unwrap())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await;
+            assert!(matches!(result, Err(FlussLakeError::SchemaIncompatible(_))));
+        }
+        let table = connection.get_table(&path).await.unwrap();
+        let writer = table.new_append().unwrap().create_writer().unwrap();
+        let expected: Vec<i32> = (generation * 100..generation * 100 + 16).collect();
+        writer
+            .append_arrow_batch(append_batch(expected.clone(), vec!["value"; 16]))
+            .unwrap();
+        writer.flush().await.unwrap();
+        drop(writer);
+        let plan = scan.plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 2);
+        for concurrency in [1, 2] {
+            let batches = tokio::time::timeout(
+                Duration::from_secs(10),
+                reader
+                    .read_splits_with_concurrency(plan.splits(), concurrency)
+                    .unwrap()
+                    .try_collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut ids: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, expected);
+        }
+        previous_splits = Some(plan.splits().to_vec());
+    }
+    admin.drop_table(&path, false).await.unwrap();
 }

@@ -203,7 +203,18 @@ async fn open_pinned_table(
         PAIMON_SCAN_VERSION_OPTION.to_string(),
         snapshot_id.to_string(),
     );
-    Ok(table.copy_with_options(pinned))
+    let table = table
+        .copy_with_time_travel(pinned)
+        .await
+        .map_err(|error| paimon_error("pin Paimon snapshot schema", error))?;
+    // Paimon's time-travel helper can fall back to the current table when
+    // resolution fails. UnionRead must not execute frozen tasks in that mode.
+    if table.travel_snapshot().map(|snapshot| snapshot.id()) != Some(snapshot_id) {
+        return Err(FlussLakeError::DataUnavailable(format!(
+            "cannot resolve frozen Paimon snapshot {snapshot_id} for {table_path}"
+        )));
+    }
+    Ok(table)
 }
 
 /// Resolves a scan output projection into explicit Paimon field names.
@@ -356,8 +367,9 @@ fn to_paimon_datum(literal: &Literal, data_type: &DataType) -> Option<PaimonDatu
         Literal::Int16(value) => Some(PaimonDatum::SmallInt(*value)),
         Literal::Int32(value) => Some(PaimonDatum::Int(*value)),
         Literal::Int64(value) => Some(PaimonDatum::Long(*value)),
-        Literal::Float32(value) => Some(PaimonDatum::Float(*value)),
-        Literal::Float64(value) => Some(PaimonDatum::Double(*value)),
+        // Paimon uses partial floating comparison; Arrow uses totalOrder. Keep
+        // these predicates residual so NaNs and signed zeros cannot be pruned away.
+        Literal::Float32(_) | Literal::Float64(_) => None,
         Literal::String(value) => Some(PaimonDatum::String(value.clone())),
         Literal::Bytes(value) => Some(PaimonDatum::Bytes(value.clone())),
         Literal::Decimal(value) => {
@@ -1177,6 +1189,63 @@ mod tests {
             to_paimon_predicate(&bound, &fields),
             Some(PaimonPredicate::AlwaysFalse)
         );
+    }
+
+    #[test]
+    fn numeric_pushdown_uses_exact_bounds_and_keeps_floats_residual() {
+        use paimon::spec::{
+            DataField as PaimonField, DataType as PaimonType, DecimalType, DoubleType, IntType,
+        };
+        let row_type = RowType::new(vec![
+            DataField::new("i", DataTypes::int(), None),
+            DataField::new("d", DataTypes::decimal(5, 2), None),
+            DataField::new("f", DataTypes::double(), None),
+        ]);
+        let fields = vec![
+            PaimonField::new(0, "i".into(), PaimonType::Int(IntType::new())),
+            PaimonField::new(
+                1,
+                "d".into(),
+                PaimonType::Decimal(DecimalType::new(5, 2).unwrap()),
+            ),
+            PaimonField::new(2, "f".into(), PaimonType::Double(DoubleType::new())),
+        ];
+        let builder = PredicateBuilder::new(&fields);
+        let convert = |predicate| {
+            to_paimon_predicate(
+                &BoundPredicate::bind(Some(&predicate), &row_type).unwrap(),
+                &fields,
+            )
+        };
+        let decimal = fluss::row::Decimal::from_unscaled_long(1234, 5, 3).unwrap();
+        assert_eq!(
+            convert(col("i").ge(1.3)),
+            Some(builder.greater_than("i", PaimonDatum::Int(1)).unwrap())
+        );
+        assert_eq!(
+            convert(col("i").eq(1.3)),
+            Some(PaimonPredicate::AlwaysFalse)
+        );
+        assert_eq!(
+            convert(col("d").ge(decimal)),
+            Some(
+                builder
+                    .greater_than(
+                        "d",
+                        PaimonDatum::Decimal {
+                            unscaled: 123,
+                            precision: 5,
+                            scale: 2
+                        }
+                    )
+                    .unwrap()
+            )
+        );
+        for value in [1.3, -0.0, f64::INFINITY, f64::NAN] {
+            assert!(convert(col("f").ge(value)).is_none());
+        }
+        assert!(convert(col("i").eq(1).or(col("f").ge(1.3))).is_none());
+        assert!(convert(col("f").is_not_null()).is_some());
     }
 
     #[test]

@@ -19,7 +19,7 @@
 
 use crate::error::{error_message, execution_client_error};
 use crate::split_descriptor::SplitDescriptor;
-use crate::table::{BoundScan, physical_primary_key_indexes, validate_pk_union_merge_engine};
+use crate::table::{BoundScan, validate_pk_union_merge_engine};
 use crate::{FlussLakeError, FlussLakeReadSplit, FlussLakeScan, RecordBatchStream, Result};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
@@ -32,6 +32,7 @@ use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 /// Poll interval used while folding a bounded changelog tail.
 ///
@@ -43,9 +44,10 @@ const TAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 pub(crate) fn execute_split(
     split: &FlussLakeReadSplit,
     scan: &Arc<FlussLakeScan>,
+    metadata: Arc<OnceCell<TableInfo>>,
 ) -> Result<RecordBatchStream> {
-    // Validation borrows the payload; ownership is needed only for the lazy stream.
-    let descriptor = split.validated_execution_descriptor()?.clone();
+    // Cloned tasks share frozen metadata; no wire descriptor needs decoding.
+    let descriptor = split.execution_descriptor().clone();
     if descriptor.table_path() != scan.table_path() {
         return Err(FlussLakeError::PlanningFailed(
             "split and reader refer to different tables".to_string(),
@@ -58,6 +60,7 @@ pub(crate) fn execute_split(
         descriptor,
         split.partition.clone(),
         scan.clone(),
+        metadata,
     )))
 }
 
@@ -65,15 +68,23 @@ async fn open_logical_stream(
     descriptor: SplitDescriptor,
     partition: crate::FlussLakePartitionIdentity,
     scan: Arc<FlussLakeScan>,
+    metadata: Arc<OnceCell<TableInfo>>,
 ) -> Result<RecordBatchStream> {
-    let table = scan
-        .connection()
-        .get_table(descriptor.table_path())
-        .await
-        .map_err(|error| execution_client_error("open Fluss table", error))?;
+    // Share the live identity check within one read attempt, not across queries.
+    // Task metadata remains fixed even if the live schema has changed.
+    let live = metadata
+        .get_or_try_init(|| async {
+            scan.connection()
+                .get_table(scan.table_path())
+                .await
+                .map(|table| table.get_table_info().clone())
+                .map_err(|error| execution_client_error("open Fluss table", error))
+        })
+        .await?;
+    descriptor.validate_live_table(live)?;
+    let frozen = descriptor.table_info().clone();
+    let table = FlussTable::new(scan.connection(), scan.connection().get_metadata(), frozen);
     let table_info = table.get_table_info();
-    crate::table::validate_lake_readable(table_info)?;
-    validate_frozen_identity(table_info, &descriptor, &partition)?;
     if descriptor.is_primary_key() && !scan.lake_only() {
         validate_pk_union_merge_engine(table_info)?;
     }
@@ -142,8 +153,10 @@ async fn open_logical_stream(
         fold_logical_changelog_tail(&table, &descriptor, &physical, &mut current_view).await?;
         reconciled_stream(current_view, lake_stream, batch_size.unwrap_or(4096))
     } else {
+        let log_filter = filter.to_pushdown_predicate();
         let log_stream = normalize_stream_schema(
-            open_logical_append_log_stream(&table, &descriptor, &physical, scan.filter()).await?,
+            open_logical_append_log_stream(&table, &descriptor, &physical, log_filter.as_ref())
+                .await?,
             physical_schema,
         );
         Box::pin(lake_stream.chain(log_stream))
@@ -436,47 +449,6 @@ fn take_rows(batch: &RecordBatch, row_indexes: &[usize]) -> Result<RecordBatch> 
     })
 }
 
-/// Rejects a split whose frozen identity no longer matches the live table.
-///
-/// The schema is frozen at plan time, so executing against a drifted schema
-/// would silently reinterpret data.
-fn validate_frozen_identity(
-    table_info: &TableInfo,
-    descriptor: &SplitDescriptor,
-    partition: &crate::FlussLakePartitionIdentity,
-) -> Result<()> {
-    let table_path = descriptor.table_path();
-    if table_info.table_path != *table_path
-        || table_info.table_id != descriptor.table_bucket().table_id()
-    {
-        return Err(FlussLakeError::SchemaIncompatible(format!(
-            "split table id {} no longer matches resolved table id {} for {table_path}",
-            descriptor.table_bucket().table_id(),
-            table_info.table_id
-        )));
-    }
-    if table_info.schema_id != descriptor.schema_id() {
-        return Err(FlussLakeError::SchemaIncompatible(format!(
-            "split schema id {} no longer matches current schema id {} for {table_path}; execution against a historical schema is not implemented",
-            descriptor.schema_id(),
-            table_info.schema_id
-        )));
-    }
-    if !partition.matches_keys(&table_info.partition_keys)
-        || (table_info.partition_keys.is_empty()
-            && !descriptor.is_append_lake()
-            && descriptor.table_bucket().bucket_id() >= table_info.num_buckets)
-        || descriptor.is_partitioned() == table_info.partition_keys.is_empty()
-        || descriptor.is_primary_key() != table_info.has_primary_key()
-        || descriptor.primary_key_indexes() != physical_primary_key_indexes(table_info)?
-    {
-        return Err(FlussLakeError::SchemaIncompatible(
-            "split partition, bucket or primary-key layout no longer matches table".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Defers an asynchronous stream setup until the stream's first poll.
 ///
 /// Setup failures surface as the first (and only) stream item instead of
@@ -638,11 +610,19 @@ fn apply_filter_and_projection(
     if matches!(filter, BoundPredicate::AlwaysTrue) && output_column_count.is_none() {
         return stream;
     }
-    let filter = Arc::new(filter.clone());
+    let needs_filter = !matches!(filter, BoundPredicate::AlwaysTrue);
+    let filter = match filter.clone().into_evaluator() {
+        Ok(evaluator) => Arc::new(evaluator),
+        Err(error) => {
+            return Box::pin(futures::stream::once(async {
+                Err(predicate_evaluation_error(error))
+            }));
+        }
+    };
     Box::pin(stream.try_filter_map(move |batch| {
         let filter = Arc::clone(&filter);
         async move {
-            let filtered = if matches!(filter.as_ref(), BoundPredicate::AlwaysTrue) {
+            let filtered = if !needs_filter {
                 batch
             } else {
                 let mask = filter
@@ -723,130 +703,10 @@ fn predicate_evaluation_error(error: ClientError) -> FlussLakeError {
 mod tests {
     use super::*;
     use arrow::array::{ArrayRef, Int32Array};
-    use fluss::metadata::{DataField, DataTypes, Schema, TableBucket, TablePath};
+    use fluss::metadata::{DataField, DataTypes};
     use fluss::predicate::{Predicate, col};
     use futures::{StreamExt, stream};
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn table_info(partitioned: bool) -> TableInfo {
-        let schema = Schema::builder()
-            .column("id", DataTypes::int())
-            .column("region", DataTypes::string())
-            .primary_key(["id", "region"])
-            .unwrap()
-            .build()
-            .unwrap();
-        TableInfo::new(
-            TablePath::new("fluss", "orders"),
-            7,
-            1,
-            schema,
-            vec!["id".into()],
-            if partitioned {
-                vec!["region".into()]
-            } else {
-                vec![]
-            }
-            .into(),
-            4,
-            HashMap::new(),
-            HashMap::new(),
-            None,
-            0,
-            0,
-        )
-    }
-
-    #[test]
-    fn worker_checks_frozen_table_schema_and_primary_key_indexes() {
-        let info = table_info(false);
-        let descriptor = |keys| {
-            SplitDescriptor::try_new(
-                info.table_path.clone(),
-                1,
-                false,
-                TableBucket::new(7, 0),
-                0,
-                10,
-                None,
-                vec![],
-                keys,
-            )
-            .unwrap()
-        };
-        let partition = crate::FlussLakePartitionIdentity::Unpartitioned;
-        let valid = descriptor(vec![0, 1]);
-        validate_frozen_identity(&info, &valid, &partition).unwrap();
-        for keys in [vec![], vec![0], vec![1, 0]] {
-            assert!(matches!(
-                validate_frozen_identity(&info, &descriptor(keys), &partition),
-                Err(FlussLakeError::SchemaIncompatible(_))
-            ));
-        }
-        let mut wrong_table = info.clone();
-        wrong_table.table_id += 1;
-        let mut wrong_schema = info.clone();
-        wrong_schema.schema_id += 1;
-        let mut wrong_path = info.clone();
-        wrong_path.table_path = TablePath::new("fluss", "other");
-        for incompatible in [wrong_table, wrong_schema, wrong_path] {
-            assert!(matches!(
-                validate_frozen_identity(&incompatible, &valid, &partition),
-                Err(FlussLakeError::SchemaIncompatible(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn worker_checks_partition_layout_without_applying_new_bucket_default() {
-        let info = table_info(true);
-        let partition =
-            crate::FlussLakePartitionIdentity::KeyValues(vec![("region".into(), "old".into())]);
-        // An old partition can have bucket 7 even though the new default is 4.
-        let descriptor = SplitDescriptor::try_new(
-            info.table_path.clone(),
-            1,
-            true,
-            TableBucket::new_with_partition(7, Some(9), 7),
-            0,
-            10,
-            None,
-            vec![],
-            vec![0],
-        )
-        .unwrap();
-        validate_frozen_identity(&info, &descriptor, &partition).unwrap();
-        for invalid in [
-            crate::FlussLakePartitionIdentity::Unpartitioned,
-            crate::FlussLakePartitionIdentity::KeyValues(vec![("unknown".into(), "old".into())]),
-        ] {
-            assert!(matches!(
-                validate_frozen_identity(&info, &descriptor, &invalid),
-                Err(FlussLakeError::SchemaIncompatible(_))
-            ));
-        }
-        let unpartitioned = table_info(false);
-        let out_of_range = SplitDescriptor::try_new(
-            info.table_path.clone(),
-            1,
-            false,
-            TableBucket::new(7, 4),
-            0,
-            10,
-            None,
-            vec![],
-            vec![0, 1],
-        )
-        .unwrap();
-        assert!(matches!(
-            validate_frozen_identity(
-                &unpartitioned,
-                &out_of_range,
-                &crate::FlussLakePartitionIdentity::Unpartitioned,
-            ),
-            Err(FlussLakeError::SchemaIncompatible(_))
-        ));
-    }
 
     fn bound(predicate: Predicate) -> BoundPredicate {
         BoundPredicate::bind(Some(&predicate), &pk_row_type()).unwrap()
@@ -968,6 +828,17 @@ mod tests {
                 "id > {threshold}"
             );
         }
+    }
+
+    #[test]
+    fn long_membership_filter_handles_multiple_batches() {
+        let input = vec![id_batch(vec![1, 128, 256]), id_batch(vec![2, 64, 300])];
+        let source: RecordBatchStream = Box::pin(stream::iter(input.into_iter().map(Ok)));
+        let filtered = apply_filter_and_projection(source, &bound(col("id").is_in(0..128)), None);
+        assert_eq!(
+            collect_batches(filtered).unwrap(),
+            vec![id_batch(vec![1]), id_batch(vec![2, 64])]
+        );
     }
 
     #[test]

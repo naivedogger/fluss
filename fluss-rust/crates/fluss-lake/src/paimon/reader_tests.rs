@@ -20,7 +20,7 @@ use crate::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource
 use fluss::metadata::{DataTypes, Schema};
 use futures::TryStreamExt;
 use paimon::catalog::Catalog;
-use paimon::spec::{DataType as PaimonType, IntType};
+use paimon::spec::{DataType as PaimonType, IntType, SchemaChange};
 use std::sync::Arc;
 
 struct Warehouse(std::path::PathBuf);
@@ -238,6 +238,24 @@ async fn mapped_physical_table_wins_over_an_unrelated_same_named_table() {
         ids(&read(&source, &info, snapshot, false).await.unwrap()),
         vec![11, 12]
     );
+
+    catalog
+        .alter_table(
+            &Identifier::new("physical", "baseline"),
+            vec![SchemaChange::rename_column("id".into(), "renamed".into())],
+            false,
+        )
+        .await
+        .unwrap();
+    // A later schema must not change how the frozen baseline is projected.
+    assert_eq!(
+        ids(&read(&source, &info, snapshot, false).await.unwrap()),
+        vec![11, 12]
+    );
+    assert!(matches!(
+        read(&source, &info, snapshot + 1, false).await,
+        Err(FlussLakeError::DataUnavailable(_))
+    ));
 }
 
 #[tokio::test]

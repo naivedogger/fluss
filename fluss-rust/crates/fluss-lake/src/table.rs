@@ -23,7 +23,7 @@ use crate::{
     FlussLakeError, FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReader, LakeSource, Result,
 };
 use fluss::client::FlussConnection;
-use fluss::metadata::{RowType, TableInfo, TablePath};
+use fluss::metadata::{PartitionSpec, RowType, TableInfo, TablePath};
 use fluss::predicate::{BoundPredicate, Predicate};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -42,7 +42,7 @@ pub(crate) struct BoundScan {
     pub(crate) filter: BoundPredicate,
 }
 
-/// Entry point for bounded reads over a lake-enabled Fluss table.
+/// Entry point for bounded reads over a Fluss table.
 #[derive(Clone)]
 pub struct FlussLakeTable {
     connection: Arc<FlussConnection>,
@@ -51,7 +51,7 @@ pub struct FlussLakeTable {
 }
 
 impl FlussLakeTable {
-    /// Opens a table and validates that it is configured for lake reads.
+    /// Opens a table for bounded Fluss-only or lake and log reads.
     pub async fn open(connection: Arc<FlussConnection>, table_path: &TablePath) -> Result<Self> {
         Self::open_with_properties(connection, table_path, HashMap::new()).await
     }
@@ -72,7 +72,7 @@ impl FlussLakeTable {
             .get_table_info(table_path)
             .await
             .map_err(|error| planning_client_error("get table metadata", error))?;
-        validate_lake_readable(&table_info)?;
+        validate_readable_table(&table_info)?;
         Ok(Self {
             connection,
             table_path: table_path.clone(),
@@ -85,7 +85,7 @@ impl FlussLakeTable {
         connection: Arc<FlussConnection>,
         table_info: &TableInfo,
     ) -> Result<Self> {
-        validate_lake_readable(table_info)?;
+        validate_readable_table(table_info)?;
         Ok(Self {
             connection,
             table_path: table_info.table_path.clone(),
@@ -112,8 +112,30 @@ impl FlussLakeTable {
     /// The result may be shared by scans with different projections and
     /// predicates, including separate references to the table in one query.
     /// This requires no `paimon` feature and does not acquire a retention lease.
-    pub async fn prepare(&self) -> Result<FlussLakeReadContext> {
-        self.new_scan().prepare().await
+    pub async fn capture_read_context(&self) -> Result<FlussLakeReadContext> {
+        self.capture_read_context_with_partition_scope(&PartitionSpec::new(
+            HashMap::<String, String>::new(),
+        ))
+        .await
+    }
+
+    /// Captures boundaries within an exact, possibly partial partition spec.
+    /// The scope constrains both lake and log planning, including lake-only partitions.
+    /// It is an input restriction, not an optional pruning hint.
+    pub async fn capture_read_context_with_partition_scope(
+        &self,
+        scope: &PartitionSpec,
+    ) -> Result<FlussLakeReadContext> {
+        let admin = self
+            .connection
+            .get_admin()
+            .map_err(|e| planning_client_error("create Fluss admin client", e))?;
+        let info = admin
+            .get_table_info(&self.table_path)
+            .await
+            .map_err(|e| planning_client_error("get table metadata", e))?;
+        validate_readable_table(&info)?;
+        crate::boundary::freeze_read_context(&admin, &info, scope).await
     }
 }
 
@@ -132,8 +154,8 @@ impl Debug for FlussLakeTable {
 
 /// Immutable configuration for one bounded UnionRead.
 ///
-/// Planning freezes source inputs into tasks. Both local readers and distributed
-/// workers must use the same scan configuration that produced those tasks.
+/// Planning freezes source inputs into local tasks. Readers must use the same
+/// scan configuration that produced those tasks.
 #[derive(Clone)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
@@ -161,6 +183,8 @@ impl FlussLakeScan {
     }
 
     /// Adds an exact filter. Repeated calls are combined with `AND`.
+    /// Unsupported predicates fail during schema binding; they are not silently
+    /// downgraded to pruning hints. PK filters run after reconciliation.
     pub fn with_filter(mut self, filter: Predicate) -> Self {
         self.filter = Some(match self.filter.take() {
             Some(existing) => existing.and(filter),
@@ -176,21 +200,17 @@ impl FlussLakeScan {
     }
 
     /// Enables or disables lake-only execution.
+    /// Requires a lake-enabled table; before its first snapshot the result is empty.
     pub fn with_lake_only(mut self, lake_only: bool) -> Self {
         self.lake_only = lake_only;
         self
     }
 
-    /// Captures source boundaries for an engine-native or default execution.
-    ///
-    /// Projection and filter are validated but do not prune this table-wide
-    /// context. They are applied by `plan_with_context` or by the host engine.
-    /// No lake catalog or file reader is opened by this method.
-    pub async fn prepare(&self) -> Result<FlussLakeReadContext> {
-        Ok(self.prepare_bound().await?.1)
-    }
-
     /// Prepares source boundaries and builds the complete default read plan.
+    ///
+    /// Safe string partition equalities restrict offset capture before lake planning.
+    /// Other predicates still participate in planning and exact result filtering.
+    /// Use `FlussLakeTable::capture_read_context` for a table-wide boundary shared by scans.
     ///
     /// Create the reader using this scan's `new_reader()`. Lake planning and reading
     /// use the injected source or the feature-selected default implementation.
@@ -200,16 +220,11 @@ impl FlussLakeScan {
 
     /// Creates a reader without planning or refreshing read boundaries.
     ///
-    /// The caller must use the planner's projection, filter, read mode and batch
-    /// size, plus a compatible lake backend and runtime catalog mapping. Workers
-    /// restore these settings using the engine's own transport. They are not
-    /// carried in splits or checked against a plan. Mismatches are caller errors
-    /// and can produce incomplete results or the wrong schema.
-    ///
-    /// Splits must come from a trusted coordinator. Version, table/schema,
-    /// layout and payload checks still apply, but do not authenticate a task.
-    /// Credentials stay local. Configuration and metadata validation is
-    /// deferred until reading; constructing this reader performs no I/O.
+    /// Use the same projection, filter, read mode and batch size that produced
+    /// the tasks, with a compatible lake backend. Task metadata does not encode
+    /// these settings; mismatches can produce incomplete results or the wrong
+    /// output schema. A task can outlive its plan without changing its bounds.
+    /// This constructor performs no I/O; initialization is lazy when reading.
     pub fn new_reader(&self) -> FlussLakeReader {
         FlussLakeReader::from_scan(self.clone())
     }
@@ -217,9 +232,10 @@ impl FlussLakeScan {
     /// Builds a default plan without choosing new snapshots or log offsets.
     ///
     /// The context must refer to this table. Metadata drift is rejected.
-    /// Different scans may share a context without sharing predicates or
-    /// projection. Engines implementing their own UnionRead can instead
-    /// consume the public context directly and skip this default planner.
+    /// Different scans may share a context within its captured partition scope
+    /// without sharing predicates or projection. The supplied context is never
+    /// narrowed or recaptured from this scan's filter. Engines implementing their
+    /// own UnionRead can consume the public context and skip this default planner.
     pub async fn plan_with_context(
         &self,
         context: &FlussLakeReadContext,
@@ -275,9 +291,15 @@ impl FlussLakeScan {
             .get_table_info(&self.table_path)
             .await
             .map_err(|error| planning_client_error("get table metadata", error))?;
-        validate_lake_readable(&table_info)?;
+        validate_readable_table(&table_info)?;
         let bound = self.bind(table_info.row_type())?;
-        let context = crate::boundary::freeze_read_context(&admin, &table_info).await?;
+        let scope = crate::pruning::PartitionPruner::new(
+            table_info.row_type(),
+            &table_info.partition_keys,
+            &bound.filter,
+        )
+        .partition_scope();
+        let context = crate::boundary::freeze_read_context(&admin, &table_info, &scope).await?;
         Ok((table_info, context, bound))
     }
 
@@ -398,15 +420,10 @@ pub(crate) fn resolve_lake_table_path(table_info: &TableInfo) -> Result<TablePat
     Ok(TablePath::new(database, table))
 }
 
-pub(crate) fn validate_lake_readable(table_info: &TableInfo) -> Result<()> {
+pub(crate) fn validate_readable_table(table_info: &TableInfo) -> Result<()> {
     match table_info.table_config.is_datalake_enabled() {
         Ok(true) => {}
-        Ok(false) => {
-            return Err(FlussLakeError::NotLakeReadable(format!(
-                "table {} does not enable table.datalake.enabled",
-                table_info.table_path
-            )));
-        }
+        Ok(false) => return Ok(()),
         Err(error) => {
             return Err(FlussLakeError::NotLakeReadable(format!(
                 "table {} has an invalid lake configuration: {error}",
@@ -459,37 +476,4 @@ pub(crate) fn physical_primary_key_indexes(table_info: &TableInfo) -> Result<Vec
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fluss::metadata::{DataTypes, Schema};
-
-    #[test]
-    fn preconfigured_lake_format_is_not_readable_until_enabled() {
-        let schema = Schema::builder()
-            .column("id", DataTypes::int())
-            .build()
-            .unwrap();
-        let table_info = TableInfo::new(
-            TablePath::new("fluss", "orders"),
-            7,
-            1,
-            schema,
-            Vec::new(),
-            Vec::<String>::new().into(),
-            1,
-            HashMap::from([("table.datalake.format".to_string(), "paimon".to_string())]),
-            HashMap::new(),
-            None,
-            0,
-            0,
-        );
-
-        assert!(matches!(
-            validate_lake_readable(&table_info),
-            Err(FlussLakeError::NotLakeReadable(_))
-        ));
-    }
 }

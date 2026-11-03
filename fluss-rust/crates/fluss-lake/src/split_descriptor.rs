@@ -16,34 +16,45 @@
 // under the License.
 
 use crate::{FlussLakeError, Result};
+use fluss::metadata::TableInfo;
 use fluss::metadata::{TableBucket, TablePath};
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Frozen execution state for one logical `(partition, bucket)` split.
 ///
 /// Projection, filtering and read mode belong to the immutable reader configuration.
 /// Lake task payloads are encoded and interpreted only by their LakeSource.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct SplitDescriptor {
-    table_path: TablePath,
-    schema_id: i32,
-    partitioned: bool,
+    table_info: Arc<TableInfo>,
+    snapshot_id: Option<i64>,
     table_bucket: TableBucket,
     start_offset: i64,
     stop_offset: i64,
-    snapshot_id: Option<i64>,
     lake_splits: Vec<crate::LakeSplit>,
     primary_key_indexes: Vec<usize>,
+}
+
+impl std::fmt::Debug for SplitDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // TableInfo may contain runtime credentials; do not print its properties.
+        f.debug_struct("SplitDescriptor")
+            .field("table_path", self.table_path())
+            .field("schema_id", &self.schema_id())
+            .field("table_bucket", &self.table_bucket)
+            .field("snapshot_id", &self.snapshot_id)
+            .field("start_offset", &self.start_offset)
+            .field("stop_offset", &self.stop_offset)
+            .field("lake_split_count", &self.lake_splits.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SplitDescriptor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
-        table_path: TablePath,
-        schema_id: i32,
-        partitioned: bool,
+        table_info: Arc<TableInfo>,
         table_bucket: TableBucket,
         start_offset: i64,
         stop_offset: i64,
@@ -52,13 +63,11 @@ impl SplitDescriptor {
         primary_key_indexes: Vec<usize>,
     ) -> Result<Self> {
         let descriptor = Self {
-            table_path,
-            schema_id,
-            partitioned,
+            table_info,
+            snapshot_id,
             table_bucket,
             start_offset,
             stop_offset,
-            snapshot_id,
             lake_splits,
             primary_key_indexes,
         };
@@ -66,36 +75,57 @@ impl SplitDescriptor {
         Ok(descriptor)
     }
 
+    pub(crate) fn table_info(&self) -> &TableInfo {
+        &self.table_info
+    }
+
+    pub(crate) fn validate_live_table(&self, live: &TableInfo) -> Result<()> {
+        let frozen = &self.table_info;
+        let lake_changed = frozen
+            .table_config
+            .is_datalake_enabled()
+            .map_err(|e| invalid_descriptor(e.to_string()))?
+            && (!live
+                .table_config
+                .is_datalake_enabled()
+                .map_err(|e| invalid_descriptor(e.to_string()))?
+                || crate::table::resolve_lake_table_path(frozen)?
+                    != crate::table::resolve_lake_table_path(live)?
+                || frozen
+                    .table_config
+                    .get_datalake_format()
+                    .map_err(|e| invalid_descriptor(e.to_string()))?
+                    != live
+                        .table_config
+                        .get_datalake_format()
+                        .map_err(|e| invalid_descriptor(e.to_string()))?);
+        if live.table_id != frozen.table_id || live.table_path != frozen.table_path || lake_changed
+        {
+            return Err(FlussLakeError::SchemaIncompatible(
+                "source identity or lake mapping changed after planning".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         let Self {
-            table_path,
-            schema_id,
-            partitioned,
+            table_info,
+            snapshot_id,
             table_bucket,
             start_offset,
             stop_offset,
-            snapshot_id,
             lake_splits,
             primary_key_indexes,
         } = self;
-        if table_path.database().is_empty() || table_path.table().is_empty() {
+        let partitioned = !table_info.partition_keys.is_empty();
+        if table_info.table_id != table_bucket.table_id() {
             return Err(invalid_descriptor(
-                "database and table names must not be empty",
+                "frozen source does not match task table",
             ));
         }
-        if *schema_id < 0 {
-            return Err(invalid_descriptor(format!(
-                "schema id must be non-negative, got {schema_id}"
-            )));
-        }
-        if table_bucket.table_id() < 0 {
-            return Err(invalid_descriptor(format!(
-                "table id must be non-negative, got {}",
-                table_bucket.table_id()
-            )));
-        }
         if let Some(partition_id) = table_bucket.partition_id() {
-            if !*partitioned {
+            if !partitioned {
                 return Err(invalid_descriptor(
                     "an unpartitioned split must not carry a live partition id",
                 ));
@@ -119,17 +149,10 @@ impl SplitDescriptor {
                 "logical changelog range is invalid: [{start_offset}, {stop_offset})"
             )));
         }
-        if *partitioned && table_bucket.partition_id().is_none() && start_offset != stop_offset {
+        if partitioned && table_bucket.partition_id().is_none() && start_offset != stop_offset {
             return Err(invalid_descriptor(
                 "a partition that no longer exists in Fluss cannot carry a log range",
             ));
-        }
-        if let Some(snapshot_id) = snapshot_id
-            && *snapshot_id < 0
-        {
-            return Err(invalid_descriptor(format!(
-                "lake snapshot id must be non-negative, got {snapshot_id}"
-            )));
         }
         if !lake_splits.is_empty() && snapshot_id.is_none() {
             return Err(invalid_descriptor(
@@ -167,15 +190,15 @@ impl SplitDescriptor {
     }
 
     pub(crate) fn table_path(&self) -> &TablePath {
-        &self.table_path
+        &self.table_info.table_path
     }
 
     pub(crate) fn schema_id(&self) -> i32 {
-        self.schema_id
+        self.table_info.schema_id
     }
 
     pub(crate) fn is_partitioned(&self) -> bool {
-        self.partitioned
+        !self.table_info.partition_keys.is_empty()
     }
 
     pub(crate) fn table_bucket(&self) -> &TableBucket {
@@ -215,19 +238,6 @@ impl SplitDescriptor {
             && self.lake_splits.len() == 1
             && self.start_offset == self.stop_offset
     }
-
-    #[cfg(test)]
-    fn encode(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|e| invalid_descriptor(e.to_string()))
-    }
-
-    #[cfg(test)]
-    fn decode(encoded: &[u8]) -> Result<Self> {
-        let value: Self =
-            serde_json::from_slice(encoded).map_err(|e| invalid_descriptor(e.to_string()))?;
-        value.validate()?;
-        Ok(value)
-    }
 }
 
 fn invalid_descriptor(message: impl Into<String>) -> FlussLakeError {
@@ -235,79 +245,83 @@ fn invalid_descriptor(message: impl Into<String>) -> FlussLakeError {
 }
 
 #[cfg(test)]
+pub(crate) fn testing_table(
+    path: TablePath,
+    schema_id: i32,
+    partitioned: bool,
+    table_id: i64,
+) -> TableInfo {
+    use fluss::metadata::{DataTypes, Schema};
+    use std::collections::HashMap;
+    let schema = Schema::builder()
+        .column("id", DataTypes::int())
+        .column("region", DataTypes::string())
+        .build()
+        .unwrap();
+    TableInfo::new(
+        path,
+        table_id,
+        schema_id,
+        schema,
+        vec![],
+        if partitioned {
+            vec!["region".into()]
+        } else {
+            vec![]
+        }
+        .into(),
+        4,
+        HashMap::from([
+            ("table.datalake.enabled".into(), "true".into()),
+            ("table.datalake.format".into(), "paimon".into()),
+        ]),
+        HashMap::new(),
+        None,
+        0,
+        0,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn descriptor() -> SplitDescriptor {
-        SplitDescriptor::try_new(
-            TablePath::new("fluss", "orders"),
-            3,
-            false,
+    #[test]
+    fn frozen_metadata_allows_schema_evolution_but_rejects_recreated_sources() {
+        let mut info = testing_table(TablePath::new("fluss", "orders"), 1, false, 7);
+        info.properties
+            .insert("private-key".into(), "SECRET".into());
+        let task = SplitDescriptor::try_new(
+            Arc::new(info.clone()),
             TableBucket::new(7, 0),
-            12,
-            20,
-            Some(42),
-            vec![crate::source::testing_split()],
-            vec![0],
+            0,
+            10,
+            None,
+            vec![],
+            vec![],
         )
-        .unwrap()
-    }
-
-    #[test]
-    fn descriptor_round_trip_and_rejects_corrupt_transport() {
-        let value = descriptor();
-        let encoded = value.encode().unwrap();
-        assert_eq!(SplitDescriptor::decode(&encoded).unwrap(), value);
-        assert!(SplitDescriptor::decode(&encoded[..encoded.len() - 1]).is_err());
-        let mut trailing = encoded.clone();
-        trailing.push(b'x');
-        assert!(SplitDescriptor::decode(&trailing).is_err());
-        assert!(SplitDescriptor::decode(b"URD1").is_err());
-    }
-
-    #[test]
-    fn descriptor_revalidates_identity_ranges_payloads_and_keys() {
-        for (field, invalid) in [
-            ("schema_id", json!(-1)),
-            ("start_offset", json!(21)),
-            ("stop_offset", json!(-1)),
-            ("snapshot_id", json!(null)),
-            ("primary_key_indexes", json!([0, 0])),
-            ("unknown", json!(true)),
-            ("lake_splits", json!([{}])),
-        ] {
-            let mut value = serde_json::to_value(descriptor()).unwrap();
-            value[field] = invalid;
-            assert!(
-                SplitDescriptor::decode(&serde_json::to_vec(&value).unwrap()).is_err(),
-                "{field}"
-            );
-        }
-        for (field, invalid) in [
-            ("bucket_id", json!(1)),
-            ("bucket_count", json!(0)),
-            ("bucket_count", json!(-1)),
-            ("snapshot_id", json!(43)),
-            ("payload", json!([])),
-            ("payload_version", json!(0)),
-        ] {
-            let mut value = serde_json::to_value(descriptor()).unwrap();
-            value["lake_splits"][0][field] = invalid;
-            assert!(
-                SplitDescriptor::decode(&serde_json::to_vec(&value).unwrap()).is_err(),
-                "{field}"
-            );
-        }
+        .unwrap();
+        assert!(!format!("{task:?}").contains("SECRET"));
+        info.schema_id += 1;
+        task.validate_live_table(&info).unwrap();
+        assert_eq!(task.table_info().schema_id, 1);
+        info.table_id += 1;
+        assert!(matches!(
+            task.validate_live_table(&info),
+            Err(FlussLakeError::SchemaIncompatible(_))
+        ));
+        info.table_id -= 1;
+        info.properties
+            .insert("table.datalake.table-name".into(), "other".into());
+        assert!(task.validate_live_table(&info).is_err());
     }
 
     #[test]
     fn expired_partition_cannot_carry_a_tail() {
+        let info = Arc::new(testing_table(TablePath::new("fluss", "orders"), 1, true, 7));
         assert!(
             SplitDescriptor::try_new(
-                TablePath::new("fluss", "orders"),
-                1,
-                true,
+                info.clone(),
                 TableBucket::new(7, 0),
                 1,
                 2,
@@ -319,9 +333,7 @@ mod tests {
         );
         assert!(
             SplitDescriptor::try_new(
-                TablePath::new("fluss", "orders"),
-                1,
-                true,
+                info,
                 TableBucket::new(7, 0),
                 0,
                 0,
@@ -334,29 +346,39 @@ mod tests {
     }
 
     #[test]
-    fn bucket_unaware_append_task_never_becomes_a_log_or_pk_task() {
-        let mut value = serde_json::to_value(descriptor()).unwrap();
-        value["primary_key_indexes"] = json!([]);
-        value["start_offset"] = json!(0);
-        value["stop_offset"] = json!(0);
-        value["table_bucket"]["bucket"] = json!(-1);
-        value["lake_splits"][0]["bucket_id"] = json!(-1);
-        value["lake_splits"][0]["bucket_count"] = json!(-1);
-        let decoded = SplitDescriptor::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(decoded.is_append_lake());
-        for (key, invalid) in [
-            ("stop_offset", json!(1)),
-            ("primary_key_indexes", json!([0])),
-            ("lake_splits", json!([])),
-        ] {
-            let mut invalid_value = value.clone();
-            invalid_value[key] = invalid;
-            assert!(SplitDescriptor::decode(&serde_json::to_vec(&invalid_value).unwrap()).is_err());
-        }
-        for count in [0, 4] {
-            let mut invalid = value.clone();
-            invalid["lake_splits"][0]["bucket_count"] = json!(count);
-            assert!(SplitDescriptor::decode(&serde_json::to_vec(&invalid).unwrap()).is_err());
-        }
+    fn bucket_unaware_append_task_cannot_carry_a_log_tail() {
+        let info = Arc::new(testing_table(
+            TablePath::new("fluss", "orders"),
+            1,
+            false,
+            7,
+        ));
+        let mut task = crate::source::testing_split();
+        task.bucket_id = -1;
+        task.bucket_count = -1;
+        assert!(
+            SplitDescriptor::try_new(
+                info.clone(),
+                TableBucket::new(7, -1),
+                0,
+                0,
+                Some(42),
+                vec![task.clone()],
+                vec![]
+            )
+            .is_ok()
+        );
+        assert!(
+            SplitDescriptor::try_new(
+                info,
+                TableBucket::new(7, -1),
+                0,
+                1,
+                Some(42),
+                vec![task],
+                vec![]
+            )
+            .is_err()
+        );
     }
 }

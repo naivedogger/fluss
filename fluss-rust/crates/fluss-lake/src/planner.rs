@@ -26,11 +26,11 @@ use crate::table::{
     BoundScan, FlussLakeScan, physical_primary_key_indexes, validate_pk_union_merge_engine,
 };
 use crate::{
-    CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeError, FlussLakeLogRange,
-    FlussLakePartitionIdentity, FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReadSplit,
-    LakePlannerContext, LakeReadSemantics, Result,
+    FlussLakeError, FlussLakeLogPartition, FlussLakeLogRange, FlussLakePartitionIdentity,
+    FlussLakeReadContext, FlussLakeReadPlan, FlussLakeReadSplit, LakePlannerContext,
+    LakeReadSemantics, Result,
 };
-use fluss::metadata::{RowType, TableInfo, TablePath};
+use fluss::metadata::{RowType, TableInfo};
 use fluss::predicate::BoundPredicate;
 use fluss::record::to_arrow_schema;
 use std::sync::Arc;
@@ -69,7 +69,7 @@ pub(crate) async fn plan_with_context(
                 planning_client_error("get table metadata", error)
             }
         })?;
-    context.validate_table(&table_info)?;
+    let table_info = context.table_info(&table_info)?;
     let bound = scan.bind(table_info.row_type())?;
     plan_prepared(scan, context, &table_info, bound).await
 }
@@ -80,6 +80,11 @@ async fn plan_prepared(
     table_info: &TableInfo,
     bound: BoundScan,
 ) -> Result<FlussLakeReadPlan> {
+    if scan.lake_only() && context.lake_format().is_none() {
+        return Err(FlussLakeError::NotLakeReadable(
+            "lake-only read requires a lake-enabled table".into(),
+        ));
+    }
     let BoundScan {
         projection: output_projection,
         filter,
@@ -94,14 +99,19 @@ async fn plan_prepared(
         context.partition_keys(),
         &filter,
     );
-    let lake_format = table_info
-        .table_config
-        .get_datalake_format()
+    let lake_format = context
+        .lake_format()
+        .map(str::parse)
+        .transpose()
         .map_err(|error| FlussLakeError::PlanningFailed(format!("invalid lake format: {error}")))?;
     // Partitions retain their own hash modulus after a table-default change.
     // Cache once per distinct layout, rather than re-encoding keys per bucket.
     let mut bucket_pruners = std::collections::HashMap::new();
     let mut bucket_may_match = |bucket_id, bucket_count| {
+        // A Fluss-only context does not carry a lake hash-format contract.
+        if context.lake_format().is_none() {
+            return true;
+        }
         bucket_pruners
             .entry(bucket_count)
             .or_insert_with(|| {
@@ -162,6 +172,8 @@ async fn plan_prepared(
         }
         _ => Vec::new(),
     };
+    tasks.retain(|task| task.partition.matches_filter(context.partition_filter()));
+    let task_table = Arc::new(table_info.clone());
     let mut splits = Vec::new();
     if !is_primary_key && !tasks.is_empty() {
         if let (Some(source), Some(snapshot_id)) = (&lake_source, snapshot_id) {
@@ -171,10 +183,8 @@ async fn plan_prepared(
             .log_ranges()
             .iter()
             .map(|range| {
-                (
-                    range.partition_identity(),
-                    range.table_bucket().partition_id(),
-                )
+                let FlussLakeLogPartition::Ordinary(identity) = range.partition();
+                (identity, range.table_bucket().partition_id())
             })
             .collect();
         // Append baseline tasks need no Fluss bucket ownership. LakeSource applies
@@ -195,7 +205,7 @@ async fn plan_prepared(
                 task.bucket_id,
             );
             splits.push(append_lake_split(
-                table_info,
+                &task_table,
                 &range,
                 snapshot_id,
                 task,
@@ -214,9 +224,10 @@ async fn plan_prepared(
         _ => std::collections::HashMap::new(),
     };
     for bucket_range in context.log_ranges() {
+        let FlussLakeLogPartition::Ordinary(identity) = bucket_range.partition();
         let bucket_id = bucket_range.table_bucket().bucket_id();
         if !bucket_may_match(bucket_id, bucket_range.bucket_count())
-            || !partition_pruner.partition_identity_may_match(bucket_range.partition_identity())
+            || !partition_pruner.partition_identity_may_match(identity)
         {
             continue;
         }
@@ -224,10 +235,10 @@ async fn plan_prepared(
             bucket_range.validate_available()?;
         }
         let planned_lake_bucket = lake_splits
-            .remove(&(bucket_range.partition_identity().clone(), bucket_id))
+            .remove(&(identity.clone(), bucket_id))
             .unwrap_or_default();
         splits.extend(plan_bucket_splits(
-            table_info,
+            &task_table,
             bucket_range,
             snapshot_id,
             planned_lake_bucket,
@@ -268,7 +279,7 @@ async fn plan_prepared(
         let lake_only_range =
             FlussLakeLogRange::lake_only(table_info.table_id, bucket_id, bucket_count, partition);
         splits.extend(plan_bucket_splits(
-            table_info,
+            &task_table,
             &lake_only_range,
             snapshot_id,
             planned_lake_bucket,
@@ -282,7 +293,7 @@ async fn plan_prepared(
 /// Append lake tasks and log tails can be scheduled independently. Primary-key
 /// reads keep the whole baseline and tail together for bucket-local reconciliation.
 fn plan_bucket_splits(
-    table_info: &TableInfo,
+    table_info: &Arc<TableInfo>,
     bucket_range: &FlussLakeLogRange,
     snapshot_id: Option<i64>,
     lake_bucket: PlannedLakeBucket,
@@ -296,8 +307,7 @@ fn plan_bucket_splits(
     if !primary_key_indexes.is_empty() {
         let statistics = split_statistics(bucket_range, include_log_tail, &lake_bucket);
         return Ok(vec![create_logical_split(
-            &table_info.table_path,
-            table_info.schema_id,
+            table_info,
             bucket_range,
             snapshot_id,
             lake_bucket.splits,
@@ -321,8 +331,7 @@ fn plan_bucket_splits(
     }
     if include_log_tail {
         let mut split = create_logical_split(
-            &table_info.table_path,
-            table_info.schema_id,
+            table_info,
             bucket_range,
             snapshot_id,
             Vec::new(),
@@ -336,7 +345,7 @@ fn plan_bucket_splits(
 }
 
 fn append_lake_split(
-    table_info: &TableInfo,
+    table_info: &Arc<TableInfo>,
     range: &FlussLakeLogRange,
     snapshot_id: Option<i64>,
     task: crate::LakeSplit,
@@ -344,8 +353,7 @@ fn append_lake_split(
 ) -> Result<FlussLakeReadSplit> {
     let statistics = SplitStatistics::new(task.estimated_rows, task.estimated_size);
     let mut split = create_logical_split(
-        &table_info.table_path,
-        table_info.schema_id,
+        table_info,
         range,
         snapshot_id,
         vec![task],
@@ -360,21 +368,16 @@ fn append_lake_split(
 /// Creates one opaque logical `(partition, bucket)` split.
 #[allow(clippy::too_many_arguments)]
 fn create_logical_split(
-    table_path: &TablePath,
-    schema_id: i32,
+    table_info: &Arc<TableInfo>,
     bucket_range: &FlussLakeLogRange,
     snapshot_id: Option<i64>,
     lake_splits: Vec<crate::LakeSplit>,
     primary_key_indexes: Vec<usize>,
     statistics: SplitStatistics,
 ) -> Result<FlussLakeReadSplit> {
+    let table_path = &table_info.table_path;
     let descriptor = SplitDescriptor::try_new(
-        table_path.clone(),
-        schema_id,
-        matches!(
-            bucket_range.partition_identity,
-            FlussLakePartitionIdentity::KeyValues(_)
-        ),
+        table_info.clone(),
         bucket_range.table_bucket.clone(),
         bucket_range.start_offset,
         bucket_range.stop_offset,
@@ -382,10 +385,8 @@ fn create_logical_split(
         lake_splits,
         primary_key_indexes,
     )?;
-    let partition = match (
-        &bucket_range.partition_identity,
-        bucket_range.table_bucket.partition_id(),
-    ) {
+    let FlussLakeLogPartition::Ordinary(identity) = bucket_range.partition();
+    let partition = match (identity, bucket_range.table_bucket.partition_id()) {
         (FlussLakePartitionIdentity::Unpartitioned, None) => "root".to_string(),
         (FlussLakePartitionIdentity::KeyValues(_), Some(partition_id)) => partition_id.to_string(),
         (FlussLakePartitionIdentity::KeyValues(key_values), None) => format!(
@@ -406,8 +407,7 @@ fn create_logical_split(
     FlussLakeReadSplit::try_new(
         split_id,
         bucket_range.table_bucket.bucket_id(),
-        bucket_range.partition_identity.clone(),
-        CURRENT_FLUSS_LAKE_SPLIT_VERSION,
+        identity.clone(),
         descriptor,
         statistics,
     )
@@ -449,7 +449,10 @@ fn group_lake_splits(
     let mut grouped = std::collections::HashMap::new();
     let mut bucket_counts: std::collections::HashMap<_, _> = log_ranges
         .iter()
-        .map(|range| (range.partition_identity(), range.bucket_count()))
+        .map(|range| {
+            let FlussLakeLogPartition::Ordinary(identity) = range.partition();
+            (identity, range.bucket_count())
+        })
         .collect();
     if info.partition_keys.is_empty() {
         bucket_counts.insert(
@@ -564,10 +567,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn lake_bucket(range: &FlussLakeLogRange) -> PlannedLakeBucket {
+        let FlussLakeLogPartition::Ordinary(identity) = range.partition();
         let splits = (0..2)
             .map(|index| {
                 let mut task = crate::source::testing_split();
-                task.partition = range.partition_identity.clone();
+                task.partition = identity.clone();
                 task.bucket_id = range.table_bucket.bucket_id();
                 task.bucket_count = range.bucket_count;
                 task.payload = vec![index];
@@ -587,8 +591,9 @@ mod tests {
     fn append_tasks_cover_lake_and_tail_independently() {
         let info = table_info(false, vec![], HashMap::new());
         let range = FlussLakeLogRange {
+            baseline: crate::FlussLakeBaseline::Lake,
             table_bucket: TableBucket::new(info.table_id, 0),
-            partition_identity: crate::FlussLakePartitionIdentity::Unpartitioned,
+            partition: FlussLakeLogPartition::Ordinary(FlussLakePartitionIdentity::Unpartitioned),
             bucket_count: 4,
             start_offset: 6,
             stop_offset: 10,
@@ -597,6 +602,10 @@ mod tests {
         let splits =
             plan_bucket_splits(&info, &range, Some(42), lake_bucket(&range), &[], false).unwrap();
         assert_eq!(splits.len(), 3);
+        assert!(std::ptr::eq(
+            splits[0].execution_descriptor().table_info(),
+            splits[2].execution_descriptor().table_info()
+        ));
         assert_eq!(
             splits
                 .iter()
@@ -606,10 +615,7 @@ mod tests {
             3
         );
         for (index, split) in splits.iter().enumerate() {
-            let restored: FlussLakeReadSplit =
-                serde_json::from_slice(&serde_json::to_vec(split).unwrap()).unwrap();
-            assert_eq!(&restored, split);
-            let descriptor = restored.validated_execution_descriptor().unwrap();
+            let descriptor = split.execution_descriptor();
             assert_eq!(descriptor.table_bucket(), range.table_bucket());
             assert_eq!(descriptor.snapshot_id(), Some(42));
             assert!(!descriptor.is_primary_key());
@@ -641,8 +647,11 @@ mod tests {
             for has_tail in [false, true] {
                 for lake_only in [false, true] {
                     let range = FlussLakeLogRange {
+                        baseline: crate::FlussLakeBaseline::Lake,
                         table_bucket: TableBucket::new(info.table_id, 0),
-                        partition_identity: crate::FlussLakePartitionIdentity::Unpartitioned,
+                        partition: FlussLakeLogPartition::Ordinary(
+                            FlussLakePartitionIdentity::Unpartitioned,
+                        ),
                         bucket_count: 4,
                         start_offset: if has_lake { 6 } else { 0 },
                         stop_offset: (if has_lake { 6 } else { 0 })
@@ -662,7 +671,7 @@ mod tests {
                     assert_eq!(splits.len(), expected_lake_tasks + expected_log_tasks);
                     let log_tasks = splits
                         .iter()
-                        .map(|split| split.validated_execution_descriptor().unwrap())
+                        .map(|split| split.execution_descriptor())
                         .filter(|descriptor| descriptor.start_offset() < descriptor.stop_offset())
                         .count();
                     assert_eq!(log_tasks, expected_log_tasks);
@@ -682,11 +691,14 @@ mod tests {
         let mut all_ids = HashSet::new();
         for (partition_id, name) in [(Some(9), "live"), (None, "expired")] {
             let range = FlussLakeLogRange {
+                baseline: crate::FlussLakeBaseline::Lake,
                 table_bucket: TableBucket::new_with_partition(info.table_id, partition_id, 7),
-                partition_identity: crate::FlussLakePartitionIdentity::KeyValues(vec![(
-                    "region".into(),
-                    name.into(),
-                )]),
+                partition: FlussLakeLogPartition::Ordinary(
+                    crate::FlussLakePartitionIdentity::KeyValues(vec![(
+                        "region".into(),
+                        name.into(),
+                    )]),
+                ),
                 bucket_count: 8,
                 start_offset: 0,
                 stop_offset: 0,
@@ -698,8 +710,11 @@ mod tests {
             assert_eq!(splits.len(), 2);
             for split in splits {
                 assert!(all_ids.insert(split.split_id.clone()));
-                assert_eq!(split.partition, range.partition_identity);
-                let descriptor = split.validated_execution_descriptor().unwrap();
+                assert_eq!(
+                    FlussLakeLogPartition::Ordinary(split.partition.clone()),
+                    *range.partition()
+                );
+                let descriptor = split.execution_descriptor();
                 assert_eq!(descriptor.table_bucket().partition_id(), partition_id);
                 assert_eq!(descriptor.lake_splits()[0].bucket_count, 8);
                 assert_eq!(descriptor.start_offset(), descriptor.stop_offset());
@@ -711,8 +726,9 @@ mod tests {
     fn primary_key_planning_keeps_bucket_baseline_and_tail_together() {
         let info = pk_table_info(vec![], HashMap::new());
         let range = FlussLakeLogRange {
+            baseline: crate::FlussLakeBaseline::Lake,
             table_bucket: TableBucket::new(info.table_id, 0),
-            partition_identity: crate::FlussLakePartitionIdentity::Unpartitioned,
+            partition: FlussLakeLogPartition::Ordinary(FlussLakePartitionIdentity::Unpartitioned),
             bucket_count: 4,
             start_offset: 6,
             stop_offset: 10,
@@ -729,7 +745,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(splits.len(), 1);
-            let descriptor = splits[0].validated_execution_descriptor().unwrap();
+            let descriptor = splits[0].execution_descriptor();
             assert!(descriptor.is_primary_key());
             assert_eq!(descriptor.lake_splits().len(), 2);
             assert_eq!(descriptor.start_offset(), 6);
@@ -770,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_unaware_tasks_are_append_only_and_still_validate_transport() {
+    fn bucket_unaware_tasks_are_append_only() {
         let info = table_info(false, vec![], HashMap::new());
         let mut task = crate::source::testing_split();
         task.bucket_id = -1;
@@ -793,8 +809,9 @@ mod tests {
         // The table default is 4, but this old live partition retains 8 buckets.
         let ranges = (0..8)
             .map(|bucket| crate::FlussLakeLogRange {
+                baseline: crate::FlussLakeBaseline::Lake,
                 table_bucket: fluss::metadata::TableBucket::new_with_partition(7, Some(9), bucket),
-                partition_identity: identity("old"),
+                partition: FlussLakeLogPartition::Ordinary(identity("old")),
                 bucket_count: 8,
                 start_offset: 0,
                 stop_offset: 1,
@@ -832,15 +849,21 @@ mod tests {
     fn pk_table_info(
         partition_keys: Vec<String>,
         properties: HashMap<String, String>,
-    ) -> TableInfo {
+    ) -> Arc<TableInfo> {
         table_info(true, partition_keys, properties)
     }
 
     fn table_info(
         primary_key: bool,
         partition_keys: Vec<String>,
-        properties: HashMap<String, String>,
-    ) -> TableInfo {
+        mut properties: HashMap<String, String>,
+    ) -> Arc<TableInfo> {
+        properties
+            .entry("table.datalake.enabled".into())
+            .or_insert_with(|| "true".into());
+        properties
+            .entry("table.datalake.format".into())
+            .or_insert_with(|| "paimon".into());
         let builder = Schema::builder()
             .column("id", DataTypes::int())
             .column("region", DataTypes::string())
@@ -852,7 +875,7 @@ mod tests {
         }
         .build()
         .unwrap();
-        TableInfo::new(
+        Arc::new(TableInfo::new(
             TablePath::new("fluss", "pk_orders"),
             7,
             1,
@@ -865,7 +888,7 @@ mod tests {
             None,
             0,
             0,
-        )
+        ))
     }
 
     #[test]
@@ -906,46 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_split_carries_one_partition_bucket_lake_and_log_unit() {
-        let range = FlussLakeLogRange {
-            table_bucket: TableBucket::new_with_partition(5, Some(9), 2),
-            partition_identity: FlussLakePartitionIdentity::KeyValues(vec![(
-                "region".to_string(),
-                "US".to_string(),
-            )]),
-            bucket_count: 4,
-            start_offset: 12,
-            stop_offset: 20,
-            earliest_offset: 8,
-        };
-        let split = create_logical_split(
-            &TablePath::new("fluss", "orders"),
-            3,
-            &range,
-            Some(42),
-            vec![crate::LakeSplit {
-                bucket_id: 2,
-                partition: range.partition_identity.clone(),
-                ..crate::source::testing_split()
-            }],
-            vec![0],
-            SplitStatistics::default(),
-        )
-        .unwrap();
-
-        assert_eq!(split.bucket_id, 2);
-        assert_eq!(
-            split.partition,
-            FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string(),)])
-        );
-        let descriptor = split.validated_execution_descriptor().unwrap();
-        assert_eq!(descriptor.snapshot_id(), Some(42));
-        assert_eq!(descriptor.start_offset(), 12);
-        assert_eq!(descriptor.stop_offset(), 20);
-        assert_eq!(descriptor.lake_splits().len(), 1);
-    }
-
-    #[test]
     fn lake_only_expired_partition_has_identity_without_live_partition_id() {
         let range = FlussLakeLogRange::lake_only(
             5,
@@ -953,14 +936,19 @@ mod tests {
             4,
             FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())]),
         );
+        let FlussLakeLogPartition::Ordinary(identity) = range.partition();
         let split = create_logical_split(
-            &TablePath::new("fluss", "orders"),
-            3,
+            &Arc::new(crate::split_descriptor::testing_table(
+                TablePath::new("fluss", "orders"),
+                3,
+                true,
+                5,
+            )),
             &range,
             Some(42),
             vec![crate::LakeSplit {
                 bucket_id: 2,
-                partition: range.partition_identity.clone(),
+                partition: identity.clone(),
                 ..crate::source::testing_split()
             }],
             Vec::new(),
@@ -973,7 +961,7 @@ mod tests {
             split.partition,
             FlussLakePartitionIdentity::KeyValues(vec![("region".to_string(), "US".to_string())])
         );
-        let descriptor = split.validated_execution_descriptor().unwrap();
+        let descriptor = split.execution_descriptor();
         assert!(descriptor.is_partitioned());
         assert_eq!(descriptor.table_bucket().partition_id(), None);
         assert_eq!(descriptor.start_offset(), 0);
@@ -992,13 +980,18 @@ mod tests {
                     ("b".into(), b.into()),
                 ]),
             );
+            let FlussLakeLogPartition::Ordinary(identity) = range.partition();
             create_logical_split(
-                &TablePath::new("fluss", "orders"),
-                3,
+                &Arc::new(crate::split_descriptor::testing_table(
+                    TablePath::new("fluss", "orders"),
+                    3,
+                    true,
+                    5,
+                )),
                 &range,
                 Some(42),
                 vec![crate::LakeSplit {
-                    partition: range.partition_identity.clone(),
+                    partition: identity.clone(),
                     ..crate::source::testing_split()
                 }],
                 Vec::new(),

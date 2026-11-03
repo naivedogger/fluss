@@ -22,15 +22,17 @@
 //! Three integration levels share the same source contract:
 //! - [`FlussLakeScan::plan`] and [`FlussLakeScan::new_reader`] provide the
 //!   complete default reader, including lake access and reconciliation.
-//!   Local callers and workers use matching scan settings to
-//!   execute transported splits without retaining or rebuilding the plan.
+//!   Local callers and in-process engines use matching scan settings to
+//!   execute tasks without retaining or rebuilding the plan.
 //! - [`FlussLakeScan::with_lake_source`] replaces lake planning/reading while
 //!   retaining the default Fluss log reader and current-view reconciliation.
-//! - [`FlussLakeTable::prepare`] returns a portable [`FlussLakeReadContext`]
+//! - [`FlussLakeTable::capture_read_context`] returns a structured [`FlussLakeReadContext`]
 //!   without a lake backend. Engines can use their own lake planners, readers,
 //!   reconciliation operators, and schedulers against these frozen inputs.
 //!
-//! A context is table-wide and independent of scan predicates and projection.
+//! A context records the table or partition scope captured by planning.
+//! Explicit preparation allows scans to share boundaries independently of projection
+//! and predicates.
 //! It is not a retention lease or a global transactional snapshot.
 
 #![doc = include_str!("../README.md")]
@@ -55,12 +57,12 @@ mod table;
 pub use error::{FlussLakeError, Result};
 #[cfg(feature = "paimon")]
 pub use paimon::PaimonLakeSource;
+pub use partition::{FlussLakeLogPartition, FlussLakePartitionIdentity};
 pub use plan::{FlussLakePlanStatistics, FlussLakeReadPlan};
-pub use read_context::{FlussLakeLogRange, FlussLakeReadContext};
+pub use read_context::{FlussLakeBaseline, FlussLakeLogRange, FlussLakeReadContext};
 pub use reader::FlussLakeReader;
 pub use source::{LakePlannerContext, LakeReadSemantics, LakeReaderContext, LakeSource, LakeSplit};
-pub(crate) use split::CURRENT_FLUSS_LAKE_SPLIT_VERSION;
-pub use split::{FlussLakePartitionIdentity, FlussLakeReadSplit};
+pub use split::FlussLakeReadSplit;
 pub use table::{FlussLakeScan, FlussLakeTable};
 
 use arrow::record_batch::RecordBatch;

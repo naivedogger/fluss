@@ -45,7 +45,7 @@ paimon = { version = "0.3.0", default-features = false, features = ["storage-mem
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "1.0"
+tokio = { workspace = true }
 
 [dev-dependencies]
 fluss-test-cluster = { path = "../fluss-test-cluster" }
-tokio = { workspace = true }

@@ -29,6 +29,7 @@ pub type Result<T> = std::result::Result<T, FlussLakeError>;
 /// protocol. Boundary conversions include available cause messages, but do not
 /// retain the original error objects.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FlussLakeError {
     /// Requested table is not configured for lake reads.
     #[error("table is not lake-readable: {0}")]
@@ -54,17 +55,13 @@ pub enum FlussLakeError {
     #[error("unsupported merge engine: {0}")]
     UnsupportedMergeEngine(String),
 
-    /// Split or backend payload version is not supported by this reader.
+    /// Lake backend payload version is not supported by its reader.
     #[error("incompatible UnionRead split version: {0}")]
     IncompatibleSplitVersion(String),
 
     /// Public engine-integration context is malformed or incomplete.
     #[error("invalid UnionRead context: {0}")]
     InvalidReadContext(String),
-
-    /// Public context transport version is not supported.
-    #[error("incompatible UnionRead context version: {0}")]
-    IncompatibleReadContextVersion(String),
 
     /// Backend or execution failure outside the explicitly classified categories,
     /// including malformed task payloads. Returned to callers like other read errors.
@@ -92,12 +89,21 @@ pub(crate) fn execution_client_error(action: &str, error: ClientError) -> FlussL
                 | fluss::error::FlussError::PartitionNotExists
                 | fluss::error::FlussError::LakeSnapshotNotExist
                 | fluss::error::FlussError::KvSnapshotNotExist
+                | fluss::error::FlussError::LogOffsetOutOfRangeException
         )
     ) {
         return FlussLakeError::DataUnavailable(message);
     }
     match error {
-        ClientError::LogOffsetOutOfRange { .. } => FlussLakeError::DataUnavailable(message),
+        ClientError::UnexpectedError {
+            source: Some(source),
+            ..
+        } if source.downcast_ref::<ClientError>().is_some_and(|cause| {
+            cause.api_error() == Some(fluss::error::FlussError::LogOffsetOutOfRangeException)
+        }) =>
+        {
+            FlussLakeError::DataUnavailable(message)
+        }
         ClientError::RpcError { .. } => FlussLakeError::ConnectionError(message),
         _ => FlussLakeError::Internal(message),
     }
@@ -149,8 +155,12 @@ mod tests {
 
     #[test]
     fn log_offset_out_of_range_maps_to_data_unavailable() {
-        let error = ClientError::LogOffsetOutOfRange {
+        let error = ClientError::UnexpectedError {
             message: "offset 1 was removed".to_string(),
+            source: Some(Box::new(ClientError::from(fluss::error::ApiError {
+                code: fluss::error::FlussError::LogOffsetOutOfRangeException.code(),
+                message: "retained prefix expired".to_string(),
+            }))),
         };
 
         assert!(matches!(

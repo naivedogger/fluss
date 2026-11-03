@@ -2105,10 +2105,14 @@ impl LogFetcher {
                     return Ok(None);
                 }
                 FetchErrorAction::LogOffsetOutOfRange => {
-                    return Err(Error::LogOffsetOutOfRange {
+                    return Err(Error::UnexpectedError {
                         message: format!(
                             "The fetching offset {fetch_offset} is out of range: {error_message}"
                         ),
+                        source: Some(Box::new(Error::from(ApiError {
+                            code: FlussError::LogOffsetOutOfRangeException.code(),
+                            message: error_message.to_string(),
+                        }))),
                     });
                 }
                 FetchErrorAction::Authorization => {
@@ -3085,7 +3089,17 @@ mod tests {
             .await;
 
         let error = fetcher.collect_fetches().await.err().expect("offset error");
-        assert!(matches!(error, Error::LogOffsetOutOfRange { .. }));
+        let Error::UnexpectedError {
+            source: Some(source),
+            ..
+        } = &error
+        else {
+            panic!("expected the existing fetch error wrapper");
+        };
+        assert_eq!(
+            source.downcast_ref::<Error>().unwrap().api_error(),
+            Some(FlussError::LogOffsetOutOfRangeException)
+        );
         assert!(error.to_string().contains("offset 5"));
         assert!(error.to_string().contains("retained prefix expired"));
         assert_eq!(status.get_bucket_offset(&bucket), Some(5));

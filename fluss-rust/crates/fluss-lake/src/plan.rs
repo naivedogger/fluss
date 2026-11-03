@@ -132,9 +132,12 @@ mod tests {
 
     fn split(rows: Option<usize>, size: Option<usize>) -> FlussLakeReadSplit {
         let descriptor = SplitDescriptor::try_new(
-            TablePath::new("fluss", "orders"),
-            1,
-            false,
+            Arc::new(crate::split_descriptor::testing_table(
+                TablePath::new("fluss", "orders"),
+                1,
+                false,
+                (TableBucket::new(5, 0)).table_id(),
+            )),
             TableBucket::new(5, 0),
             0,
             10,
@@ -147,7 +150,6 @@ mod tests {
             "fluss.orders:root:0".to_string(),
             0,
             FlussLakePartitionIdentity::Unpartitioned,
-            crate::CURRENT_FLUSS_LAKE_SPLIT_VERSION,
             descriptor,
             SplitStatistics::new(rows, size),
         )
