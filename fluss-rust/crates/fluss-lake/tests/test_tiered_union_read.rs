@@ -29,8 +29,8 @@ use fluss_lake::{
     FlussLakeReadSplit, FlussLakeScan, FlussLakeTable, LakePlannerContext, LakeReadSemantics,
     LakeReaderContext, LakeSource, LakeSplit, PaimonLakeSource, RecordBatchStream,
 };
-use futures::TryStreamExt;
 use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -202,23 +202,14 @@ async fn verify() {
     .map(|(id, name)| (id, name.to_owned()))
     .collect::<Vec<_>>();
     let reader = scan.new_reader();
-    // The unpartitioned PK plan has only one task. Append has independent
-    // lake/log tasks, so exercise both serial and concurrent execution there.
-    let concurrencies: &[usize] = if scenario == "pk" { &[1] } else { &[1, 4] };
-    for &concurrency in concurrencies {
-        let batches = reader
-            .read_splits_with_concurrency(&splits, concurrency)
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            rows(&batches),
-            expected,
-            "serial and concurrent retained reads must preserve the current view"
-        );
-        assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
-    }
+    let batches = reader
+        .read_splits(&splits)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows(&batches), expected);
+    assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
     drop(reader);
     drop(plan);
     drop(scan);
@@ -256,10 +247,14 @@ async fn verify() {
     }
     let custom_scan = table.new_scan().with_lake_source(custom_source.clone());
     let custom_plan = custom_scan.plan_with_context(&context).await.unwrap();
-    let mut stream = custom_scan
-        .new_reader()
-        .read_splits_with_concurrency(custom_plan.splits(), custom_plan.split_count())
-        .unwrap();
+    // Model engine-owned scheduling of independent local tasks.
+    let custom_reader = custom_scan.new_reader();
+    let streams = custom_plan
+        .splits()
+        .iter()
+        .map(|split| custom_reader.read_split(split).unwrap())
+        .collect::<Vec<_>>();
+    let mut stream = futures::stream::iter(streams).flatten_unordered(custom_plan.split_count());
     let mut batches = Vec::new();
     if let Some(gate) = lake_gate {
         // Even a blocked lake reader must not delay the independent log task.

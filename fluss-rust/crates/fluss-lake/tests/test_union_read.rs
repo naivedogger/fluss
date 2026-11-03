@@ -121,11 +121,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_planning() {
             .is_err()
     );
     assert!(
-        ids_reader
-            .read_splits_with_concurrency(&ids_splits, 0)
-            .is_err()
-    );
-    assert!(
         lake_table
             .new_scan()
             .with_batch_size(0)
@@ -447,33 +442,31 @@ async fn shared_read_metadata_does_not_outlive_the_read_attempt() {
         drop(writer);
         let plan = scan.plan().await.unwrap();
         assert_eq!(plan.splits().len(), 2);
-        for concurrency in [1, 2] {
-            let batches = tokio::time::timeout(
-                Duration::from_secs(10),
-                reader
-                    .read_splits_with_concurrency(plan.splits(), concurrency)
+        let batches = tokio::time::timeout(
+            Duration::from_secs(10),
+            reader
+                .read_splits(plan.splits())
+                .unwrap()
+                .try_collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
                     .unwrap()
-                    .try_collect::<Vec<_>>(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let mut ids: Vec<i32> = batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap()
-                        .values()
-                        .iter()
-                        .copied()
-                })
-                .collect();
-            ids.sort_unstable();
-            assert_eq!(ids, expected);
-        }
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
         previous_splits = Some(plan.splits().to_vec());
     }
     admin.drop_table(&path, false).await.unwrap();

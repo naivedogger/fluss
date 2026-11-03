@@ -98,11 +98,11 @@ The plan freezes source boundaries and logical tasks, while the reader captures
 scan settings. Callers must use the same projection, filter, mode, batch size
 and compatible lake backend for planning and execution. The reader does not
 retain a plan or check task membership. It rejects duplicate task
-IDs within one `read_splits` call. `read_splits(plan.splits())` reads an unordered
-stream with at most eight active logical tasks. Use
-`read_splits_with_concurrency(..., n)` to set a positive limit, or schedule
-`read_split` in the host engine. Dropping the stream cancels active reads; the
-first error is terminal and drops sibling streams. Each `read_splits` call lazily shares
+IDs within one `read_splits` call. `read_splits(plan.splits())` consumes tasks
+sequentially in the supplied order; row order within each task is unspecified.
+For concurrent execution, callers schedule `read_split()` streams themselves.
+Dropping the stream cancels the active read; the first error is terminal and
+remaining tasks are not started. Each `read_splits` call lazily shares
 one Fluss table metadata load across its tasks. Separate calls, including
 `read_split`, start fresh metadata sessions; frozen schemas and boundaries are
 unchanged, and core routing refresh remains active.
@@ -113,7 +113,7 @@ are complete. This supports count scans but is not a metadata-only count.
 
 ### Schedule local tasks in an engine
 
-The default planner and reader can be used independently of the convenience concurrency helper. An in-process engine can retain or clone selected tasks and schedule `read_split()` itself. Tasks share frozen source metadata and can outlive their plan; no plan identity check or replanning is required.
+The default planner and reader can be used independently of the sequential `read_splits()` helper. An in-process engine can retain or clone selected tasks and schedule `read_split()` itself. Tasks share frozen source metadata and can outlive their plan; no plan identity check or replanning is required.
 
 ```rust,no_run
 # use fluss_lake::{FlussLakeScan, Result};
@@ -313,7 +313,7 @@ The modules separate source boundaries, default task planning and execution. The
 | `planner.rs` | Apply safe pruning, call `LakeSource::plan`, and construct the default append or PK tasks. |
 | `plan.rs` | Immutable planning result: context, output schema, splits and statistics. No reader or I/O. |
 | `split.rs`, `split_descriptor.rs` | Local task metadata, shared frozen source information and construction-time validation. |
-| `reader.rs` | The single scan-created reader API; lazy task streams, concurrency limits, first-error termination and cancellation. |
+| `reader.rs` | The single scan-created reader API; lazy task streams, sequential consumption, first-error termination and cancellation. |
 | `executor.rs` | Execute one task, read bounded logs, reconcile PK rows, then apply exact filtering, output projection and batch sizing. |
 | `source.rs` | The lake-format extension contract and predicates safe to push below reconciliation. |
 | `paimon.rs`, `paimon/arrow_conversion.rs` | Paimon catalog/snapshot access, portable task payloads, native baseline reads and lossless Arrow adaptation. |

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Scan-configured readers, bounded task concurrency and stream cancellation.
+//! Scan-configured readers, sequential task consumption and stream cancellation.
 
 use crate::executor::execute_split;
 use crate::{FlussLakeError, FlussLakeReadSplit, FlussLakeScan, RecordBatchStream, Result};
@@ -50,27 +50,13 @@ impl FlussLakeReader {
         execute_split(split, &self.scan, Arc::new(OnceCell::new())).map(stop_after_first_error)
     }
 
-    /// Read a task collection as an unordered stream with at most eight
-    /// active logical tasks. Duplicate tasks are rejected. Engines may instead
-    /// schedule `read_split` themselves. Nonempty tasks share one lazy table
-    /// metadata load within this call; later calls load it again. Routing refresh
-    /// remains managed by the core client. An error drops all sibling streams;
+    /// Read tasks sequentially in the supplied order. Duplicate tasks are rejected.
+    /// Callers control concurrency by scheduling `read_split` streams themselves.
+    /// Nonempty tasks share one lazy table metadata load within this call; later
+    /// calls load it again. Routing refresh remains managed by the core client.
+    /// The first error terminates the stream without starting remaining tasks;
     /// discard this attempt's output before replanning with fresh boundaries.
     pub fn read_splits(&self, splits: &[FlussLakeReadSplit]) -> Result<RecordBatchStream> {
-        self.read_splits_with_concurrency(splits, 8)
-    }
-
-    /// As `read_splits`, with an explicit positive active-task limit.
-    pub fn read_splits_with_concurrency(
-        &self,
-        splits: &[FlussLakeReadSplit],
-        concurrency: usize,
-    ) -> Result<RecordBatchStream> {
-        if concurrency == 0 {
-            return Err(FlussLakeError::PlanningFailed(
-                "read concurrency must be positive".to_string(),
-            ));
-        }
         self.scan.validate_configuration()?;
         let mut seen = HashSet::with_capacity(splits.len());
         for split in splits {
@@ -85,20 +71,17 @@ impl FlussLakeReader {
             .iter()
             .map(|split| execute_split(split, &self.scan, metadata.clone()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(merge_split_streams(streams, concurrency))
+        Ok(concatenate_split_streams(streams))
     }
 }
 
-fn merge_split_streams(streams: Vec<RecordBatchStream>, concurrency: usize) -> RecordBatchStream {
-    stop_after_first_error(Box::pin(
-        futures::stream::iter(streams).flatten_unordered(concurrency),
-    ))
+fn concatenate_split_streams(streams: Vec<RecordBatchStream>) -> RecordBatchStream {
+    stop_after_first_error(Box::pin(futures::stream::iter(streams).flatten()))
 }
 
 /// Makes the first stream error terminal and immediately drops the source.
 ///
-/// For `read_splits`, dropping the merged stream also cancels every sibling
-/// split as soon as one split invalidates the attempt.
+/// For `read_splits`, this also drops all remaining unpolled task streams.
 fn stop_after_first_error(stream: RecordBatchStream) -> RecordBatchStream {
     Box::pin(futures::stream::unfold(Some(stream), |stream| async move {
         let mut stream = stream?;
@@ -148,25 +131,25 @@ mod tests {
     }
 
     #[test]
-    fn merged_reads_bound_active_streams_and_release_on_drop() {
+    fn sequential_reads_release_active_streams_on_completion_and_drop() {
         futures::executor::block_on(async {
             let active = Arc::new(AtomicUsize::new(0));
             let peak = Arc::new(AtomicUsize::new(0));
-            let streams = (0..12)
+            let streams = (0..2)
                 .map(|_| counted_stream(active.clone(), peak.clone()))
                 .collect();
-            let batches = merge_split_streams(streams, 2)
+            let batches = concatenate_split_streams(streams)
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-            assert_eq!(batches.len(), 24);
-            assert!(peak.load(Ordering::SeqCst) <= 2);
+            assert_eq!(batches.len(), 4);
+            assert_eq!(peak.load(Ordering::SeqCst), 1);
             assert_eq!(active.load(Ordering::SeqCst), 0);
 
-            let streams = (0..12)
+            let streams = (0..2)
                 .map(|_| counted_stream(active.clone(), peak.clone()))
                 .collect();
-            let mut merged = merge_split_streams(streams, 2);
+            let mut merged = concatenate_split_streams(streams);
             assert!(merged.next().await.unwrap().is_ok());
             drop(merged);
             assert_eq!(active.load(Ordering::SeqCst), 0);
@@ -174,29 +157,24 @@ mod tests {
     }
 
     #[test]
-    fn merged_error_drops_siblings_and_cannot_be_followed_by_rows() {
+    fn error_does_not_start_remaining_tasks() {
         futures::executor::block_on(async {
             let active = Arc::new(AtomicUsize::new(0));
             let peak = Arc::new(AtomicUsize::new(0));
             let streams = vec![
-                counted_stream(active.clone(), peak),
                 Box::pin(futures::stream::once(async {
                     Err(FlussLakeError::DataUnavailable("expired input".into()))
                 })) as RecordBatchStream,
+                counted_stream(active.clone(), peak.clone()),
             ];
-            let mut stream = merge_split_streams(streams, 2);
-            loop {
-                if stream
-                    .next()
-                    .await
-                    .expect("must report the failure")
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            assert_eq!(active.load(Ordering::SeqCst), 0);
+            let mut stream = concatenate_split_streams(streams);
+            assert!(matches!(
+                stream.next().await,
+                Some(Err(FlussLakeError::DataUnavailable(_)))
+            ));
             assert!(stream.next().await.is_none());
+            assert_eq!(peak.load(Ordering::SeqCst), 0);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
         });
     }
 
