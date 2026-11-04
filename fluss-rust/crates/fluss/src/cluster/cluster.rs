@@ -313,7 +313,6 @@ impl Cluster {
             table_id_by_path.extend(origin.get_table_id_by_path().clone());
             partitions_id_by_path.extend(origin.partitions_id_by_path.clone());
             tmp_available_locations_by_path.extend(origin.available_locations_by_path.clone());
-            tmp_available_location_by_bucket.extend(origin.available_locations_by_bucket.clone());
             bucket_count_by_table_or_partition
                 .extend(origin.bucket_count_by_table_or_partition.clone());
         }
@@ -425,6 +424,8 @@ impl Cluster {
             tmp_available_locations_by_path.insert(physical_table_path, bucket_locations);
         }
 
+        // Rebuild this index so buckets omitted from refreshed metadata or without a
+        // leader cannot retain an old route that disagrees with the path index.
         for bucket_locations in &mut tmp_available_locations_by_path.values() {
             for location in bucket_locations {
                 if location.leader().is_some() {
@@ -1187,6 +1188,104 @@ mod tests {
             }],
             table_metadata,
             partition_metadata,
+        }
+    }
+
+    #[test]
+    fn metadata_refresh_removes_stale_leaders_and_preserves_other_tables() {
+        let path_routes = |cluster: &Cluster, table_name: &str| {
+            let path = PhysicalTablePath::of(Arc::new(TablePath::new("db", table_name)));
+            cluster
+                .get_available_buckets_for_table_path(&path)
+                .iter()
+                .map(|location| {
+                    (
+                        location.bucket_id(),
+                        location.leader().as_ref().map(ServerNode::id),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let current = pb_metadata_response(
+            vec![
+                pb_table_metadata("plain", 1, false, vec![pb_bucket(0), pb_bucket(1)]),
+                pb_table_metadata("other", 2, false, vec![pb_bucket(0)]),
+            ],
+            vec![],
+        );
+        let current = Cluster::from_metadata_response(current, None).unwrap();
+        let mut leaderless = pb_bucket(0);
+        leaderless.leader_id = None;
+        // Bucket 0 loses its leader; bucket 1 disappears from the refreshed table.
+        let response = pb_metadata_response(
+            vec![pb_table_metadata("plain", 1, false, vec![leaderless])],
+            vec![],
+        );
+        let updated = Cluster::from_metadata_response(response, Some(&current)).unwrap();
+        assert!(updated.leader_for(&TableBucket::new(1, 0)).is_none());
+        assert!(updated.leader_for(&TableBucket::new(1, 1)).is_none());
+        assert_eq!(path_routes(&updated, "plain"), vec![(0, None)]);
+
+        let mut new_leader = pb_bucket(0);
+        new_leader.leader_id = Some(2);
+        new_leader.replica_id = vec![2];
+        new_leader.isr = vec![2];
+        let mut recovered = pb_metadata_response(
+            vec![pb_table_metadata("plain", 1, false, vec![new_leader])],
+            vec![],
+        );
+        recovered.tablet_servers.push(PbServerNode {
+            node_id: 2,
+            host: "ts2".to_string(),
+            ..recovered.tablet_servers[0].clone()
+        });
+        let recovered = Cluster::from_metadata_response(recovered, Some(&updated)).unwrap();
+        assert_eq!(
+            recovered.leader_for(&TableBucket::new(1, 0)).unwrap().id(),
+            2
+        );
+        assert_eq!(path_routes(&recovered, "plain"), vec![(0, Some(2))]);
+        assert!(recovered.leader_for(&TableBucket::new(1, 1)).is_none());
+        for cluster in [&updated, &recovered] {
+            assert_eq!(cluster.leader_for(&TableBucket::new(2, 0)).unwrap().id(), 1);
+            assert_eq!(path_routes(cluster, "other"), vec![(0, Some(1))]);
+        }
+    }
+
+    #[test]
+    fn partition_metadata_refresh_preserves_other_partitions() {
+        let partition = |name: &str, id, buckets| PbPartitionMetadata {
+            table_id: 1,
+            partition_name: name.to_string(),
+            partition_id: id,
+            bucket_metadata: buckets,
+            bucket_count: Some(2),
+        };
+        let current = pb_metadata_response(
+            vec![pb_table_metadata("parts", 1, true, vec![])],
+            vec![
+                partition("p1", 10, vec![pb_bucket(0), pb_bucket(1)]),
+                partition("p2", 20, vec![pb_bucket(0), pb_bucket(1)]),
+            ],
+        );
+        let current = Cluster::from_metadata_response(current, None).unwrap();
+        let mut leaderless = pb_bucket(0);
+        leaderless.leader_id = None;
+        let response = pb_metadata_response(vec![], vec![partition("p1", 10, vec![leaderless])]);
+        let updated = Cluster::from_metadata_response(response, Some(&current)).unwrap();
+        for bucket_id in [0, 1] {
+            assert!(
+                updated
+                    .leader_for(&TableBucket::new_with_partition(1, Some(10), bucket_id))
+                    .is_none()
+            );
+            assert_eq!(
+                updated
+                    .leader_for(&TableBucket::new_with_partition(1, Some(20), bucket_id))
+                    .unwrap()
+                    .id(),
+                1
+            );
         }
     }
 
