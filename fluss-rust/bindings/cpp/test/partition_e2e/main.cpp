@@ -586,12 +586,19 @@ void fault_case(Context& c, bool lookup_mode, bool drop) {
     stage("READBACK_OK: verify leader-change and unknown-leader logs before declaring coverage");
 }
 
+#include "recreate_stress.hpp"
+
 int main(int argc, char** argv) {
     try {
         require(argc == 2, "usage: partition_e2e CASE");
         std::string mode = argv[1];
         if (mode == "--version") {
             std::cout << PARTITION_SDK_REVISION << std::endl;
+            return 0;
+        }
+        if (mode == "recreate-shared" || mode == "recreate-separate") {
+            recreate_stress::run(mode == "recreate-shared");
+            stage("PASS");
             return 0;
         }
         Context c;

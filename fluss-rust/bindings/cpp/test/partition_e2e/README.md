@@ -96,6 +96,69 @@ The 5 ms writer/lookup batching settings keep correctness tests short.
 Initial table acquisition retries transient metadata errors for up to 30 seconds
 after creation; fault-path reads and individual write acknowledgments retain their errors.
 
+## Drop/recreate under continued writes
+
+`recreate-shared` and `recreate-separate` reuse the callback accounting and paced
+submission from `test/rust-isr-callback-bp/isr-storm-cpp`, with the existing published
+runtime, connection JSON, watchdog and result directories. They use nonpartitioned
+Log tables to match the customer incident. They are opt-in and not part of the
+default partition suite.
+
+Both cases create unique A/B tables and start both workloads. After a 30-second
+baseline, a separate Admin connection drops B and immediately recreates its name.
+The original B writer and Connection remain alive and continue receiving input for
+60 seconds; A keeps writing throughout. `shared` uses one Connection for A/B;
+`separate` uses two Connections in the same process. The latter isolates their SDK
+caches/buffers, while retaining the shared C++ runtime and callback executor.
+
+Unlike the old runner's optional DDL kick, recreation happens **after** the old B
+writer has started. Both workloads use 100ms initial / 1000ms maximum retry backoff,
+acks=all, idempotence, a 64MiB write buffer per Connection and a 1-second buffer
+admission timeout. No production SDK behavior or metadata lock is changed.
+
+```bash
+python3 download.py --sdk-ref PUBLISHED_COMMIT --output /root/cpp-test/partition-results -- \
+  --config /root/cpp-test/config.json --server-version latest-released-2026-11-04 \
+  --cases recreate-shared recreate-separate --buckets 16 \
+  --stress-rate 20000 --stress-writers 2 --stress-payload 1024
+```
+
+Rate is **per table**, divided across its writers. The initial two-table target is
+40,000 rows/s, approximately 41MB/s of payload before replication. The usual
+baseline plus observation writes about 3.7GB per case before replication; A keeps
+writing during drain/recovery, so allow additional space. This is a bounded
+isolation/recovery test, not a peak-throughput benchmark. The SDK branch retains
+write/metadata diagnostic logs, which also affect throughput and disk usage.
+
+The baseline must have successful, recent ACKs from both tables before DDL begins.
+Each second, `stdout.log` records accepted writes, successful/failed callbacks,
+synchronous failures, pending, ACK idle time, maximum result latency and error-code
+counts for each role. DDL events record old/new table IDs and monotonic elapsed time.
+The final verdict requires:
+
+- Old B continues submitting after DDL and observes table-not-exist/invalid-table
+  errors; all pending results
+  finish within the drain window after its submissions stop.
+- A has no additional submission/callback errors, continues ACKing, and has no
+  observed ACK gap above `--stress-stall` (default 10 seconds).
+- A new writer obtained through the original B Connection writes the recreated B.
+  This refresh happens only after the old-writer observation and drain, to avoid
+  masking recovery failures.
+- A finishes with pending=0 and successful Flush.
+
+Defaults are 30 seconds baseline, 60 seconds observation, up to 30 seconds drain
+per role, and a 300-second whole-process watchdog. A hung join, DDL or Flush is
+bounded by that watchdog; on Linux it attempts a thread dump before killing the
+process. A process exit of zero without all verdict fields passing is rejected.
+These cases check availability/completion, not full readback or spontaneous
+metadata-race incidence. No ISR failure is assumed from DDL alone.
+
+Success cleans only the owned tables after rechecking their IDs; failure retains
+them for diagnosis. `--keep` also retains successful cases. Table names are printed
+as `OWNED_TABLE`; no existing user tables are deleted. Use a dedicated test cluster
+with enough free storage and no competing benchmark. For cross-process or cluster
+saturation conclusions, a separate ECS load experiment is still needed.
+
 ## Directed metadata tests
 
 New partition-enabled CI builds also package `bin/metadata_e2e`, a Rust test

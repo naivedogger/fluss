@@ -38,6 +38,7 @@ METADATA = {
     "metadata-concurrent-update": "client::metadata::live_tests::metadata_concurrent_update",
 }
 FAULTS = ("scanner-drop", "scanner-control", "lookup-drop", "lookup-control")
+STRESS = ("recreate-shared", "recreate-separate")
 
 
 def execute(binary, case, directory, env, timeout):
@@ -83,6 +84,16 @@ def execute(binary, case, directory, env, timeout):
                 status = "failed"
         if code == 0 and case in FAULTS:
             status = "needs-evidence"
+        if case in STRESS:
+            stdout.flush()
+            verdicts = []
+            for line in (directory / "stdout.log").read_text().splitlines():
+                if line.startswith('{"type":"verdict",'):
+                    verdicts.append(json.loads(line))
+            if code == 0 and (len(verdicts) != 1 or not all(
+                    verdicts[0].get(key) == 1 for key in
+                    ("old_B_drained", "old_B_failed", "A_healthy", "new_B_writable"))):
+                status = "failed"
         return dict(case=case, status=status, exit_code=code,
                     seconds=round(time.monotonic() - started, 3))
 
@@ -97,12 +108,20 @@ def main():
     build.add_argument("-j", "--jobs", type=int, default=4)
     run = sub.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
-    run.add_argument("--cases", nargs="+", choices=CASES + FAULTS + tuple(METADATA), default=list(CASES))
+    run.add_argument("--cases", nargs="+", choices=CASES + FAULTS + tuple(METADATA) + STRESS, default=list(CASES))
     run.add_argument("--rows", type=int, default=1000, help="Rows per partition for basic cases")
     run.add_argument("--timeout", type=int, default=120, help="Whole-process deadline per automatic case")
     run.add_argument("--fault-timeout", type=int, default=600, help="Includes operator intervention")
     run.add_argument("--buckets", type=int, default=4)
     run.add_argument("--lookup-retries", type=int, default=2147483647)
+    run.add_argument("--stress-rate", type=int, default=20000, help="Target rows/s per table, not per writer")
+    run.add_argument("--stress-writers", type=int, default=2, help="Writers per table")
+    run.add_argument("--stress-payload", type=int, default=1024, help="Payload bytes per row")
+    run.add_argument("--stress-baseline", type=int, default=30)
+    run.add_argument("--stress-observe", type=int, default=60)
+    run.add_argument("--stress-drain", type=int, default=30, help="Maximum pending drain seconds per role")
+    run.add_argument("--stress-stall", type=int, default=10, help="Maximum healthy-table ACK gap in seconds")
+    run.add_argument("--stress-timeout", type=int, default=300, help="Process watchdog including DDL and flush")
     run.add_argument("--keep", action="store_true", help="Keep successful automatic case tables too")
     run.add_argument("--database", help="Override the existing config database")
     run.add_argument("--server-version", required=True, help="Record the deployed server version/build")
@@ -144,6 +163,14 @@ def main():
         parser.error("case names must not repeat")
     if not 0 <= args.lookup_retries <= 2147483647:
         parser.error("lookup retries must be 0..2147483647")
+    if any(case in STRESS for case in args.cases):
+        if not (1 <= args.stress_writers <= 16 and args.stress_writers <= args.stress_rate <= 500000
+                and 1 <= args.stress_payload <= 4096 and 5 <= args.stress_baseline <= 120
+                and 5 <= args.stress_observe <= 300 and 1 <= args.stress_drain <= 120
+                and 1 <= args.stress_stall <= args.stress_observe):
+            parser.error("invalid stress load/durations")
+        if args.stress_timeout < args.stress_baseline + args.stress_observe + 3 * args.stress_drain + 60:
+            parser.error("stress timeout must cover baseline + observe + 3*drain + 60 seconds")
     if args.runtime:
         runtime = args.runtime.resolve()
         metadata = json.loads((runtime / "build-metadata.json").read_text())
@@ -186,11 +213,21 @@ def main():
         PART_REPLICATION=str(replication), PART_ROWS=str(args.rows),
         PART_BUCKETS=str(args.buckets), PART_KEEP="1" if args.keep else "0",
         PART_LOOKUP_RETRIES=str(args.lookup_retries),
+        PART_STRESS_RATE=str(args.stress_rate), PART_STRESS_WRITERS=str(args.stress_writers),
+        PART_STRESS_PAYLOAD=str(args.stress_payload), PART_STRESS_BASELINE=str(args.stress_baseline),
+        PART_STRESS_OBSERVE=str(args.stress_observe), PART_STRESS_DRAIN=str(args.stress_drain),
+        PART_STRESS_STALL=str(args.stress_stall),
     )
     manifest = dict(run_id=run_id, server_version=args.server_version,
                     sdk=sdk,
                     rows_per_partition=args.rows, buckets=args.buckets,
                     replication_factor=replication, lookup_retries=args.lookup_retries, results=[])
+    if any(case in STRESS for case in args.cases):
+        manifest["stress"] = dict(rate_per_table=args.stress_rate, writers_per_table=args.stress_writers,
+                                  payload_bytes=args.stress_payload, baseline_seconds=args.stress_baseline,
+                                  observe_seconds=args.stress_observe, drain_seconds=args.stress_drain,
+                                  healthy_stall_seconds=args.stress_stall, timeout_seconds=args.stress_timeout,
+                                  retry_backoff_ms=100, retry_max_backoff_ms=1000)
     print("RESULTS " + str(result_dir), flush=True)
     (result_dir / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for case in args.cases:
@@ -204,6 +241,7 @@ def main():
                   "then create recovery.ready only AFTER the cluster has recovered. "
                   "See README for evidence requirements.", flush=True)
         result = execute(metadata_binary if case in METADATA else binary, case, directory, case_env,
+                         args.stress_timeout if case in STRESS else
                          args.fault_timeout if case in FAULTS else args.timeout)
         manifest["results"].append(result)
         (result_dir / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")

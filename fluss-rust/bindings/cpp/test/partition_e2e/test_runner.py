@@ -30,6 +30,24 @@ import run
 
 
 class RunnerTest(unittest.TestCase):
+    def test_recreate_requires_all_isolation_contracts_even_on_zero_exit(self):
+        run.WORK.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=run.WORK) as work:
+            root = Path(work)
+            binary = root / "native"
+            verdict = dict(type="verdict", old_B_drained=1, old_B_failed=1,
+                           A_healthy=1, new_B_writable=1)
+            observations = [None, verdict] + [dict(verdict, **{key: 0}) for key in
+                ("old_B_drained", "old_B_failed", "A_healthy", "new_B_writable")]
+            for index, observation in enumerate(observations):
+                binary.write_text("#!" + sys.executable + "\nprint(" + repr(
+                    json.dumps(observation, separators=(",", ":")) if observation else "PASS") + ")\n")
+                binary.chmod(0o700)
+                directory = root / str(index)
+                directory.mkdir()
+                result = run.execute(binary, "recreate-shared", directory, os.environ, 5)
+                self.assertEqual(result["status"], "passed" if index == 1 else "failed")
+
     def test_published_runner_works_without_source_checkout_and_rejects_wrong_binary(self):
         run.WORK.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=run.WORK) as work:
