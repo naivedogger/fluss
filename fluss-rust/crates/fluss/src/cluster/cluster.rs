@@ -1348,6 +1348,66 @@ mod tests {
     }
 
     #[test]
+    fn metadata_regression_keeps_recreated_table_over_late_old_response() {
+        let response = |table_id, partition_id, schema_id| {
+            let mut table = pb_table_metadata("parts", table_id, true, vec![]);
+            table.schema_id = schema_id;
+            pb_metadata_response(
+                vec![table],
+                vec![PbPartitionMetadata {
+                    table_id,
+                    partition_name: "p1".to_string(),
+                    partition_id,
+                    bucket_metadata: vec![pb_bucket(0)],
+                    bucket_count: Some(2),
+                }],
+            )
+        };
+        let old_response = response(10, 100, 1);
+        let old = Cluster::from_metadata_response(old_response.clone(), None).unwrap();
+        let recreated = Cluster::from_metadata_response(response(20, 200, 2), Some(&old)).unwrap();
+        let cluster = Cluster::from_metadata_response(old_response, Some(&recreated)).unwrap();
+        let table_path = TablePath::new("db", "parts");
+        let partition_path =
+            PhysicalTablePath::of_partitioned(Arc::new(table_path.clone()), Some("p1".to_string()));
+        let info = cluster.opt_get_table(&table_path).unwrap();
+        let routes = cluster
+            .get_available_buckets_for_table_path(&partition_path)
+            .iter()
+            .map(|location| location.table_bucket.clone())
+            .collect::<Vec<_>>();
+
+        // Check the path identity and its routes together: a retained new partition
+        // must not hide a rollback of the containing table's ID/schema.
+        assert_eq!(
+            (
+                cluster.get_table_id(&table_path),
+                info.table_id,
+                info.schema_id,
+                cluster.get_partition_id(&partition_path),
+                routes
+            ),
+            (
+                Some(20),
+                20,
+                2,
+                Some(200),
+                vec![TableBucket::new_with_partition(20, Some(200), 0)]
+            )
+        );
+        assert!(
+            cluster
+                .leader_for(&TableBucket::new_with_partition(20, Some(200), 0))
+                .is_some()
+        );
+        assert!(
+            cluster
+                .leader_for(&TableBucket::new_with_partition(10, Some(100), 0))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn from_metadata_response_keeps_a_re_created_partition_over_stale_metadata() {
         let partition = |partition_id| PbPartitionMetadata {
             table_id: 1,

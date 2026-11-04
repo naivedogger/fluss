@@ -56,6 +56,23 @@ class RunnerTest(unittest.TestCase):
             summary = json.loads(summaries[0].read_text())
             self.assertEqual(summary["sdk"]["commit"], metadata["sdkRevision"])
             self.assertEqual(summary["results"][0]["status"], "passed")
+            metadata_command = command[:-1] + ["metadata-late-response"]
+            missing = subprocess.run(metadata_command, capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("require a published runtime with metadataE2e", missing.stderr)
+            native = runtime / "bin/metadata_e2e"
+            native.write_text("#!" + sys.executable + "\nimport sys\n"
+                              "assert sys.argv[1:] == ['--ignored', '--exact', "
+                              "'client::metadata::live_tests::metadata_late_response', "
+                              "'--nocapture', '--test-threads=1']\n"
+                              "print('test result: ok. 1 passed; 0 failed;')\n")
+            native.chmod(0o700)
+            for count in (1, 0):
+                native.write_text(native.read_text().replace("1 passed", str(count) + " passed"))
+                metadata["metadataE2e"] = dict(binarySha256=hashlib.sha256(native.read_bytes()).hexdigest())
+                (runtime / "build-metadata.json").write_text(json.dumps(metadata))
+                result = subprocess.run(metadata_command, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if count else 1, result.stderr)
             binary.write_text("wrong artifact")
             rejected = subprocess.run(command, capture_output=True, text=True)
             self.assertNotEqual(rejected.returncode, 0)

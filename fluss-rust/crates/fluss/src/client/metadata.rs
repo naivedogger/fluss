@@ -344,6 +344,8 @@ impl Metadata {
 
     pub async fn update(&self, metadata_response: MetadataResponse) -> Result<()> {
         let origin_cluster = self.cluster.read().clone();
+        #[cfg(test)]
+        tests::pause_after_update_snapshot(&origin_cluster);
         let new_cluster =
             Cluster::from_metadata_response(metadata_response, Some(&origin_cluster))?;
         self.replace_cluster(new_cluster);
@@ -560,6 +562,10 @@ impl Metadata {
 }
 
 #[cfg(test)]
+#[path = "metadata_live_tests.rs"]
+mod live_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::ApiError;
@@ -571,6 +577,113 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    type SnapshotGate = (
+        std::sync::mpsc::Sender<Arc<Cluster>>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    thread_local! {
+        static UPDATE_SNAPSHOT_GATE: std::cell::RefCell<Option<SnapshotGate>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn install_update_snapshot_gate(
+        ready: std::sync::mpsc::Sender<Arc<Cluster>>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        UPDATE_SNAPSHOT_GATE.with(|gate| *gate.borrow_mut() = Some((ready, resume)));
+    }
+
+    pub(super) fn pause_after_update_snapshot(snapshot: &Arc<Cluster>) {
+        UPDATE_SNAPSHOT_GATE.with(|gate| {
+            if let Some((ready, resume)) = gate.borrow_mut().take() {
+                ready.send(Arc::clone(snapshot)).unwrap();
+                resume
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("resume update");
+            }
+        });
+    }
+
+    #[test]
+    fn metadata_regression_preserves_both_concurrent_updates() {
+        use crate::metadata::{JsonSerde, TableDescriptor};
+        use crate::proto::{PbBucketMetadata, PbTableMetadata, PbTablePath};
+        use crate::test_utils::build_cluster_with_tables;
+        use std::sync::mpsc;
+
+        let a = TablePath::new("db", "a");
+        let b = TablePath::new("db", "b");
+        let initial = Arc::new(build_cluster_with_tables(&[(&a, 1, 1), (&b, 2, 1)], 9092));
+        let metadata = Arc::new(Metadata::new_for_test(Arc::clone(&initial)));
+        let response = |path: &TablePath, table_id| {
+            let descriptor = TableDescriptor::builder()
+                .schema(initial.opt_get_table(path).unwrap().schema.clone())
+                .distributed_by(Some(1), vec![])
+                .build()
+                .unwrap();
+            MetadataResponse {
+                table_metadata: vec![PbTableMetadata {
+                    table_path: PbTablePath {
+                        database_name: "db".to_string(),
+                        table_name: path.table().to_string(),
+                    },
+                    table_id,
+                    schema_id: 2,
+                    table_json: serde_json::to_vec(&descriptor.serialize_json().unwrap()).unwrap(),
+                    bucket_metadata: vec![PbBucketMetadata {
+                        bucket_id: 0,
+                        leader_id: Some(2),
+                        replica_id: vec![2],
+                        isr: vec![2],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..server_metadata(&[1, 2], 9092)
+            }
+        };
+        let spawn_update = |response| {
+            let metadata = Arc::clone(&metadata);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                UPDATE_SNAPSHOT_GATE.with(|gate| {
+                    *gate.borrow_mut() = Some((ready_tx, resume_rx));
+                });
+                futures::executor::block_on(metadata.update(response)).unwrap();
+            });
+            (worker, ready_rx, resume_tx)
+        };
+        let (worker_a, ready_a, resume_a) = spawn_update(response(&a, 1));
+        let (worker_b, ready_b, resume_b) = spawn_update(response(&b, 2));
+        let snapshot_a = ready_a.recv_timeout(Duration::from_secs(10)).unwrap();
+        let snapshot_b = ready_b.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(Arc::ptr_eq(&initial, &snapshot_a));
+        assert!(Arc::ptr_eq(&initial, &snapshot_b));
+
+        // Both real update calls captured S0. Publish A completely before allowing
+        // B to merge/publish, so a lost update cannot depend on scheduler luck.
+        resume_a.send(()).unwrap();
+        worker_a.join().unwrap();
+        assert_eq!(
+            metadata.get_cluster().opt_get_table(&a).unwrap().schema_id,
+            2
+        );
+        resume_b.send(()).unwrap();
+        worker_b.join().unwrap();
+
+        let cluster = metadata.get_cluster();
+        let state = |path: &TablePath, table_id| {
+            (
+                cluster.opt_get_table(path).unwrap().schema_id,
+                cluster
+                    .leader_for(&TableBucket::new(table_id, 0))
+                    .map(ServerNode::id),
+            )
+        };
+        assert_eq!((state(&a, 1), state(&b, 2)), ((2, Some(2)), (2, Some(2))));
+    }
 
     fn server_metadata(ids: &[i32], port: u16) -> MetadataResponse {
         MetadataResponse {

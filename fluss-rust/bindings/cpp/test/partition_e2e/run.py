@@ -33,13 +33,18 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[4] if (HERE / "CMakeLists.txt").is_file() else HERE
 WORK = REPO / "target" / "cpp-partition-e2e"
 CASES = ("log", "arrow", "pk", "lifecycle", "missing-log", "missing-pk", "float-name")
+METADATA = {
+    "metadata-late-response": "client::metadata::live_tests::metadata_late_response",
+    "metadata-concurrent-update": "client::metadata::live_tests::metadata_concurrent_update",
+}
 FAULTS = ("scanner-drop", "scanner-control", "lookup-drop", "lookup-control")
 
 
 def execute(binary, case, directory, env, timeout):
     with (directory / "stdout.log").open("w") as stdout, (directory / "stderr.log").open("w") as stderr:
         process = subprocess.Popen(
-            [str(binary), case], cwd=directory, env=env, stdout=stdout, stderr=stderr,
+            [str(binary)] + (["--ignored", "--exact", METADATA[case], "--nocapture",
+                              "--test-threads=1"] if case in METADATA else [case]), cwd=directory, env=env, stdout=stdout, stderr=stderr,
             start_new_session=True,
         )
         (directory / "pid").write_text(str(process.pid) + "\n")
@@ -71,6 +76,11 @@ def execute(binary, case, directory, env, timeout):
                     pass
                 process.wait()
         status = "timeout" if timed_out else ("passed" if code == 0 else "failed")
+        if code == 0 and case in METADATA:
+            stdout.flush()
+            # libtest exits successfully when an exact filter matches zero tests.
+            if "test result: ok. 1 passed; 0 failed;" not in (directory / "stdout.log").read_text():
+                status = "failed"
         if code == 0 and case in FAULTS:
             status = "needs-evidence"
         return dict(case=case, status=status, exit_code=code,
@@ -87,7 +97,7 @@ def main():
     build.add_argument("-j", "--jobs", type=int, default=4)
     run = sub.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
-    run.add_argument("--cases", nargs="+", choices=CASES + FAULTS, default=list(CASES))
+    run.add_argument("--cases", nargs="+", choices=CASES + FAULTS + tuple(METADATA), default=list(CASES))
     run.add_argument("--rows", type=int, default=1000, help="Rows per partition for basic cases")
     run.add_argument("--timeout", type=int, default=120, help="Whole-process deadline per automatic case")
     run.add_argument("--fault-timeout", type=int, default=600, help="Includes operator intervention")
@@ -150,6 +160,15 @@ def main():
         sdk = json.loads((WORK / "build" / "revision.json").read_text()) if binary.is_file() else None
     if not binary.is_file():
         parser.error("build first")
+    metadata_binary = None
+    if any(case in METADATA for case in args.cases):
+        if not args.runtime or "metadataE2e" not in metadata:
+            parser.error("metadata cases require a published runtime with metadataE2e")
+        metadata_binary = runtime / "bin" / "metadata_e2e"
+        if (not metadata_binary.is_file() or hashlib.sha256(metadata_binary.read_bytes()).hexdigest()
+                != metadata["metadataE2e"]["binarySha256"]):
+            parser.error("metadata binary differs from the published runtime")
+        sdk["metadata_binary_sha256"] = metadata["metadataE2e"]["binarySha256"]
     config = json.loads(args.config.read_text())
     replication = config.get("replication_factor", 3)
     if type(replication) is not int or replication < 1:
@@ -184,7 +203,7 @@ def main():
             print("Wait for fault.ready, perform leader migration/restart on the test cluster, "
                   "then create recovery.ready only AFTER the cluster has recovered. "
                   "See README for evidence requirements.", flush=True)
-        result = execute(binary, case, directory, case_env,
+        result = execute(metadata_binary if case in METADATA else binary, case, directory, case_env,
                          args.fault_timeout if case in FAULTS else args.timeout)
         manifest["results"].append(result)
         (result_dir / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")

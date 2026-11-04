@@ -96,6 +96,36 @@ The 5 ms writer/lookup batching settings keep correctness tests short.
 Initial table acquisition retries transient metadata errors for up to 30 seconds
 after creation; fault-path reads and individual write acknowledgments retain their errors.
 
+## Directed metadata tests
+
+New partition-enabled CI builds also package `bin/metadata_e2e`, a Rust test
+executable with timing controls compiled only under `cfg(test)`. Select a newly
+published SDK revision; the older `6f683b517` package does not contain these tests.
+Use the same downloader/config and select:
+
+```bash
+--cases metadata-late-response metadata-concurrent-update --timeout 120
+```
+
+Both tests connect to the real server, create uniquely named partitioned log tables,
+and verify baseline append/scan before injection. `metadata-late-response` captures
+an old table's real metadata, drops/recreates that owned table, then applies the old
+response after the new one. `metadata-concurrent-update` forces two actual metadata
+updates to capture the same cache snapshot before publishing A then B. The expected
+contract is that the new table identity and both updates survive respectively.
+
+Logs separate `INJECT`, `CACHE`, and `READ_WRITE`: cache corruption is a failure even
+if subsequent I/O refreshes and recovers. The I/O probe retains pre-injection table
+information, while using the affected live metadata cache. These exercise the Rust
+client against a real server, not the C++ binding or naturally occurring network
+reordering. Failure tables are retained for investigation; successful owned tables
+are removed unless `--keep` is set. One bucket per partition is sufficient here;
+`--rows` and `--buckets` apply to the C++ cases only.
+
+The diagnostic branch retains two failing local `metadata_regression_` tests too.
+They assert correct behavior rather than treating reproduction as success. CI only
+builds and lists the live tests; ECS explicitly executes the selected cases.
+
 ## Cases and assertions
 
 | Case | Checks |
@@ -156,9 +186,11 @@ python3 fluss-e2e-native/ci/partition.py --sdk-ref codex/cpp-partition-e2e -- \
    the writer from refreshing the old scanner's shared metadata, and requires the
    original scanner to read it. The lookup case queues A and B on the original lookuper,
    waits up to 60 seconds for B, and requires A to terminate rather than stay pending.
-5. Inspect SDK logs for unknown-leader/metadata refresh involving the dropped A and
-   surviving B. Attach the server routing evidence. Without that evidence a successful
-   readback does not establish coverage of the combined-refresh defect.
+5. Confirm that both deleted A and surviving B have no cached leader in the original
+   reader, and that their IDs occur in the same metadata request which fails with
+   `PartitionNotExists`. Correlate the request, error and subsequent retry with the
+   server routing evidence. A successful readback without this evidence does not
+   establish coverage of the combined-refresh defect.
 
 Successful manual cases are always `needs-evidence` (exit 2), not automatically passed.
 A failed call or stalled readback is `failed`/`timeout` (exit 1); distinguish SDK failure
@@ -168,6 +200,27 @@ it is not a fixed load period. The in-process marker wait is bounded at eight mi
 For the retry-limit check, rerun `lookup-drop --lookup-retries 0`. A stale leader RPC
 can then fail immediately before reaching the unknown-leader path; verify logs before
 claiming reproduction of the retry-counter defect.
+
+## Local metadata regressions before cluster faults
+
+Two focused Rust tests cover cache publication independently of the ECS cases:
+
+```bash
+cd fluss-rust
+cargo test --release -p fluss-rs --lib metadata_regression_ -- --nocapture
+```
+
+- `metadata_regression_keeps_recreated_table_over_late_old_response` applies the
+  recreated table before a delayed old response, then checks table identity/schema
+  and partition routes together.
+- `metadata_regression_preserves_both_concurrent_updates` runs two actual updates
+  on separate OS threads. A test-only gate proves both captured the same snapshot,
+  then allows A to publish before B. Both tables' new schema and leader must survive.
+
+These tests assert the desired behavior; a failure is retained as a regression,
+not an expected pass. They establish local cache behavior under controlled inputs,
+not occurrence in a deployed cluster or the cause of a previous Daily timeout.
+The gate is compiled only for unit tests and introduces no release-runtime behavior.
 
 ## Results
 
