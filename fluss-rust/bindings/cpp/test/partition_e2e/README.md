@@ -37,23 +37,33 @@ The normal ECS path uses a Linux runtime built and published by CI. Select
 publish configuration. The harness enables `NATIVE_PARTITION_E2E=ON` and includes
 this binary and runner in the existing OSS runtime package.
 
-On ECS, from a dedicated checkout of the **fluss-e2e harness** at that branch:
+On ECS, fetch this branch from the SDK fork into the existing checkout and create
+an adjacent worktree, preserving the previous OOO/upgrade checkout and its results:
 
 ```bash
-python3 fluss-e2e-native/ci/partition.py --sdk-ref codex/cpp-partition-e2e -- \
+cd /root/cpp-test/fluss-ooo-fixed
+git fetch https://github.com/naivedogger/fluss.git codex/cpp-partition-e2e
+git worktree add --detach /root/cpp-test/fluss-partition FETCH_HEAD
+
+python3 /root/cpp-test/fluss-partition/fluss-rust/bindings/cpp/test/partition_e2e/download.py \
+  --sdk-ref 6f683b517538f4a0fc9858ff6a712b636b28537d \
+  --output /root/cpp-test/partition-results -- \
   --config /root/cpp-test/config.json \
-  --server-version YOUR_DEPLOYED_VERSION \
+  --server-version YOUR_DEPLOYED_VERSION --rows 100 \
   --cases log arrow pk lifecycle missing-log missing-pk
 ```
 
-This downloads and verifies the published runtime using the existing `ossutil`
-configuration, then runs its bundled script. No SDK compilation or service deployment
-is needed on ECS. The script prints its output directory and resolved SDK commit.
-Use `--sdk-ref FULL_COMMIT_SHA` to repeat a published version.
-Alternatively, copy just `ci/partition.py` and `ci/artifacts.py` from that harness
-branch into the same dedicated ECS directory and invoke `partition.py` there;
-pass `--output /your/results/directory` before `--` to select the result location.
-The bundled partition runner is verified without requiring a harness source checkout.
+Reuse the existing connection JSON, updating it for the temporary test cluster.
+The downloader requires Python 3.9+, `ossutil` on PATH and its configured OSS access.
+For a non-default OSS configuration, add `--oss-config /path/to/.ossutilconfig`
+before `--`. This is separate from the Fluss connection JSON after `--`.
+The runtime must match the ECS architecture and glibc version.
+
+The SDK commit above selects the already published binary, independently of the
+Git revision containing the downloader. The script verifies the archive, SDK
+revision, platform and bundled partition binary/runner hashes, then executes that
+runner without compiling or requiring the internal harness repository. It prints
+the output directory and resolved SDK commit. Each invocation uses a fresh directory.
 
 For local development, build from an SDK source checkout:
 
