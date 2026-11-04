@@ -23,15 +23,39 @@ Run against an existing test cluster using the same connection JSON as the OOO/u
 scripts. Each case is a separate process with a deadline. No cluster restart, leader
 migration, database creation, or existing-table deletion is automated.
 
-SDK baseline: `codex/cpp-flush-diagnostics`, commit `f4463335d`. It contains #4941,
-#4527, #4969, #4994 and the C++ pending-lookup API. It installs diagnostic logging:
+SDK baseline: `codex/cpp-flush-diagnostics` plus upstream `0661d7e7b` (#4606)
+and the #5042 stale-leader-index fix/review tests (`2896e1c6a`). It contains #4941,
+#4527, #4969, #4994 and the C++ pending-lookup API. It retains diagnostic logging:
 write/metadata DEBUG, other modules WARN. This is a correctness/diagnostic branch,
-not a throughput baseline. It does not contain the later scan fix #4606
-(`0661d7e7b`); use the recorded revision when interpreting results.
+not a throughput baseline. #5042 does not fix missing-partition isolation in scanner
+or lookup metadata refresh; the fault cases still need evidence of that path.
 
 ## Build and run
 
-In a dedicated ECS checkout of the fork:
+The normal ECS path uses a Linux runtime built and published by CI. Select
+`codex/cpp-partition-e2e` for the SDK, the `fluss-e2e` harness and the `fluss-ali`
+publish configuration. The harness enables `NATIVE_PARTITION_E2E=ON` and includes
+this binary and runner in the existing OSS runtime package.
+
+On ECS, from a dedicated checkout of the **fluss-e2e harness** at that branch:
+
+```bash
+python3 fluss-e2e-native/ci/partition.py --sdk-ref codex/cpp-partition-e2e -- \
+  --config /root/cpp-test/config.json \
+  --server-version YOUR_DEPLOYED_VERSION \
+  --cases log arrow pk lifecycle missing-log missing-pk
+```
+
+This downloads and verifies the published runtime using the existing `ossutil`
+configuration, then runs its bundled script. No SDK compilation or service deployment
+is needed on ECS. The script prints its output directory and resolved SDK commit.
+Use `--sdk-ref FULL_COMMIT_SHA` to repeat a published version.
+Alternatively, copy just `ci/partition.py` and `ci/artifacts.py` from that harness
+branch into the same dedicated ECS directory and invoke `partition.py` there;
+pass `--output /your/results/directory` before `--` to select the result location.
+The bundled partition runner is verified without requiring a harness source checkout.
+
+For local development, build from an SDK source checkout:
 
 ```bash
 git fetch origin codex/cpp-partition-e2e
@@ -99,7 +123,8 @@ Run the control and deletion variants separately against an isolated test cluste
 Each uses fresh tables. Do not run overlapping fault injections.
 
 ```bash
-python3 "$TEST_DIR/run.py" run --config /root/cpp-test/config.json \
+python3 fluss-e2e-native/ci/partition.py --sdk-ref codex/cpp-partition-e2e -- \
+  --config /root/cpp-test/config.json \
   --server-version YOUR_DEPLOYED_VERSION --cases scanner-drop
 ```
 
@@ -136,7 +161,8 @@ claiming reproduction of the retry-counter defect.
 
 ## Results
 
-Results are under `target/cpp-partition-e2e/results/<run-id>/`:
+Local results are under `target/cpp-partition-e2e/results/<run-id>/`.
+The ECS downloader puts them under its printed output directory's `results/<run-id>/`:
 
 - `summary.json`: built SDK commit/dirty flag and binary SHA-256, supplied server version, parameters,
   per-case outcome and elapsed time.

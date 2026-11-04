@@ -15,9 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""The process deadline must survive a native call that never returns."""
+"""Published-runtime loading and native process deadline regressions."""
+import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,7 +29,38 @@ import unittest
 import run
 
 
-class DeadlineTest(unittest.TestCase):
+class RunnerTest(unittest.TestCase):
+    def test_published_runner_works_without_source_checkout_and_rejects_wrong_binary(self):
+        run.WORK.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=run.WORK) as work:
+            root = Path(work)
+            runtime = root / "runtime"
+            (runtime / "bin").mkdir(parents=True)
+            (runtime / "partition").mkdir()
+            script = runtime / "partition/run.py"
+            shutil.copyfile(run.__file__, script)
+            binary = runtime / "bin/partition_e2e"
+            binary.write_text("#!" + sys.executable + "\nprint('fixture readback')\n")
+            binary.chmod(0o700)
+            metadata = dict(sdkRevision="a" * 40, harnessRevision="b" * 40, partitionE2e=dict(
+                binarySha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                runnerSha256=hashlib.sha256(script.read_bytes()).hexdigest()))
+            (runtime / "build-metadata.json").write_text(json.dumps(metadata))
+            config = root / "config.json"
+            config.write_text(json.dumps(dict(endpoint="fixture")))
+            command = [sys.executable, str(script), "run", "--runtime", str(runtime),
+                       "--work-dir", str(root / "output"), "--config", str(config),
+                       "--server-version", "fixture", "--cases", "log"]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            summaries = list((root / "output/results").glob("*/summary.json"))
+            summary = json.loads(summaries[0].read_text())
+            self.assertEqual(summary["sdk"]["commit"], metadata["sdkRevision"])
+            self.assertEqual(summary["results"][0]["status"], "passed")
+            binary.write_text("wrong artifact")
+            rejected = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("differs from the published runtime", rejected.stderr)
+
     def test_timeout_is_reported_and_next_case_can_run(self):
         run.WORK.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=run.WORK) as work:

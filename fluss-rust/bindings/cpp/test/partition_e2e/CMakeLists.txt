@@ -23,3 +23,6 @@ get_filename_component(SDK "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 add_subdirectory("${SDK}/bindings/cpp" sdk EXCLUDE_FROM_ALL)
 add_executable(partition_e2e main.cpp)
 target_link_libraries(partition_e2e PRIVATE fluss_cpp)
+execute_process(COMMAND git -C "${SDK}" describe --always --dirty
+  OUTPUT_VARIABLE SDK_REV OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+target_compile_definitions(partition_e2e PRIVATE PARTITION_SDK_REVISION="${SDK_REV}")

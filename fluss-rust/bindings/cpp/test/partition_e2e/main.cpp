@@ -590,6 +590,10 @@ int main(int argc, char** argv) {
     try {
         require(argc == 2, "usage: partition_e2e CASE");
         std::string mode = argv[1];
+        if (mode == "--version") {
+            std::cout << PARTITION_SDK_REVISION << std::endl;
+            return 0;
+        }
         Context c;
         if (mode == "log" || mode == "arrow")
             log_case(c, mode == "arrow");

@@ -30,7 +30,7 @@ import time
 import uuid
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[4]
+REPO = HERE.parents[4] if (HERE / "CMakeLists.txt").is_file() else HERE
 WORK = REPO / "target" / "cpp-partition-e2e"
 CASES = ("log", "arrow", "pk", "lifecycle", "missing-log", "missing-pk", "float-name")
 FAULTS = ("scanner-drop", "scanner-control", "lookup-drop", "lookup-control")
@@ -96,9 +96,12 @@ def main():
     run.add_argument("--keep", action="store_true", help="Keep successful automatic case tables too")
     run.add_argument("--database", help="Override the existing config database")
     run.add_argument("--server-version", required=True, help="Record the deployed server version/build")
+    run.add_argument("--runtime", type=Path, help="Use a published runtime; no SDK build on ECS")
+    run.add_argument("--work-dir", type=Path, help="Directory for results and temporary files")
     args = parser.parse_args()
-    WORK.mkdir(parents=True, exist_ok=True)
-    tmp = WORK / "tmp"
+    work = (getattr(args, "work_dir", None) or WORK).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    tmp = work / "tmp"
     tmp.mkdir(exist_ok=True)
     env = dict(os.environ, TMPDIR=str(tmp))
     if args.command == "build":
@@ -131,7 +134,20 @@ def main():
         parser.error("case names must not repeat")
     if not 0 <= args.lookup_retries <= 2147483647:
         parser.error("lookup retries must be 0..2147483647")
-    binary = WORK / "build" / "partition_e2e"
+    if args.runtime:
+        runtime = args.runtime.resolve()
+        metadata = json.loads((runtime / "build-metadata.json").read_text())
+        partition = metadata["partitionE2e"]
+        binary = runtime / "bin" / "partition_e2e"
+        if (hashlib.sha256(binary.read_bytes()).hexdigest() != partition["binarySha256"]
+                or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != partition["runnerSha256"]):
+            parser.error("partition binary/runner differs from the published runtime")
+        sdk = dict(commit=metadata["sdkRevision"], dirty=False,
+                   binary_sha256=partition["binarySha256"],
+                   harness_commit=metadata["harnessRevision"])
+    else:
+        binary = WORK / "build" / "partition_e2e"
+        sdk = json.loads((WORK / "build" / "revision.json").read_text()) if binary.is_file() else None
     if not binary.is_file():
         parser.error("build first")
     config = json.loads(args.config.read_text())
@@ -139,7 +155,7 @@ def main():
     if type(replication) is not int or replication < 1:
         parser.error("replication_factor must be a positive integer")
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
-    result_dir = WORK / "results" / run_id
+    result_dir = work / "results" / run_id
     result_dir.mkdir(parents=True)
     env.update(
         PART_ENDPOINT=config["endpoint"],
@@ -153,7 +169,7 @@ def main():
         PART_LOOKUP_RETRIES=str(args.lookup_retries),
     )
     manifest = dict(run_id=run_id, server_version=args.server_version,
-                    sdk=json.loads((WORK / "build" / "revision.json").read_text()),
+                    sdk=sdk,
                     rows_per_partition=args.rows, buckets=args.buckets,
                     replication_factor=replication, lookup_retries=args.lookup_retries, results=[])
     print("RESULTS " + str(result_dir), flush=True)
