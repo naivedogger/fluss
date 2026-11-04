@@ -69,7 +69,7 @@ struct Workload {
           payload_bytes(payload_bytes) {
         handles.resize(writers);
         fluss::WriteCallbackOptions options;
-        options.max_pending_operations = 32768;
+        options.max_pending_operations = 262144;
         for (auto& writer : handles)
             check("create stress writer", table.NewAppend().CreateWriter(writer, options));
     }
@@ -78,22 +78,41 @@ struct Workload {
             workers.emplace_back([this, w, counts = stats] {
                 try {
                     uint64_t sequence = 0;
-                    uint64_t random = 0x9e3779b97f4a7c15ULL + w;
-                    std::string value(payload_bytes, 'x');
-                    auto next = Clock::now();
-                    auto interval = std::chrono::nanoseconds(1000000000LL * writers / rate);
-                    while (!stop.load()) {
-                        // Vary the payload to avoid compressible constant-string load.
+                    // Match the previous OOO load: 1024 prebuilt random payloads
+                    // per lane. Payload generation must not throttle the producer.
+                    uint64_t random = 17 + (name == "A" ? 0 : writers) + w;
+                    std::vector<fluss::GenericRow> pool;
+                    pool.reserve(1024);
+                    for (int i = 0; i < 1024; ++i) {
+                        std::string value(payload_bytes, ' ');
                         for (auto& ch : value) {
                             random ^= random << 13;
                             random ^= random >> 7;
                             random ^= random << 17;
                             ch = static_cast<char>('!' + random % 90);
                         }
-                        fluss::GenericRow row(2);
-                        row.SetString(
-                            0, name + ":" + std::to_string(w) + ":" + std::to_string(sequence++));
-                        row.SetString(1, value);
+                        pool.emplace_back(2);
+                        pool.back().SetString(1, value);
+                    }
+                    const auto id_prefix = name + ":" + std::to_string(w) + ":";
+                    const int lane_rate = rate / writers + (w < rate % writers ? 1 : 0);
+                    const int quota_size = std::max(1, lane_rate / 200);
+                    const auto interval =
+                        std::chrono::nanoseconds(1000000000LL * quota_size / lane_rate);
+                    auto next = Clock::now();
+                    int remaining = 0;
+                    while (!stop.load()) {
+                        // About 5ms per quota matches the old load generator. A blocked lane
+                        // discards missed time instead of sending catch-up bursts.
+                        if (remaining == 0) {
+                            std::this_thread::sleep_until(next);
+                            if (stop.load()) break;
+                            next = std::max(next, Clock::now()) + interval;
+                            remaining = quota_size;
+                        }
+                        --remaining;
+                        auto& row = pool[sequence % pool.size()];
+                        row.SetString(0, id_prefix + std::to_string(sequence++));
                         auto begin = millis();
                         ++counts->submitted;
                         ++counts->pending;
@@ -121,9 +140,6 @@ struct Workload {
                             counts->error(result.error_code);
                             --counts->pending;
                         }
-                        // Do not create a catch-up burst after buffer admission blocks.
-                        next = std::max(next + interval, Clock::now());
-                        std::this_thread::sleep_until(next);
                     }
                 } catch (const std::exception& e) {
                     ++worker_errors;
@@ -205,8 +221,10 @@ void run(bool shared) {
             "invalid stress durations");
     auto config = configuration(false);
     config.writer_batch_timeout_ms = 100;
-    config.writer_buffer_memory_size = 64 * 1024 * 1024;
-    config.writer_buffer_wait_timeout_ms = 1000;
+    // Preserve the previous four-process load's aggregate 1 GiB write budget
+    // while varying only whether A and B share a connection.
+    config.writer_buffer_memory_size = (shared ? 1024ULL : 512ULL) * 1024 * 1024;
+    config.writer_buffer_wait_timeout_ms = 10000;
     config.writer_retry_backoff_ms = 100;
     config.writer_retry_max_backoff_ms = 1000;
     fluss::Connection a_connection, b_connection, admin_connection;
@@ -233,6 +251,8 @@ void run(bool shared) {
     const auto start = millis();
     std::cout << "STRESS_CONFIG shared=" << shared << " rate_per_table=" << rate
               << " writers_per_table=" << writers << " payload=" << bytes
+              << " buffer_bytes_per_connection=" << config.writer_buffer_memory_size
+              << " buffer_wait_ms=10000 payload_pool_per_writer=1024"
               << " backoff_ms=100 max_backoff_ms=1000 A=" << a_id << " old_B=" << old_id
               << std::endl;
     Workload a(a_table, "A", writers, rate, bytes);

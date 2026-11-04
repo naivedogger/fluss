@@ -113,22 +113,40 @@ caches/buffers, while retaining the shared C++ runtime and callback executor.
 
 Unlike the old runner's optional DDL kick, recreation happens **after** the old B
 writer has started. Both workloads use 100ms initial / 1000ms maximum retry backoff,
-acks=all, idempotence, a 64MiB write buffer per Connection and a 1-second buffer
-admission timeout. No production SDK behavior or metadata lock is changed.
+acks=all, idempotence, dynamic 256KiB–2MiB batches, 100ms linger and a 10-second
+buffer admission timeout. The aggregate write buffer is 1GiB: one shared Connection
+gets 1GiB, or two separate Connections get 512MiB each. This matches the prior
+four-process OOO test's aggregate buffer budget. No production SDK behavior or
+metadata lock is changed.
+
+The prior ECS 1KiB OOO runs targeted 400,000 rows/s and acknowledged about
+393,000–395,000 rows/s. Use that aggregate target for this test, split evenly across
+two tables. Each table has 10 writers and 16 buckets (20 writers and 32 buckets total).
+Fetch this branch from the GitHub fork and build on ECS using the existing Arrow archive:
 
 ```bash
-python3 download.py --sdk-ref PUBLISHED_COMMIT --output /root/cpp-test/partition-results -- \
+TEST_DIR="$PWD/fluss-rust/bindings/cpp/test/partition_e2e"
+CARGO_BUILD_JOBS=4 python3 "$TEST_DIR/run.py" build
+python3 "$TEST_DIR/run.py" run \
   --config /root/cpp-test/config.json --server-version latest-released-2026-11-04 \
+  --work-dir /root/cpp-test/recreate-results \
   --cases recreate-shared recreate-separate --buckets 16 \
-  --stress-rate 20000 --stress-writers 2 --stress-payload 1024
+  --stress-rate 200000 --stress-writers 10 --stress-payload 1024
 ```
 
-Rate is **per table**, divided across its writers. The initial two-table target is
-40,000 rows/s, approximately 41MB/s of payload before replication. The usual
-baseline plus observation writes about 3.7GB per case before replication; A keeps
-writing during drain/recovery, so allow additional space. This is a bounded
-isolation/recovery test, not a peak-throughput benchmark. The SDK branch retains
-write/metadata diagnostic logs, which also affect throughput and disk usage.
+Like the prior OOO producer, each writer cycles through 1024 prebuilt pseudorandom
+payloads drawn from 90 printable characters and submits small paced quotas. This
+avoids per-record random generation and sleeps. Each append still changes its ID;
+the C++ API consumes row data during Append, so the next reuse cannot change an
+already submitted record. Arrow/ZSTD compression remains enabled by default.
+
+Rate is **per table**, divided across its writers. The two-table target is
+400,000 rows/s, about 391MiB/s of uncompressed payload before replication. Actual
+network/storage load depends on compression, encoding and replication. These are
+availability tests in one process, not a reproduction of the old four-process
+throughput benchmark. The diagnostic SDK also retains write/metadata logs. Compare
+successful ACK rates and server metrics before treating a pass as high-load evidence.
+The CLI retains its lower default of 20,000 rows/s per table unless explicitly set.
 
 The baseline must have successful, recent ACKs from both tables before DDL begins.
 Each second, `stdout.log` records accepted writes, successful/failed callbacks,
