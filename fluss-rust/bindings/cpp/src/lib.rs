@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod diagnostic_logging;
 mod lookup;
 mod types;
 mod write_callback;
@@ -40,6 +41,7 @@ use fluss::rpc::FlussError as CoreFlussError;
 use fluss::rpc::message::OffsetSpec;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    diagnostic_logging::init();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

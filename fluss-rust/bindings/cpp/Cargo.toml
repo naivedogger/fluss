@@ -32,6 +32,7 @@ arrow = { workspace = true, features = ["ffi"] }
 bigdecimal = { workspace = true }
 cxx = "1.0"
 fluss = { workspace = true, features = ["storage-all"] }
+log = "0.4"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
