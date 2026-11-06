@@ -78,7 +78,7 @@ use futures::TryStreamExt;
 use std::sync::Arc;
 
 async fn query(connection: Arc<FlussConnection>, path: &TablePath) -> Result<()> {
-    let table = FlussLakeTable::open(connection, path).await?;
+    let table = FlussLakeTable::new(connection, path);
     let scan = table.new_scan()
         .with_filter(col("id").eq(42_i32))
         .with_projection_by_names(vec!["name".to_string()])
@@ -93,6 +93,10 @@ async fn query(connection: Arc<FlussConnection>, path: &TablePath) -> Result<()>
     Ok(())
 }
 ```
+
+`FlussLakeTable::new()` creates a reusable handle without I/O. Each `scan.plan()` binds the scan to current metadata, derives a safe partition scope, captures fresh boundaries and plans tasks. A later plan can observe newer data; existing plans keep their captured schema and offsets. Missing tables and invalid lake configuration are reported during planning, not construction. Use `capture_read_context()` and `plan_with_context()` when several scans must share the same boundaries. A scoped context restricts every scan that uses it.
+
+Runtime lake properties can be supplied with `FlussLakeTable::new(connection, path).with_catalog_properties(properties)`. They are copied into scans created from that handle and remain separate from the captured boundaries.
 
 The plan freezes source boundaries and logical tasks, while the reader captures
 scan settings. Callers must use the same projection, filter, mode, batch size
@@ -110,6 +114,8 @@ unchanged, and core routing refresh remains active.
 `with_projection(vec![])` returns zero-column batches with correct row counts.
 The reader retains hidden key/filter columns until reconciliation and filtering
 are complete. This supports count scans but is not a metadata-only count.
+
+Lake-only `plan()` captures the readable lake snapshot without listing live partitions or querying Fluss log offsets. Its context reports `is_lake_only() == true` and cannot be reused for a union scan. An empty `log_ranges()` alone does not imply lake-only: a union capture can have no live partitions. For external lake-only boundaries, use `from_lake_snapshot(table, snapshot_id, scope)`; `None` denotes a lake-enabled table with no readable snapshot. An ordinary union context may still be used for a lake-only scan.
 
 ### Schedule local tasks in an engine
 
@@ -226,7 +232,7 @@ identity, resolved `lake_table_path()`, pinned lake snapshot ID, partition/bucke
 ranges. Engine expressions, physical file tasks, runtime handles, credentials,
 and memory pools stay outside this context.
 
-Java coordinators call `UnionReadBoundaryPlanner.captureReadContext(admin, tablePath[, scope])` for a structured UnionReadContext. Its accessors expose schema, lake snapshot, partition scope and bucket offsets for FE task planning. The engine owns task serialization and distribution. Rust workers import engine-decoded fields using `from_boundary()` or `from_boundary_with_partition_filter()`, with the captured metadata rather than fresh metadata. Capture blocks a planning thread without opening lake files; the caller owns Admin.
+Java coordinators can capture boundaries with the existing Admin APIs (`getReadableLakeSnapshot()` and offset queries), or adapt the Flink connector's `LakeSplitGenerator.generateHybridLakeFlussSplits()` where suitable. The adapter must preserve the selected snapshot and matching seams, captured schema, source identities and per-partition bucket counts, and resolve offset sentinels. Engines own serialization and map the fields into Rust's `from_boundary()` or scoped variant. Java lake payloads cannot be passed directly to Rust readers. A client-only Java capture helper is follow-up work, not a prerequisite for this Rust API.
 
 Engines must not decode default logical splits to build a native file reader.
 

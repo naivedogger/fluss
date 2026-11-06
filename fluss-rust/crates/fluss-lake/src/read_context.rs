@@ -200,7 +200,7 @@ pub struct FlussLakeReadContext {
     num_buckets: i32,
     merge_engine: Option<String>,
     lake: Option<LakeDescriptor>,
-    log_ranges: Vec<FlussLakeLogRange>,
+    log_ranges: Option<Vec<FlussLakeLogRange>>,
 }
 
 /// Lake configuration is present only for lake-enabled tables. A configured
@@ -272,6 +272,28 @@ impl FlussLakeReadContext {
         table: &TableInfo,
         lake_snapshot_id: Option<i64>,
         log_ranges: Vec<FlussLakeLogRange>,
+        partition_filter: &PartitionSpec,
+    ) -> Result<Self> {
+        Self::from_inputs(table, lake_snapshot_id, Some(log_ranges), partition_filter)
+    }
+
+    /// Imports a lake-only boundary without capturing Fluss log ranges.
+    ///
+    /// `None` means the lake-enabled table had no readable snapshot. The
+    /// resulting context may only be used with lake-only scans, even if its
+    /// log range list is empty just like a union context with no live partitions.
+    pub fn from_lake_snapshot(
+        table: &TableInfo,
+        lake_snapshot_id: Option<i64>,
+        partition_filter: &PartitionSpec,
+    ) -> Result<Self> {
+        Self::from_inputs(table, lake_snapshot_id, None, partition_filter)
+    }
+
+    fn from_inputs(
+        table: &TableInfo,
+        lake_snapshot_id: Option<i64>,
+        log_ranges: Option<Vec<FlussLakeLogRange>>,
         partition_filter: &PartitionSpec,
     ) -> Result<Self> {
         let context = Self {
@@ -382,8 +404,16 @@ impl FlussLakeReadContext {
     /// Consumers must handle every log partition kind or reject the read; ranges
     /// must not be skipped merely because their kind is unsupported.
     /// Lake-only partitions must be planned separately within the same scope.
+    /// Lake-only capture returns an empty slice; check [`Self::is_lake_only`]
+    /// before using this context for a union read.
     pub fn log_ranges(&self) -> &[FlussLakeLogRange] {
-        &self.log_ranges
+        self.log_ranges.as_deref().unwrap_or_default()
+    }
+
+    /// Whether capture omitted Fluss log boundaries. Such a context cannot
+    /// be used for a union scan; an empty range list alone does not imply this.
+    pub fn is_lake_only(&self) -> bool {
+        self.log_ranges.is_none()
     }
 
     /// Checks that live metadata still identifies the same source table.
@@ -477,11 +507,7 @@ impl FlussLakeReadContext {
                 "invalid table, schema, snapshot, or bucket identity",
             ));
         }
-        if let Some(lake) = &self.lake
-            && (lake.table_path.database().is_empty()
-                || lake.table_path.table().is_empty()
-                || lake.snapshot_id.is_some_and(|id| id < 0))
-        {
+        if self.lake_snapshot_id().is_some_and(|id| id < 0) {
             return Err(invalid_context("invalid lake identity"));
         }
         let schema = &self.schema;
@@ -489,42 +515,35 @@ impl FlussLakeReadContext {
             self.partition_filter.keys(),
             &self.partition_keys,
         )?;
-        let columns: HashSet<_> = schema.column_names().into_iter().collect();
-        for keys in [&self.partition_keys, &self.bucket_keys] {
-            let mut seen = HashSet::new();
-            if keys
-                .iter()
-                .any(|key| !columns.contains(key.as_str()) || !seen.insert(key))
-            {
-                return Err(invalid_context("unknown or duplicate partition/bucket key"));
+        let primary_keys = schema.primary_key_column_names();
+        let mut keys = HashSet::new();
+        for key in self.partition_keys.iter().chain(&self.bucket_keys) {
+            if schema.row_type().get_field_index(key).is_none() || !keys.insert(key) {
+                return Err(invalid_context(
+                    "partition and bucket keys must be distinct schema columns",
+                ));
             }
-        }
-        if self
-            .bucket_keys
-            .iter()
-            .any(|key| self.partition_keys.contains(key))
-        {
-            return Err(invalid_context(
-                "bucket keys must not contain partition keys",
-            ));
-        }
-        if schema.primary_key().is_some() {
-            let primary_keys = schema.primary_key_column_names();
-            if self.bucket_keys.is_empty()
-                || self
-                    .partition_keys
-                    .iter()
-                    .chain(&self.bucket_keys)
-                    .any(|key| !primary_keys.contains(&key.as_str()))
-            {
+            if schema.primary_key().is_some() && !primary_keys.contains(&key.as_str()) {
                 return Err(invalid_context(
                     "PK partition and bucket keys must belong to the primary key",
                 ));
             }
         }
+        if schema.primary_key().is_some() && self.bucket_keys.is_empty() {
+            return Err(invalid_context("PK tables must have bucket keys"));
+        }
+        if self.is_lake_only() {
+            return if self.lake.is_some() {
+                Ok(())
+            } else {
+                Err(invalid_context(
+                    "lake-only capture requires a lake-enabled table",
+                ))
+            };
+        }
         let mut groups = HashMap::new();
         let mut partition_ids = HashMap::new();
-        for range in &self.log_ranges {
+        for range in self.log_ranges() {
             let bucket = range.table_bucket();
             let FlussLakeLogPartition::Ordinary(identity) = range.partition();
             if bucket.table_id() != self.table_id
@@ -688,6 +707,30 @@ mod tests {
             assert_eq!(imported.log_ranges(), original.log_ranges());
             assert_eq!(imported.table_schema(), &table(partitioned).schema);
             imported.validate_table(&table(partitioned)).unwrap();
+        }
+    }
+
+    #[test]
+    fn imported_layout_rejects_invalid_keys() {
+        let original = context(true);
+        for (partition_keys, bucket_keys) in [
+            (vec!["region"], vec!["missing"]),
+            (vec!["region"], vec!["id", "id"]),
+            (vec!["region"], vec!["region"]),
+            (vec!["region"], vec!["amount"]),
+            (vec!["region"], vec![]),
+        ] {
+            let mut info = table(true);
+            info.partition_keys = partition_keys.into_iter().map(str::to_owned).collect();
+            info.bucket_keys = bucket_keys.into_iter().map(str::to_owned).collect();
+            assert!(
+                FlussLakeReadContext::from_boundary(
+                    &info,
+                    Some(42),
+                    original.log_ranges().to_vec(),
+                )
+                .is_err()
+            );
         }
     }
 

@@ -51,46 +51,26 @@ pub struct FlussLakeTable {
 }
 
 impl FlussLakeTable {
-    /// Opens a table for bounded Fluss-only or lake and log reads.
-    pub async fn open(connection: Arc<FlussConnection>, table_path: &TablePath) -> Result<Self> {
-        Self::open_with_properties(connection, table_path, HashMap::new()).await
-    }
-
-    /// Opens a table with runtime lake properties such as storage credentials.
+    /// Creates a reusable table handle without fetching metadata or capturing boundaries.
     ///
-    /// Runtime properties are held by the table and reader. They are never
-    /// serialized into a read split.
-    pub async fn open_with_properties(
-        connection: Arc<FlussConnection>,
-        table_path: &TablePath,
-        catalog_property_overrides: HashMap<String, String>,
-    ) -> Result<Self> {
-        let admin = connection
-            .get_admin()
-            .map_err(|error| planning_client_error("create Fluss admin client", error))?;
-        let table_info = admin
-            .get_table_info(table_path)
-            .await
-            .map_err(|error| planning_client_error("get table metadata", error))?;
-        validate_readable_table(&table_info)?;
-        Ok(Self {
+    /// Each [`FlussLakeScan::plan`] call captures fresh source boundaries. Use
+    /// [`Self::capture_read_context`] to explicitly share boundaries across scans.
+    /// Table existence and configuration are checked when planning or capturing.
+    pub fn new(connection: Arc<FlussConnection>, table_path: &TablePath) -> Self {
+        Self {
             connection,
             table_path: table_path.clone(),
-            catalog_property_overrides,
-        })
+            catalog_property_overrides: HashMap::new(),
+        }
     }
 
-    /// Creates a table from metadata already resolved by the caller.
-    pub fn try_from_table_info(
-        connection: Arc<FlussConnection>,
-        table_info: &TableInfo,
-    ) -> Result<Self> {
-        validate_readable_table(table_info)?;
-        Ok(Self {
-            connection,
-            table_path: table_info.table_path.clone(),
-            catalog_property_overrides: HashMap::new(),
-        })
+    /// Sets runtime lake properties, replacing any previous overrides.
+    ///
+    /// Properties such as storage credentials are copied into subsequently
+    /// created scans. They are not part of the read context or split payloads.
+    pub fn with_catalog_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.catalog_property_overrides = properties;
+        self
     }
 
     /// Creates a bounded read scan.
@@ -206,7 +186,7 @@ impl FlussLakeScan {
         self
     }
 
-    /// Prepares source boundaries and builds the complete default read plan.
+    /// Captures fresh source boundaries and builds the complete default read plan.
     ///
     /// Safe string partition equalities restrict offset capture before lake planning.
     /// Other predicates still participate in planning and exact result filtering.
@@ -231,7 +211,8 @@ impl FlussLakeScan {
 
     /// Builds a default plan without choosing new snapshots or log offsets.
     ///
-    /// The context must refer to this table. Metadata drift is rejected.
+    /// The context must refer to this table. Source identity and lake mapping
+    /// are checked; later schema additions do not replace the captured schema.
     /// Different scans may share a context within its captured partition scope
     /// without sharing predicates or projection. The supplied context is never
     /// narrowed or recaptured from this scan's filter. Engines implementing their
@@ -299,7 +280,11 @@ impl FlussLakeScan {
             &bound.filter,
         )
         .partition_scope();
-        let context = crate::boundary::freeze_read_context(&admin, &table_info, &scope).await?;
+        let context = if self.lake_only {
+            crate::boundary::freeze_lake_read_context(&admin, &table_info, &scope).await?
+        } else {
+            crate::boundary::freeze_read_context(&admin, &table_info, &scope).await?
+        };
         Ok((table_info, context, bound))
     }
 

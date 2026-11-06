@@ -55,6 +55,8 @@ async fn append_log_plan_uses_frozen_stop_offset_after_planning() {
         )
         .build()
         .expect("Failed to build UnionRead integration test table descriptor");
+    let lake_table = FlussLakeTable::new(connection.clone(), &table_path);
+    assert!(lake_table.new_scan().plan().await.is_err());
     support::create_table(&admin, &table_path, &table_descriptor).await;
 
     let table = connection
@@ -77,9 +79,6 @@ async fn append_log_plan_uses_frozen_stop_offset_after_planning() {
         .await
         .expect("Failed to flush pre-plan batch");
 
-    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
-        .await
-        .expect("Failed to open append-log lake table");
     let scan = lake_table
         .new_scan()
         .with_projection(vec![1])
@@ -154,7 +153,8 @@ async fn append_log_plan_uses_frozen_stop_offset_after_planning() {
     }
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2, 3]);
-    let later_context = lake_table.capture_read_context().await.unwrap();
+    let later_plan = ids_scan.plan().await.unwrap();
+    let later_context = later_plan.read_context();
     assert!(
         later_context
             .log_ranges()
@@ -167,9 +167,10 @@ async fn append_log_plan_uses_frozen_stop_offset_after_planning() {
                 .map(|range| range.stop_offset())
                 .sum::<i64>()
     );
-    let mut other_info = admin.get_table_info(&table_path).await.unwrap();
-    other_info.table_path = TablePath::new("fluss", "different_table");
-    let other = FlussLakeTable::try_from_table_info(connection.clone(), &other_info).unwrap();
+    let other = FlussLakeTable::new(
+        connection.clone(),
+        &TablePath::new("fluss", "different_table"),
+    );
     assert!(matches!(
         other.new_scan().plan_with_context(&context).await,
         Err(FlussLakeError::InvalidReadContext(_))
@@ -279,9 +280,7 @@ async fn frozen_schema_survives_alter_table_after_planning() {
         .await
         .expect("Failed to flush pre-plan batch");
 
-    let lake_table = FlussLakeTable::open(connection.clone(), &table_path)
-        .await
-        .expect("Failed to open stale-schema lake table");
+    let lake_table = FlussLakeTable::new(connection.clone(), &table_path);
     let scan = lake_table.new_scan();
     let plan = scan
         .plan()
@@ -319,9 +318,7 @@ async fn frozen_schema_survives_alter_table_after_planning() {
     let expected_schema = plan.schema().clone();
     drop(plan);
     drop(scan);
-    let reopened_table = FlussLakeTable::open(connection.clone(), &table_path)
-        .await
-        .unwrap();
+    let reopened_table = FlussLakeTable::new(connection.clone(), &table_path);
     let batches = tokio::time::timeout(Duration::from_secs(10), async {
         reopened_table
             .new_scan()
@@ -413,9 +410,7 @@ async fn shared_read_metadata_does_not_outlive_the_read_attempt() {
         .build()
         .unwrap();
     support::create_table(&admin, &path, &descriptor).await;
-    let lake_table = FlussLakeTable::open(connection.clone(), &path)
-        .await
-        .unwrap();
+    let lake_table = FlussLakeTable::new(connection.clone(), &path);
     let scan = lake_table.new_scan();
     let reader = scan.new_reader();
     let mut previous_splits = None;

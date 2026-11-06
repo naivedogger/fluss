@@ -156,9 +156,7 @@ async fn verify() {
         reads: AtomicUsize::new(0),
         lake_gate: lake_gate.clone(),
     });
-    let table = FlussLakeTable::open_with_properties(connection, &path, properties.clone())
-        .await
-        .unwrap();
+    let table = FlussLakeTable::new(connection, &path).with_catalog_properties(properties.clone());
     if scenario.contains('-') {
         verify_partition_layouts(&table, &scenario).await;
         return;
@@ -214,7 +212,9 @@ async fn verify() {
     drop(plan);
     drop(scan);
     let lake_scan = table.new_scan().with_lake_only(true);
-    let lake_plan = lake_scan.plan_with_context(&context).await.unwrap();
+    let lake_plan = lake_scan.plan().await.unwrap();
+    assert!(lake_plan.read_context().is_lake_only());
+    assert!(lake_plan.read_context().log_ranges().is_empty());
     let baseline = read_batches(lake_scan, lake_plan.splits()).await;
     assert_eq!(
         rows(&baseline),

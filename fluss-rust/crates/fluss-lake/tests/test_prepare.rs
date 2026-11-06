@@ -48,6 +48,8 @@ async fn prepare_freezes_fluss_only_ranges_and_schema() {
         )
         .build()
         .unwrap();
+    let table = FlussLakeTable::new(connection.clone(), &path);
+    assert!(table.capture_read_context().await.is_err());
     support::create_table(&admin, &path, &descriptor).await;
     let source = connection.get_table(&path).await.unwrap();
     let writer = source.new_append().unwrap().create_writer().unwrap();
@@ -58,9 +60,6 @@ async fn prepare_freezes_fluss_only_ranges_and_schema() {
     writer.append_arrow_batch(batch(vec![1, 2, 3])).unwrap();
     writer.flush().await.unwrap();
 
-    let table = FlussLakeTable::open(connection.clone(), &path)
-        .await
-        .unwrap();
     let plain = table.capture_read_context().await.unwrap();
     assert_eq!(plain.lake_snapshot_id(), None);
     assert_eq!(plain.lake_format(), None);
@@ -197,9 +196,18 @@ async fn partition_filter_preserves_scope_and_resolved_bucket_counts() {
     }
     writer.flush().await.unwrap();
     drop(writer);
-    let table = FlussLakeTable::open(connection.clone(), &path)
-        .await
-        .unwrap();
+    let table = FlussLakeTable::new(connection.clone(), &path);
+    // No readable snapshot yet: lake-only is empty, not a log-only union.
+    let lake_scan = table.new_scan().with_lake_only(true);
+    let lake_plan = lake_scan.plan().await.unwrap();
+    let lake_context = lake_plan.read_context();
+    assert!(lake_context.is_lake_only());
+    assert!(lake_context.log_ranges().is_empty());
+    assert!(lake_plan.splits().is_empty());
+    assert!(matches!(
+        table.new_scan().plan_with_context(lake_context).await,
+        Err(fluss_lake::FlussLakeError::InvalidReadContext(_))
+    ));
     let all = table.capture_read_context().await.unwrap();
     assert_eq!(all.log_ranges().len(), 3);
     let filter = PartitionSpec::new(HashMap::from([("region", "US")]));
@@ -250,6 +258,7 @@ async fn partition_filter_preserves_scope_and_resolved_bucket_counts() {
         .await
         .unwrap();
     assert!(dropped.log_ranges().is_empty());
+    assert!(!dropped.is_lake_only());
     assert_eq!(dropped.partition_filter(), selected.partition_filter());
     admin.drop_table(&path, false).await.unwrap();
 }

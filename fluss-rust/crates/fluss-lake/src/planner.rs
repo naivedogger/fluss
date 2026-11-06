@@ -47,6 +47,11 @@ pub(crate) async fn plan_with_context(
     context: &FlussLakeReadContext,
 ) -> Result<FlussLakeReadPlan> {
     scan.validate_configuration()?;
+    if context.is_lake_only() && !scan.lake_only() {
+        return Err(FlussLakeError::InvalidReadContext(
+            "lake-only context has no log boundaries for a union read".into(),
+        ));
+    }
     if scan.table_path() != context.table_path() {
         return Err(FlussLakeError::InvalidReadContext(
             "scan and read context refer to different tables".to_string(),
@@ -262,14 +267,16 @@ async fn plan_prepared(
         {
             continue;
         }
-        if table_info.partition_keys.is_empty() {
+        if table_info.partition_keys.is_empty() && !scan.lake_only() {
             return Err(FlussLakeError::PlanningFailed(format!(
                 "lake snapshot {} of the unpartitioned table {} contains an unmatched bucket {bucket_id}",
                 snapshot_id.unwrap_or_default(),
                 scan.table_path()
             )));
         }
-        if matches!(partition, crate::FlussLakePartitionIdentity::Unpartitioned) {
+        if !table_info.partition_keys.is_empty()
+            && matches!(partition, crate::FlussLakePartitionIdentity::Unpartitioned)
+        {
             return Err(FlussLakeError::PlanningFailed(format!(
                 "lake snapshot {} of the partitioned table {} contains an unpartitioned split",
                 snapshot_id.unwrap_or_default(),
