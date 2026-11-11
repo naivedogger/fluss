@@ -296,6 +296,7 @@ impl FlussLakeReadContext {
         log_ranges: Option<Vec<FlussLakeLogRange>>,
         partition_filter: &PartitionSpec,
     ) -> Result<Self> {
+        crate::table::validate_supported_table(table)?;
         let context = Self {
             table_path: table.table_path.clone(),
             table_id: table.table_id,
@@ -427,6 +428,7 @@ impl FlussLakeReadContext {
     /// verify that data is still retained. An engine-native adapter must also
     /// validate its lake layout and enforce bounded log availability.
     pub fn validate_table(&self, table: &TableInfo) -> Result<()> {
+        crate::table::validate_supported_table(table)?;
         let lake_changed = if let Some(lake) = &self.lake {
             let live = LakeDescriptor::capture(table, None)?;
             live.as_ref()

@@ -80,6 +80,7 @@ impl SplitDescriptor {
     }
 
     pub(crate) fn validate_live_table(&self, live: &TableInfo) -> Result<()> {
+        crate::table::validate_supported_table(live)?;
         let frozen = &self.table_info;
         let lake_changed = frozen
             .table_config

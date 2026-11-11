@@ -418,3 +418,5 @@ The ordinary `with_filter` path binds supported predicates strictly and evaluate
 A LakeSource owns snapshot-specific deletion vectors and lake version reconciliation. Its opaque task payload must retain the data-file/deletion-file association through planning and path rewriting. Native readers must preserve physical row positions when applying DVs. A Parquet reader alone is not a PK current-view reader. There is no generic DV trait or stable reader-only Paimon payload ABI in this API.
 
 Shared historical-log support is tracked in [#5001](https://github.com/apache/fluss/issues/5001); it is separate from reading expired partitions already present in the lake snapshot.
+
+Tables with `table.datalake.historical-partition.enabled=true` are rejected during boundary capture and import: writes to expired partitions can remain in the shared `__historical__` log before tiering and are missing from ordinary partition ranges and the lake snapshot. Shared historical-log support is tracked in [#5001](https://github.com/apache/fluss/issues/5001). Expired partitions already present in a lake snapshot remain supported when this option is disabled.
