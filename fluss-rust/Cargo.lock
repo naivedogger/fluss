@@ -1661,6 +1661,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluss-lake-ffi"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "fluss-lake",
+ "fluss-rs",
+ "futures",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "fluss-rs"
 version = "1.0.0"
 dependencies = [
@@ -5988,6 +6000,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

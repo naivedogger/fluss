@@ -1,0 +1,33 @@
+name: fluss-sr-probe
+x-base: &base
+  image: ${PROBE_IMAGE:-fluss-sr-ecs:local}
+  platform: linux/amd64
+  environment:
+    TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+  ulimits:
+    nofile: {soft: 65535, hard: 65535}
+services:
+  fe:
+    <<: *base
+    command: [/opt/sr/fe/bin/start_fe.sh]
+    ports: ["127.0.0.1:${SR_QUERY_PORT:-19030}:9030"]
+    volumes: [fe-meta:/opt/sr/fe/meta]
+  be1:
+    <<: *base
+    command: [/opt/sr/be/bin/start_be.sh]
+    volumes: [be1-data:/opt/sr/be/storage]
+  be2:
+    <<: *base
+    command: [/opt/sr/be/bin/start_be.sh]
+    volumes: [be2-data:/opt/sr/be/storage]
+  probe:
+    <<: *base
+    profiles: [tools]
+    volumes:
+      - ./config.json:/run/secrets/probe.json:ro
+      - ./results:/results
+    entrypoint: [python3,/opt/probe.py]
+volumes:
+  fe-meta:
+  be1-data:
+  be2-data:
