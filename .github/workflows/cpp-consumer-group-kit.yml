@@ -30,8 +30,11 @@ jobs:
           strip kit/consumer_group_e2e kit/lib/*
           sudo apt-get install -y patchelf
           patchelf --set-rpath '$ORIGIN/lib' kit/consumer_group_e2e
+          mv build/group build/unrelocated
           ldd kit/consumer_group_e2e | tee libs.txt
-          ! grep -F 'not found' libs.txt
+          grep -E 'libarrow.*=> .*/kit/lib/' libs.txt
+          if grep -F 'not found' libs.txt; then exit 1; fi
+          python3 kit/run.py --help
           git rev-parse HEAD > kit/REVISION
           tar czf consumer-group-kit.tgz kit
       - uses: actions/upload-artifact@v4
